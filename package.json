@@ -9,15 +9,36 @@
   "categories": [
     "Other"
   ],
-  "activationEvents": [],
+  "activationEvents": [
+    "onView:quiz-support-chat",
+    "onCommand:quiz-based-support.setApiKey"
+  ],
   "main": "./dist/extension.js",
   "contributes": {
     "commands": [
       {
-        "command": "quiz-based-support.helloWorld",
-        "title": "Hello World"
+        "command": "quiz-based-support.setApiKey",
+        "title": "Quiz Support: Set OpenAI API Key"
       }
-    ]
+    ],
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "quiz-support-sidebar",
+          "title": "Quiz Support",
+          "icon": "$(comment-discussion)"
+        }
+      ]
+    },
+    "views": {
+      "quiz-support-sidebar": [
+        {
+          "type": "webview",
+          "id": "quiz-support-chat",
+          "name": "AI Code Search"
+        }
+      ]
+    }
   },
   "scripts": {
     "vscode:prepublish": "npm run package",
@@ -46,8 +67,12 @@
     "typescript-eslint": "^8.56.1"
   },
   "dependencies": {
+    "js-tiktoken": "^1.0.21",
     "openai": "^6.44.0",
     "tree-sitter-java": "^0.23.5",
+    "tree-sitter-javascript": "^0.25.0",
+    "tree-sitter-typescript": "^0.23.2",
+    "vectra": "^0.15.0",
     "web-tree-sitter": "^0.26.9"
   }
 }

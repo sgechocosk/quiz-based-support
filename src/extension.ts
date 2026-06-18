@@ -1,26 +1,35 @@
-// The module 'vscode' contains the VS Code extensibility API
-// Import the module and reference it with the alias vscode in your code below
-import * as vscode from 'vscode';
+import * as vscode from "vscode";
+import { ChatSidebarProvider } from "./ChatSidebarProvider"; // 後述
 
-// This method is called when your extension is activated
-// Your extension is activated the very first time the command is executed
 export function activate(context: vscode.ExtensionContext) {
+  console.log("Quiz-based Support is now active!");
 
-	// Use the console to output diagnostic information (console.log) and errors (console.error)
-	// This line of code will only be executed once when your extension is activated
-	console.log('Congratulations, your extension "quiz-based-support" is now active!');
+  // 1. APIキーを設定・保存するコマンド
+  const setApiKeyCommand = vscode.commands.registerCommand(
+    "quiz-based-support.setApiKey",
+    async () => {
+      const apiKey = await vscode.window.showInputBox({
+        prompt: "OpenAI API Keyを入力してください (sk-... )",
+        password: true, // 入力を隠す
+        ignoreFocusOut: true,
+      });
 
-	// The command has been defined in the package.json file
-	// Now provide the implementation of the command with registerCommand
-	// The commandId parameter must match the command field in package.json
-	const disposable = vscode.commands.registerCommand('quiz-based-support.helloWorld', () => {
-		// The code you place here will be executed every time your command is executed
-		// Display a message box to the user
-		vscode.window.showInformationMessage('Hello World from quiz-based-support!');
-	});
+      if (apiKey) {
+        // SecretStorageを使用してOSのセキュア領域に暗号化して保存
+        await context.secrets.store("openai-api-key", apiKey);
+        vscode.window.showInformationMessage("APIキーを安全に保存しました。");
+      }
+    },
+  );
 
-	context.subscriptions.push(disposable);
+  // 2. サイドバーのWebviewプロバイダーを登録
+  const sidebarProvider = new ChatSidebarProvider(context);
+  const viewRegistration = vscode.window.registerWebviewViewProvider(
+    "quiz-support-chat", // package.jsonで定義するIDと一致させる
+    sidebarProvider,
+  );
+
+  context.subscriptions.push(setApiKeyCommand, viewRegistration);
 }
 
-// This method is called when your extension is deactivated
 export function deactivate() {}
