@@ -304,8 +304,14 @@ export class WorkspaceVectorSearchService {
       const relativePath = this.relativePath(file);
       const nodes = candidates.length > 0 ? candidates : [tree.rootNode];
       const results: CodeChunk[] = [];
+      // tokenEncoderはループ外で1度だけ取得してパフォーマンスを改善
+      const tokenEncoder = await WorkspaceVectorSearchService.getTokenEncoder();
 
       for (const [index, node] of nodes.entries()) {
+        const lineCount = node.endPosition.row - node.startPosition.row + 1;
+        // 300行超の巨大ノードはembeddingの品質が落ちるためスキップ
+        if (lineCount > 300) continue;
+
         const sourceText = text.slice(node.startIndex, node.endIndex).trim();
         if (!sourceText) {
           continue;
@@ -314,14 +320,20 @@ export class WorkspaceVectorSearchService {
         const kind = this.getChunkKind(node, language);
         const symbolName = this.getNodeName(node, kind);
         const signature = sourceText.split(/\r?\n/, 1)[0]?.trim() ?? symbolName;
+
+        // クラス名を含めることでembeddingの文脈精度を向上させる
+        const className =
+          kind !== "class" ? this.getEnclosingClassName(node) : undefined;
+
         const embeddingText = [
           `file: ${relativePath}`,
+          className ? `class: ${className}` : null,
           `symbol: ${symbolName}`,
           `kind: ${kind}`,
           sourceText,
-        ].join("\n");
-        const tokenEncoder =
-          await WorkspaceVectorSearchService.getTokenEncoder();
+        ]
+          .filter(Boolean)
+          .join("\n");
 
         results.push({
           id: `${workspaceId}:${relativePath}:${node.startPosition.row + 1}-${node.endPosition.row + 1}:${kind}:${index}`,
@@ -343,8 +355,6 @@ export class WorkspaceVectorSearchService {
       if (results.length === 0) {
         const sourceText = text.trim();
         if (sourceText) {
-          const tokenEncoder =
-            await WorkspaceVectorSearchService.getTokenEncoder();
           results.push({
             id: `${workspaceId}:${relativePath}:file`,
             embeddingText: [
@@ -429,15 +439,41 @@ export class WorkspaceVectorSearchService {
     rootNode: TreeSitter.Node,
     language: SupportedLanguage,
   ): TreeSitter.Node[] {
-    const types =
-      language === "java"
-        ? ["method_declaration", "constructor_declaration"]
-        : [
-            "function_declaration",
-            "method_definition",
-            "generator_function_declaration",
-          ];
-    return rootNode.descendantsOfType(types);
+    if (language === "java") {
+      return rootNode.descendantsOfType([
+        "method_declaration",
+        "constructor_declaration",
+        "class_declaration",
+      ]);
+    }
+
+    // JS/TS: 関数・メソッド・クラスを幅広く対象にする
+    const allCandidates = rootNode.descendantsOfType([
+      "function_declaration",
+      "method_definition",
+      "generator_function_declaration",
+      "arrow_function", // const fn = () => {}
+      "function_expression", // const fn = function() {}
+      "class_declaration", // class Foo {}
+      "class_expression", // const Foo = class {}
+    ]);
+
+    // ネストしたアロー関数・関数式のうち、3行未満の短い断片を除外してノイズを減らす
+    return allCandidates.filter((node) => {
+      const lineCount = node.endPosition.row - node.startPosition.row + 1;
+      // クラスと関数宣言は行数に関わらず必ず残す
+      if (
+        node.type === "class_declaration" ||
+        node.type === "class_expression" ||
+        node.type === "function_declaration" ||
+        node.type === "method_definition" ||
+        node.type === "generator_function_declaration"
+      ) {
+        return true;
+      }
+      // アロー関数・関数式は3行以上のみ（1〜2行の短いコールバックを除外）
+      return lineCount >= 3;
+    });
   }
 
   private getChunkKind(
@@ -445,24 +481,72 @@ export class WorkspaceVectorSearchService {
     language: SupportedLanguage,
   ): string {
     if (language === "java") {
-      return node.type === "constructor_declaration" ? "constructor" : "method";
+      if (node.type === "constructor_declaration") return "constructor";
+      if (node.type === "class_declaration") return "class";
+      return "method";
     }
 
-    if (
-      node.type === "method_definition" &&
-      node.childForFieldName("name")?.text === "constructor"
-    ) {
-      return "constructor";
+    switch (node.type) {
+      case "class_declaration":
+      case "class_expression":
+        return "class";
+      case "method_definition":
+        return node.childForFieldName("name")?.text === "constructor"
+          ? "constructor"
+          : "method";
+      case "function_declaration":
+      case "generator_function_declaration":
+        return "function";
+      case "arrow_function":
+      case "function_expression":
+        return "function";
+      default:
+        return "function";
     }
-
-    return node.type === "function_declaration" ? "function" : "method";
   }
 
   private getNodeName(node: TreeSitter.Node, kind: string): string {
-    return (
-      node.childForFieldName("name")?.text?.trim() ??
-      (kind === "constructor" ? "constructor" : kind)
-    );
+    // クラス・関数宣言は name フィールドを直接持つ
+    const directName = node.childForFieldName("name")?.text?.trim();
+    if (directName) return directName;
+
+    // アロー関数・関数式は親ノードを遡って代入先の名前を取得する
+    // 例: const handleClick = () => {}  → "handleClick"
+    const parent = node.parent;
+    if (parent?.type === "variable_declarator") {
+      const nameNode = parent.childForFieldName("name");
+      if (nameNode) return nameNode.text.trim();
+    }
+
+    // オブジェクトリテラルのメソッド値
+    // 例: { fetchUser: async () => {} }  → "fetchUser"
+    if (parent?.type === "pair") {
+      const keyNode = parent.childForFieldName("key");
+      if (keyNode) return keyNode.text.trim();
+    }
+
+    // export default function() {} のように名前がない場合
+    if (parent?.type === "export_statement") {
+      return "default";
+    }
+
+    return kind === "constructor" ? "constructor" : kind;
+  }
+
+  // ノードを祖先方向に遡り、囲むクラス名を返す
+  private getEnclosingClassName(node: TreeSitter.Node): string | undefined {
+    let current = node.parent;
+    while (current) {
+      if (
+        current.type === "class_declaration" ||
+        current.type === "class_expression"
+      ) {
+        const name = current.childForFieldName("name")?.text?.trim();
+        if (name) return name;
+      }
+      current = current.parent;
+    }
+    return undefined;
   }
 
   private async loadLanguage(
@@ -495,6 +579,10 @@ export class WorkspaceVectorSearchService {
         return path.join(parserDir, "tree-sitter-tsx.wasm");
       case "java":
         return path.join(parserDir, "tree-sitter-java.wasm");
+      case "html":
+      case "css":
+        // html/cssはextractLineBasedChunksで処理されるためここには到達しない
+        throw new Error(`TreeSitter parser not used for language: ${language}`);
     }
   }
 
