@@ -445,7 +445,7 @@ export class WorkspaceVectorSearchService {
     language: "html" | "css",
   ): Promise<CodeChunk[]> {
     const CHUNK_LINES = 60; // 1チャンクあたりの行数
-    const OVERLAP_LINES = 10; // チャンク間のオーバーラップ（文脈保持）
+    const OVERLAP_LINES = 10; // チャンク間のオーバーラップ(文脈保持)
     const lines = text.split(/\r?\n/);
     const relativePath = this.relativePath(file);
     const workspaceId = this.getWorkspaceId();
@@ -525,7 +525,7 @@ export class WorkspaceVectorSearchService {
       ) {
         return true;
       }
-      // アロー関数・関数式は3行以上のみ（1〜2行の短いコールバックを除外）
+      // アロー関数・関数式は3行以上のみ(1〜2行の短いコールバックを除外)
       return lineCount >= 3;
     });
   }
@@ -769,7 +769,7 @@ export class WorkspaceVectorSearchService {
       "【ルール】",
       "- 指定されたJSONスキーマに厳密に従って出力してください。",
       "- targetFilePath, startLine, endLine は提示されたコードの情報を正確に使用してください。",
-      "- quizCode には変更後のコードを記載しますが、学習者が考えるべき重要な実装部分（変数名、条件式、ロジックなど）を `___BLANK___` に置き換えてください。",
+      "- quizCode には変更後のコードを記載しますが、学習者が考えるべき実装部分(変数名、条件式、ロジックなど)を複数の `___BLANK___` に積極的に置き換えてください。",
       "- answers には `___BLANK___` に入る正解の文字列を出現順に配列で指定してください。",
       "- explanation には「どういった変更のため」「どういったコードを」「どのように実装するのか」という目的と方針を記載してください。",
       "- overallExplanation には全体的な方針を記載してください。",
@@ -783,7 +783,7 @@ export class WorkspaceVectorSearchService {
       primaryCode,
       "```",
       supplementSnippets
-        ? `\n【参考スニペット（関連ファイル）】\n${supplementSnippets}`
+        ? `\n【参考スニペット(関連ファイル)】\n${supplementSnippets}`
         : "",
     ]
       .join("\n")
@@ -791,7 +791,7 @@ export class WorkspaceVectorSearchService {
 
     const client = new OpenAI({ apiKey });
     const response = await client.chat.completions.create({
-      model: "gpt-4o-mini",
+      model: "gpt-5-mini",
       messages: [
         { role: "system", content: systemPrompt },
         { role: "user", content: userPrompt },
@@ -827,7 +827,7 @@ export class WorkspaceVectorSearchService {
 
     for (const [i, change] of result.changes.entries()) {
       sections.push(
-        `【問題 ${i + 1}】${change.targetFilePath}（${change.startLine}〜${change.endLine}行目）`,
+        `【問題 ${i + 1}】${change.targetFilePath}(${change.startLine}〜${change.endLine}行目)`,
         "",
         `${change.explanation}`,
         "",

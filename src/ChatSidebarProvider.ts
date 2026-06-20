@@ -255,7 +255,7 @@ export class ChatSidebarProvider implements vscode.WebviewViewProvider {
                   const msgDiv = document.createElement('div');
                   msgDiv.className = 'message ' + className;
                   
-                  // botからのメッセージ（かつユーザー入力ではないもの）のみHTMLとして描画
+                  // botからのメッセージ(かつユーザー入力ではないもの)のみHTMLとして描画
                   if (className === 'bot-msg') {
                       msgDiv.innerHTML = formatTextToHtml(text);
                   } else {
