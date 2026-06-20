@@ -787,7 +787,7 @@ export class WorkspaceVectorSearchService {
 
     const client = new OpenAI({ apiKey });
     const response = await client.chat.completions.create({
-      model: "gpt-4o",
+      model: "gpt-5-mini",
       messages: [
         { role: "system", content: systemPrompt },
         { role: "user", content: userPrompt },
