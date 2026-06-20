@@ -56,7 +56,8 @@ export interface CodeChange {
   startLine: number;
   endLine: number;
   beforeCode: string;
-  afterCode: string;
+  quizCode: string;
+  answers: string[];
   explanation: string;
 }
 
@@ -79,14 +80,19 @@ const ANALYSIS_JSON_SCHEMA = {
             targetFilePath: { type: "string" },
             startLine: { type: "integer" },
             endLine: { type: "integer" },
-            afterCode: { type: "string" },
+            quizCode: { type: "string" },
+            answers: {
+              type: "array",
+              items: { type: "string" },
+            },
             explanation: { type: "string" },
           },
           required: [
             "targetFilePath",
             "startLine",
             "endLine",
-            "afterCode",
+            "quizCode",
+            "answers",
             "explanation",
           ],
           additionalProperties: false,
@@ -742,14 +748,12 @@ export class WorkspaceVectorSearchService {
       throw new Error("関連するコードが見つかりませんでした。");
     }
 
-    // プライマリ：スコア最上位ヒットのファイル全体（行番号付き・1000行制限）
     const primary = hits[0]!;
     const primaryCode = await this.readFileWithLimit(
       primary.filePath,
       primary.startLine,
     );
 
-    // 補足：残りのヒットは既存スニペットをそのまま利用（追加I/Oゼロ）
     const supplementSnippets = hits
       .slice(1)
       .map(
@@ -759,16 +763,16 @@ export class WorkspaceVectorSearchService {
       .join("\n\n");
 
     const systemPrompt = [
-      "あなたはプログラミングアシスタントです。",
-      "ユーザーの要件を満たすための修正案を考え、以下の点を厳守して出力してください。",
+      "あなたはプログラミング学習アシスタントです。",
+      "ユーザーがシステムの仕様や実装方法を理解できるように、答えを直接提示するのではなく、コードの一部を穴埋め形式にしたクイズを作成してください。",
       "",
       "【ルール】",
-      "- 必ず指定されたJSONスキーマに厳密に従って出力してください。",
-      "- targetFilePath は提示されたコードに含まれるファイルパスを正確に使用してください。",
-      "- startLine / endLine は提示されたコードの「行番号: コード」形式の数値を使用してください。",
-      "- afterCode には変更後のコード全体を記載してください（省略不可）。",
-      "- explanation には変更理由を日本語で簡潔に記載してください。",
-      "- overallExplanation には全体的な変更方針を日本語で記載してください。",
+      "- 指定されたJSONスキーマに厳密に従って出力してください。",
+      "- targetFilePath, startLine, endLine は提示されたコードの情報を正確に使用してください。",
+      "- quizCode には変更後のコードを記載しますが、学習者が考えるべき重要な実装部分（変数名、条件式、ロジックなど）を `___BLANK___` に置き換えてください。",
+      "- answers には `___BLANK___` に入る正解の文字列を出現順に配列で指定してください。",
+      "- explanation には「どういった変更のため」「どういったコードを」「どのように実装するのか」という目的と方針を記載してください。",
+      "- overallExplanation には全体的な方針を記載してください。",
     ].join("\n");
 
     const userPrompt = [
@@ -787,7 +791,7 @@ export class WorkspaceVectorSearchService {
 
     const client = new OpenAI({ apiKey });
     const response = await client.chat.completions.create({
-      model: "gpt-5-mini",
+      model: "gpt-4o-mini",
       messages: [
         { role: "system", content: systemPrompt },
         { role: "user", content: userPrompt },
@@ -799,13 +803,11 @@ export class WorkspaceVectorSearchService {
     });
 
     const content = response.choices[0]?.message?.content ?? "{}";
-    // structured outputs は JSON 以外が混入しないが念のためフェンス除去
     const parsed = JSON.parse(content.replace(/```json|```/g, "").trim()) as {
       changes: Omit<CodeChange, "beforeCode">[];
       overallExplanation: string;
     };
 
-    // beforeCode をサーバー側で注入（LLMに生成させない）
     const changes: CodeChange[] = await Promise.all(
       parsed.changes.map(async (c) => ({
         ...c,
@@ -820,22 +822,21 @@ export class WorkspaceVectorSearchService {
     return { changes, overallExplanation: parsed.overallExplanation };
   }
 
-  // ---- 整形メソッド ----
   public formatAnalysisResult(result: AnalysisResult): string {
     const sections: string[] = [result.overallExplanation, ""];
 
     for (const [i, change] of result.changes.entries()) {
       sections.push(
-        `【変更 ${i + 1}】${change.targetFilePath}（${change.startLine}〜${change.endLine}行目）`,
+        `【問題 ${i + 1}】${change.targetFilePath}（${change.startLine}〜${change.endLine}行目）`,
         "",
         `${change.explanation}`,
         "",
         "変更前:",
         change.beforeCode,
         "",
-        "変更後:",
+        "実装するコード:",
         "```",
-        change.afterCode,
+        change.quizCode,
         "```",
         "",
       );

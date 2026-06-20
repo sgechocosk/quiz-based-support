@@ -108,7 +108,6 @@ export class ChatSidebarProvider implements vscode.WebviewViewProvider {
     try {
       const results = await this._vectorService.search(query);
 
-      // ---- ここから追加 ----
       this._view?.webview.postMessage({
         type: "status",
         value: "変更案を分析中...",
@@ -118,7 +117,6 @@ export class ChatSidebarProvider implements vscode.WebviewViewProvider {
         results,
       );
       const formatted = this._vectorService.formatAnalysisResult(analysis);
-      // ---- ここまで追加（既存の formatSearchResults 呼び出しを置き換え） ----
 
       this._view?.webview.postMessage({ type: "result", value: formatted });
     } catch (error) {
@@ -164,6 +162,7 @@ export class ChatSidebarProvider implements vscode.WebviewViewProvider {
           <meta charset="UTF-8">
           <meta name="viewport" content="width=device-width, initial-scale=1.0">
           <style>
+              /* --- 既存のスタイル --- */
               html, body { height: 100%; margin: 0; padding: 0; overflow: hidden; }
               body { font-family: var(--vscode-font-family); color: var(--vscode-foreground); }
               #chat-container { display: flex; flex-direction: column; height: 100%; padding: 10px; box-sizing: border-box; }
@@ -174,26 +173,27 @@ export class ChatSidebarProvider implements vscode.WebviewViewProvider {
               .error-msg { color: var(--vscode-errorForeground); }
               .notice-msg { background: var(--vscode-editorHoverWidget-background); border: 1px solid var(--vscode-editorHoverWidget-border); align-self: stretch; max-width: 100%; }
               #input-container { display: flex; gap: 5px; flex-shrink: 0; }
-              input { flex-grow: 1; background: var(--vscode-input-background); color: var(--vscode-input-foreground); border: 1px solid var(--vscode-input-border); padding: 6px; border-radius: 4px; outline: none; }
-              input:focus { border-color: var(--vscode-focusBorder); }
-              
-              button { 
-                  background: var(--vscode-button-background); 
-                  color: var(--vscode-button-foreground); 
-                  border: 1px solid rgba(255, 255, 255, 0.2); 
-                  padding: 6px 12px; 
-                  border-radius: 4px; 
-                  cursor: pointer; 
-                  flex-shrink: 0; 
-                  filter: brightness(1.2); /* 背景と同化を防ぐため明度を上げる */
-              }
+              input[type="text"] { flex-grow: 1; background: var(--vscode-input-background); color: var(--vscode-input-foreground); border: 1px solid var(--vscode-input-border); padding: 6px; border-radius: 4px; outline: none; }
+              input[type="text"]:focus { border-color: var(--vscode-focusBorder); }
+              button { background: var(--vscode-button-background); color: var(--vscode-button-foreground); border: 1px solid rgba(255, 255, 255, 0.2); padding: 6px 12px; border-radius: 4px; cursor: pointer; flex-shrink: 0; filter: brightness(1.2); }
               button:hover { filter: brightness(1.35); }
               button:disabled, input:disabled { opacity: 0.5; cursor: not-allowed; }
-              
               #top-actions { display: flex; gap: 8px; margin-bottom: 10px; flex-shrink: 0; }
               #top-actions button { flex: 1; background: var(--vscode-button-secondaryBackground); color: var(--vscode-button-secondaryForeground); }
               #index-actions { display: none; flex-direction: column; gap: 8px; padding: 8px; border: 1px solid var(--vscode-editorWidget-border); border-radius: 6px; margin-bottom: 10px; }
               #index-actions.visible { display: flex; }
+
+              /* 穴埋め用の入力フィールドスタイル */
+              .quiz-blank {
+                  background: var(--vscode-input-background);
+                  color: var(--vscode-input-foreground);
+                  border: 1px solid var(--vscode-input-border);
+                  padding: 2px 4px;
+                  margin: 0 4px;
+                  border-radius: 3px;
+                  width: 120px;
+                  font-family: var(--vscode-editor-font-family);
+              }
           </style>
       </head>
       <body>
@@ -221,10 +221,47 @@ export class ChatSidebarProvider implements vscode.WebviewViewProvider {
               const indexActions = document.getElementById('index-actions');
               const indexSummary = document.getElementById('index-summary');
 
+              function formatTextToHtml(text) {
+                  const escaped = text
+                      .replace(/&/g, "&amp;")
+                      .replace(/</g, "&lt;")
+                      .replace(/>/g, "&gt;");
+
+                  const parts = escaped.split(/(\`\`\`[\\s\\S]*?\`\`\`)/g);
+                  
+                  return parts.map(part => {
+                      if (part.startsWith('\`\`\`') && part.endsWith('\`\`\`')) {
+                          // --- コードブロック内の処理 ---
+                          // 先頭の改行を取り除く
+                          let code = part.slice(3, -3).replace(/^\\n/, '');
+                          
+                          // コードブロックの中にある ___BLANK___ を入力フィールドに置換する
+                          code = code.replace(/___BLANK___/g, '<input type="text" class="quiz-blank" placeholder="???">');
+                          
+                          return '<pre style="background:var(--vscode-textCodeBlock-background);padding:8px;border-radius:4px;overflow-x:auto;margin:4px 0;"><code>' + code + '</code></pre>';
+                      } else {
+                          // --- 通常テキスト内の処理 ---
+                          let normalText = part.replace(/\\n/g, '<br>');
+                          
+                          // 通常テキストの中にある ___BLANK___ も念のため置換する
+                          normalText = normalText.replace(/___BLANK___/g, '<input type="text" class="quiz-blank" placeholder="???">');
+                          
+                          return normalText;
+                      }
+                  }).join('');
+              }
+
               function addMessage(text, className) {
                   const msgDiv = document.createElement('div');
                   msgDiv.className = 'message ' + className;
-                  msgDiv.textContent = text;
+                  
+                  // botからのメッセージ（かつユーザー入力ではないもの）のみHTMLとして描画
+                  if (className === 'bot-msg') {
+                      msgDiv.innerHTML = formatTextToHtml(text);
+                  } else {
+                      msgDiv.textContent = text;
+                  }
+                  
                   messagesDiv.appendChild(msgDiv);
                   messagesDiv.scrollTop = messagesDiv.scrollHeight;
               }
