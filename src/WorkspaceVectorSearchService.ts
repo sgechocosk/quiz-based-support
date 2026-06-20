@@ -58,6 +58,7 @@ export interface CodeChange {
   beforeCode: string;
   quizCode: string;
   answers: string[];
+  hints: string[];
   explanation: string;
 }
 
@@ -85,6 +86,10 @@ const ANALYSIS_JSON_SCHEMA = {
               type: "array",
               items: { type: "string" },
             },
+            hints: {
+              type: "array",
+              items: { type: "string" },
+            },
             explanation: { type: "string" },
           },
           required: [
@@ -93,6 +98,7 @@ const ANALYSIS_JSON_SCHEMA = {
             "endLine",
             "quizCode",
             "answers",
+            "hints",
             "explanation",
           ],
           additionalProperties: false,
@@ -778,16 +784,23 @@ export class WorkspaceVectorSearchService {
       "  - 型アノテーション: ): ___BLANK___",
       "  - 引数リスト: (___BLANK___)",
       "  - 代入値: = ___BLANK___",
-      "- いずれも認知的負荷を抑えるため、専門知識が十分でなくても少しの思考で解答できるレベルに調整してください。",
       "- 変更のない行にはBLANKを入れないでください。",
       "- answers 配列には ___BLANK___ の出現順に正解を必ず記載してください。",
+      "",
+      "【hintsのルール - 必ず守ること】",
+      "- hints は answers と同じ数・同じ順番で作成してください。",
+      "- 各ヒントは『〇〇するために、□□を使って、～する』という形式で書いてください。",
+      "  - 例: 非同期処理の完了を待つために、awaitを使って、Promiseの結果を受け取ります",
+      "  - 例: 条件が真のときだけ処理を実行するために、if文を使って、戻り値を早期リターンします",
+      "- 正解の単語やコードをそのままヒントに含めないでください。考えるプロセスを促す内容にしてください。",
+      "- 専門知識がなくても少しの思考で解答できるレベルに調整してください。",
       "",
       "【その他のルール】",
       "- 指定されたJSONスキーマに厳密に従って出力してください。",
       "- targetFilePath, startLine, endLine は提示されたコードの情報を正確に使用してください。",
-      "- explanation には学習用に変更の目的を記載してください。",
+      "- explanation には変更全体の目的・背景を学習者向けに記載してください。",
       "- overallExplanation には全体的な学習用の方針を記載してください。",
-      "- ___BLANK___ はコード内にのみ使用し、文字列やコメント、目的や方針内では使用しないでください。",
+      "- ___BLANK___ はコード内にのみ使用し、hints・explanation・overallExplanation 内では使用しないでください。",
     ].join("\n");
 
     const userPrompt = [
@@ -844,23 +857,24 @@ export class WorkspaceVectorSearchService {
     const sections: string[] = [result.overallExplanation, ""];
 
     for (const [i, change] of result.changes.entries()) {
-      // answersをJSON文字列としてコードブロックの前に埋め込む
-      // WebView側がこれを読んでinputのdata-answer属性に割り当てる
       const answersJson = JSON.stringify(change.answers);
+      const hintsJson = JSON.stringify(change.hints);
+
+      // quizCode からBLANKを含む行だけを抽出する
+      const blankLines = change.quizCode
+        .split("\n")
+        .filter((line) => line.includes("___BLANK___"));
 
       sections.push(
         `【問題 ${i + 1}】${change.targetFilePath}(${change.startLine}〜${change.endLine}行目)`,
         "",
-        `${change.explanation}`,
+        change.explanation,
         "",
-        "変更前:",
-        change.beforeCode,
-        "",
-        "実装するコード:",
-        // ___QUIZ_ANSWERS___タグで正解リストをWebViewに渡す
+        // ヒントと入力欄をBLANK順に並べる
         `___QUIZ_ANSWERS___${answersJson}___QUIZ_ANSWERS___`,
+        `___QUIZ_HINTS___${hintsJson}___QUIZ_HINTS___`,
         "```",
-        change.quizCode,
+        blankLines.join("\n"),
         "```",
         "",
       );
