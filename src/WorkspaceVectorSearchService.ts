@@ -762,17 +762,32 @@ export class WorkspaceVectorSearchService {
       )
       .join("\n\n");
 
+    const lineCount = primary.endLine - primary.startLine + 1;
+    const minBlanks = Math.max(3, Math.ceil(lineCount / 5));
+
     const systemPrompt = [
       "あなたはプログラミング学習アシスタントです。",
-      "ユーザーがシステムの仕様や実装方法を理解できるように、答えを直接提示するのではなく、コードの一部を穴埋め形式にしたクイズを作成してください。",
+      "ユーザーが実装方法を自分で考えられるよう、コードの穴埋めクイズを作成してください。",
       "",
-      "【ルール】",
+      "【BLANKのルール - 必ず守ること】",
+      `- quizCode 全体で最低 ${minBlanks} 個以上の ___BLANK___ を必ず挿入してください。`,
+      "- 変更・追加するコード行は、その行に含まれる重要な実装を ___BLANK___ に置き換えてください。",
+      "- BLANKの粒度は『単語1つ、2つ』や、以下のような意味のある単位のいずれかで出題してください。:",
+      "  - 条件式全体: if (___BLANK___)",
+      "  - メソッド呼び出し全体: await ___BLANK___",
+      "  - 型アノテーション: ): ___BLANK___",
+      "  - 引数リスト: (___BLANK___)",
+      "  - 代入値: = ___BLANK___",
+      "- いずれも認知的負荷を抑えるため、専門知識が十分でなくても少しの思考で解答できるレベルに調整してください。",
+      "- 変更のない行にはBLANKを入れないでください。",
+      "- answers 配列には ___BLANK___ の出現順に正解を必ず記載してください。",
+      "",
+      "【その他のルール】",
       "- 指定されたJSONスキーマに厳密に従って出力してください。",
       "- targetFilePath, startLine, endLine は提示されたコードの情報を正確に使用してください。",
-      "- quizCode には変更後のコードを記載しますが、学習者が考えるべき実装部分(変数名、条件式、ロジックなど)を複数の `___BLANK___` に積極的に置き換えてください。",
-      "- answers には `___BLANK___` に入る正解の文字列を出現順に配列で指定してください。",
-      "- explanation には「どういった変更のため」「どういったコードを」「どのように実装するのか」という目的と方針を記載してください。",
-      "- overallExplanation には全体的な方針を記載してください。",
+      "- explanation には学習用に変更の目的を記載してください。",
+      "- overallExplanation には全体的な学習用の方針を記載してください。",
+      "- ___BLANK___ はコード内にのみ使用し、文字列やコメント、目的や方針内では使用しないでください。",
     ].join("\n");
 
     const userPrompt = [
@@ -785,6 +800,9 @@ export class WorkspaceVectorSearchService {
       supplementSnippets
         ? `\n【参考スニペット(関連ファイル)】\n${supplementSnippets}`
         : "",
+      "",
+      `【重要】quizCode には最低 ${minBlanks} 個の ___BLANK___ を含めること。`,
+      "変更する各行に対して意味ある単位でBLANKを設置し、answers にその正解を順番通りに入れてください。",
     ]
       .join("\n")
       .trim();
@@ -826,6 +844,10 @@ export class WorkspaceVectorSearchService {
     const sections: string[] = [result.overallExplanation, ""];
 
     for (const [i, change] of result.changes.entries()) {
+      // answersをJSON文字列としてコードブロックの前に埋め込む
+      // WebView側がこれを読んでinputのdata-answer属性に割り当てる
+      const answersJson = JSON.stringify(change.answers);
+
       sections.push(
         `【問題 ${i + 1}】${change.targetFilePath}(${change.startLine}〜${change.endLine}行目)`,
         "",
@@ -835,6 +857,8 @@ export class WorkspaceVectorSearchService {
         change.beforeCode,
         "",
         "実装するコード:",
+        // ___QUIZ_ANSWERS___タグで正解リストをWebViewに渡す
+        `___QUIZ_ANSWERS___${answersJson}___QUIZ_ANSWERS___`,
         "```",
         change.quizCode,
         "```",

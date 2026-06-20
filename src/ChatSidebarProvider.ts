@@ -155,184 +155,225 @@ export class ChatSidebarProvider implements vscode.WebviewViewProvider {
   }
 
   private _getHtmlForWebview() {
-    return `
-      <!DOCTYPE html>
-      <html lang="ja">
-      <head>
-          <meta charset="UTF-8">
-          <meta name="viewport" content="width=device-width, initial-scale=1.0">
-          <style>
-              /* --- 既存のスタイル --- */
-              html, body { height: 100%; margin: 0; padding: 0; overflow: hidden; }
-              body { font-family: var(--vscode-font-family); color: var(--vscode-foreground); }
-              #chat-container { display: flex; flex-direction: column; height: 100%; padding: 10px; box-sizing: border-box; }
-              #messages { flex-grow: 1; overflow-y: auto; margin-bottom: 10px; display: flex; flex-direction: column; gap: 8px; padding-right: 4px; }
-              .message { padding: 8px; border-radius: 6px; font-size: 13px; line-height: 1.4; word-wrap: break-word; white-space: pre-wrap; }
-              .user-msg { background-color: var(--vscode-button-background); color: var(--vscode-button-foreground); align-self: flex-end; max-width: 85%; }
-              .bot-msg { background-color: var(--vscode-editor-inactiveSelectionBackground); align-self: flex-start; max-width: 95%; }
-              .error-msg { color: var(--vscode-errorForeground); }
-              .notice-msg { background: var(--vscode-editorHoverWidget-background); border: 1px solid var(--vscode-editorHoverWidget-border); align-self: stretch; max-width: 100%; }
-              #input-container { display: flex; gap: 5px; flex-shrink: 0; }
-              input[type="text"] { flex-grow: 1; background: var(--vscode-input-background); color: var(--vscode-input-foreground); border: 1px solid var(--vscode-input-border); padding: 6px; border-radius: 4px; outline: none; }
-              input[type="text"]:focus { border-color: var(--vscode-focusBorder); }
-              button { background: var(--vscode-button-background); color: var(--vscode-button-foreground); border: 1px solid rgba(255, 255, 255, 0.2); padding: 6px 12px; border-radius: 4px; cursor: pointer; flex-shrink: 0; filter: brightness(1.2); }
-              button:hover { filter: brightness(1.35); }
-              button:disabled, input:disabled { opacity: 0.5; cursor: not-allowed; }
-              #top-actions { display: flex; gap: 8px; margin-bottom: 10px; flex-shrink: 0; }
-              #top-actions button { flex: 1; background: var(--vscode-button-secondaryBackground); color: var(--vscode-button-secondaryForeground); }
-              #index-actions { display: none; flex-direction: column; gap: 8px; padding: 8px; border: 1px solid var(--vscode-editorWidget-border); border-radius: 6px; margin-bottom: 10px; }
-              #index-actions.visible { display: flex; }
+    const script = this._getScriptContent();
+    const style = this._getStyleContent();
 
-              /* 穴埋め用の入力フィールドスタイル */
-              .quiz-blank {
-                  background: var(--vscode-input-background);
-                  color: var(--vscode-input-foreground);
-                  border: 1px solid var(--vscode-input-border);
-                  padding: 2px 4px;
-                  margin: 0 4px;
-                  border-radius: 3px;
-                  width: 120px;
-                  font-family: var(--vscode-editor-font-family);
-              }
-          </style>
-      </head>
-      <body>
-          <div id="chat-container">
-              <div id="top-actions">
-                  <button id="setup-btn">API Key</button>
-                  <button id="scan-btn">ベクトル化</button>
-              </div>
-              <div id="index-actions">
-                  <div id="index-summary" class="message notice-msg"></div>
-                  <button id="index-btn">確定して実行</button>
-              </div>
-              <div id="messages"></div>
-              <div id="input-container">
-                  <input type="text" id="query-input" placeholder="準備中..." disabled />
-                  <button id="send-btn" disabled>送信</button>
-              </div>
-          </div>
+    return (
+      "<!DOCTYPE html>" +
+      '<html lang="ja">' +
+      "<head>" +
+      '<meta charset="UTF-8">' +
+      '<meta name="viewport" content="width=device-width, initial-scale=1.0">' +
+      "<style>" +
+      style +
+      "</style>" +
+      "</head>" +
+      "<body>" +
+      '<div id="chat-container">' +
+      '<div id="top-actions">' +
+      '<button id="setup-btn">API Key</button>' +
+      '<button id="scan-btn">ベクトル化</button>' +
+      "</div>" +
+      '<div id="index-actions">' +
+      '<div id="index-summary" class="message notice-msg"></div>' +
+      '<button id="index-btn">確定して実行</button>' +
+      "</div>" +
+      '<div id="messages"></div>' +
+      '<div id="input-container">' +
+      '<input type="text" id="query-input" placeholder="準備中..." disabled />' +
+      '<button id="send-btn" disabled>送信</button>' +
+      "</div>" +
+      "</div>" +
+      "<script>" +
+      script +
+      "</script>" +
+      "</body>" +
+      "</html>"
+    );
+  }
 
-          <script>
-              const vscode = acquireVsCodeApi();
-              const messagesDiv = document.getElementById('messages');
-              const input = document.getElementById('query-input');
-              const sendBtn = document.getElementById('send-btn');
-              const indexActions = document.getElementById('index-actions');
-              const indexSummary = document.getElementById('index-summary');
+  private _getStyleContent(): string {
+    return [
+      "html, body { height: 100%; margin: 0; padding: 0; overflow: hidden; }",
+      "body { font-family: var(--vscode-font-family); color: var(--vscode-foreground); }",
+      "#chat-container { display: flex; flex-direction: column; height: 100%; padding: 10px; box-sizing: border-box; }",
+      "#messages { flex-grow: 1; overflow-y: auto; margin-bottom: 10px; display: flex; flex-direction: column; gap: 8px; padding-right: 4px; }",
+      ".message { padding: 8px; border-radius: 6px; font-size: 13px; line-height: 1.4; word-wrap: break-word; white-space: pre-wrap; }",
+      ".user-msg { background-color: var(--vscode-button-background); color: var(--vscode-button-foreground); align-self: flex-end; max-width: 85%; }",
+      ".bot-msg { background-color: var(--vscode-editor-inactiveSelectionBackground); align-self: flex-start; max-width: 95%; }",
+      ".error-msg { color: var(--vscode-errorForeground); }",
+      ".notice-msg { background: var(--vscode-editorHoverWidget-background); border: 1px solid var(--vscode-editorHoverWidget-border); align-self: stretch; max-width: 100%; }",
+      "#input-container { display: flex; gap: 5px; flex-shrink: 0; }",
+      'input[type="text"] { flex-grow: 1; background: var(--vscode-input-background); color: var(--vscode-input-foreground); border: 1px solid var(--vscode-input-border); padding: 6px; border-radius: 4px; outline: none; }',
+      'input[type="text"]:focus { border-color: var(--vscode-focusBorder); }',
+      "button { background: var(--vscode-button-background); color: var(--vscode-button-foreground); border: 1px solid rgba(255, 255, 255, 0.2); padding: 6px 12px; border-radius: 4px; cursor: pointer; flex-shrink: 0; filter: brightness(1.2); }",
+      "button:hover { filter: brightness(1.35); }",
+      "button:disabled, input:disabled { opacity: 0.5; cursor: not-allowed; }",
+      "#top-actions { display: flex; gap: 8px; margin-bottom: 10px; flex-shrink: 0; }",
+      "#top-actions button { flex: 1; background: var(--vscode-button-secondaryBackground); color: var(--vscode-button-secondaryForeground); }",
+      "#index-actions { display: none; flex-direction: column; gap: 8px; padding: 8px; border: 1px solid var(--vscode-editorWidget-border); border-radius: 6px; margin-bottom: 10px; }",
+      "#index-actions.visible { display: flex; }",
+      ".quiz-blank { background: var(--vscode-input-background); color: var(--vscode-input-foreground); border: 1px solid var(--vscode-input-border); padding: 2px 6px; margin: 0 4px; border-radius: 3px; font-family: var(--vscode-editor-font-family); font-size: 0.95em; }",
+      ".quiz-blank.correct { border-color: #4caf50; background: rgba(76, 175, 80, 0.15); }",
+      ".quiz-blank.incorrect { border-color: #f44336; background: rgba(244, 67, 54, 0.15); }",
+      ".grade-btn { margin-top: 6px; background: var(--vscode-button-secondaryBackground); color: var(--vscode-button-secondaryForeground); width: 100%; }",
+      ".grade-result { font-size: 12px; margin-top: 4px; color: var(--vscode-foreground); opacity: 0.8; }",
+    ].join("\n");
+  }
 
-              function formatTextToHtml(text) {
-                  const escaped = text
-                      .replace(/&/g, "&amp;")
-                      .replace(/</g, "&lt;")
-                      .replace(/>/g, "&gt;");
-
-                  const parts = escaped.split(/(\`\`\`[\\s\\S]*?\`\`\`)/g);
-                  
-                  return parts.map(part => {
-                      if (part.startsWith('\`\`\`') && part.endsWith('\`\`\`')) {
-                          // --- コードブロック内の処理 ---
-                          // 先頭の改行を取り除く
-                          let code = part.slice(3, -3).replace(/^\\n/, '');
-                          
-                          // コードブロックの中にある ___BLANK___ を入力フィールドに置換する
-                          code = code.replace(/___BLANK___/g, '<input type="text" class="quiz-blank" placeholder="???">');
-                          
-                          return '<pre style="background:var(--vscode-textCodeBlock-background);padding:8px;border-radius:4px;overflow-x:auto;margin:4px 0;"><code>' + code + '</code></pre>';
-                      } else {
-                          // --- 通常テキスト内の処理 ---
-                          let normalText = part.replace(/\\n/g, '<br>');
-                          
-                          // 通常テキストの中にある ___BLANK___ も念のため置換する
-                          normalText = normalText.replace(/___BLANK___/g, '<input type="text" class="quiz-blank" placeholder="???">');
-                          
-                          return normalText;
-                      }
-                  }).join('');
-              }
-
-              function addMessage(text, className) {
-                  const msgDiv = document.createElement('div');
-                  msgDiv.className = 'message ' + className;
-                  
-                  // botからのメッセージ(かつユーザー入力ではないもの)のみHTMLとして描画
-                  if (className === 'bot-msg') {
-                      msgDiv.innerHTML = formatTextToHtml(text);
-                  } else {
-                      msgDiv.textContent = text;
-                  }
-                  
-                  messagesDiv.appendChild(msgDiv);
-                  messagesDiv.scrollTop = messagesDiv.scrollHeight;
-              }
-
-              function setInputState(enabled, placeholder) {
-                  input.disabled = !enabled;
-                  sendBtn.disabled = !enabled;
-                  input.placeholder = placeholder;
-              }
-
-              document.getElementById('send-btn').addEventListener('click', () => {
-                  const text = input.value.trim();
-                  if (text) {
-                      addMessage(text, 'user-msg');
-                      input.value = '';
-                      vscode.postMessage({ type: 'searchQuery', value: text });
-                  }
-              });
-
-              document.getElementById('setup-btn').addEventListener('click', () => {
-                  vscode.postMessage({ type: 'requestSetApiKey' });
-              });
-
-              document.getElementById('scan-btn').addEventListener('click', () => {
-                  vscode.postMessage({ type: 'requestScan' });
-              });
-
-              document.getElementById('index-btn').addEventListener('click', () => {
-                  vscode.postMessage({ type: 'confirmBuildIndex' });
-              });
-
-              window.addEventListener('message', event => {
-                  const message = event.data;
-                  switch (message.type) {
-                      case 'state':
-                          if (message.value === 'require-api-key') {
-                              addMessage('APIキーが未設定です。API Keyボタンから設定してください。', 'bot-msg');
-                              setInputState(false, 'APIキーを設定してください...');
-                              indexActions.classList.remove('visible');
-                          } else if (message.value === 'require-scan') {
-                              addMessage('APIキーを確認しました。上部のベクトル化ボタンを押してスキャンを開始してください。', 'bot-msg');
-                              setInputState(false, 'スキャンを行ってください...');
-                              indexActions.classList.remove('visible');
-                          } else if (message.value === 'ready') {
-                              addMessage(message.message || '準備完了です。コードの機能や役割を入力してください。', 'bot-msg');
-                              setInputState(true, '例: ログイン処理のコードは？');
-                              indexActions.classList.remove('visible');
-                          }
-                          break;
-                      case 'scanResult':
-                          setInputState(false, '承認待ち...');
-                          indexSummary.textContent = message.summary;
-                          indexActions.classList.add('visible');
-                          addMessage('スキャンが完了しました。トークン数を確認し、よろしければ確定して実行ボタンを押してください。', 'bot-msg');
-                          break;
-                      case 'result':
-                      case 'status':
-                          addMessage(message.value, 'bot-msg');
-                          break;
-                      case 'error':
-                          addMessage('エラー: ' + message.value, 'error-msg');
-                          break;
-                  }
-              });
-
-              input.addEventListener('keypress', (e) => {
-                  if (e.key === 'Enter') sendBtn.click();
-              });
-          </script>
-      </body>
-      </html>
-    `;
+  private _getScriptContent(): string {
+    return [
+      "const vscode = acquireVsCodeApi();",
+      "const messagesDiv = document.getElementById('messages');",
+      "const input = document.getElementById('query-input');",
+      "const sendBtn = document.getElementById('send-btn');",
+      "const indexActions = document.getElementById('index-actions');",
+      "const indexSummary = document.getElementById('index-summary');",
+      "",
+      "function gradeQuiz(btn) {",
+      "  const msgDiv = btn.closest('.message');",
+      "  const inputs = msgDiv.querySelectorAll('.quiz-blank');",
+      "  let correct = 0;",
+      "  inputs.forEach(function(inp) {",
+      "    const userAnswer = inp.value.trim();",
+      "    const correctAnswer = inp.dataset.answer || '';",
+      "    const normalize = function(s) { return s.trim().replace(/;$/, '').replace(/\\s+/g, ' '); };",
+      "    const isCorrect = normalize(userAnswer) === normalize(correctAnswer);",
+      "    inp.classList.remove('correct', 'incorrect');",
+      "    inp.classList.add(isCorrect ? 'correct' : 'incorrect');",
+      "    inp.title = isCorrect ? '正解！' : ('正解: ' + correctAnswer);",
+      "    if (isCorrect) correct++;",
+      "  });",
+      "  const resultDiv = btn.nextElementSibling;",
+      "  resultDiv.textContent = '結果: ' + inputs.length + '問中 ' + correct + '問正解 (' + Math.round(correct / inputs.length * 100) + '%)';",
+      "  btn.disabled = true;",
+      "  btn.textContent = '採点済み';",
+      "}",
+      "",
+      "function formatTextToHtml(text) {",
+      "  const escaped = text",
+      "    .replace(/&/g, '&amp;')",
+      "    .replace(/</g, '&lt;')",
+      "    .replace(/>/g, '&gt;');",
+      "",
+      "  let answers = [];",
+      "  const answersMatch = escaped.match(/___QUIZ_ANSWERS___([\\s\\S]*?)___QUIZ_ANSWERS___/);",
+      "  if (answersMatch) {",
+      "    try { answers = JSON.parse(answersMatch[1]); } catch(e) {}",
+      "  }",
+      "  const cleanedText = escaped.replace(/___QUIZ_ANSWERS___[\\s\\S]*?___QUIZ_ANSWERS___\\n?/g, '');",
+      "",
+      "  let blankIndex = 0;",
+      "  const codeBlockRegex = new RegExp('(' + '`'.repeat(3) + '[\\\\s\\\\S]*?' + '`'.repeat(3) + ')', 'g');",
+      "  const parts = cleanedText.split(codeBlockRegex);",
+      "",
+      "  const html = parts.map(function(part) {",
+      "    if (part.startsWith('```') && part.endsWith('```')) {",
+      "      let code = part.slice(3, -3).replace(/^\\n/, '');",
+      "      code = code.replace(/___BLANK___/g, function() {",
+      "        const answer = answers[blankIndex] || '';",
+      "        const escapedAnswer = answer.replace(/\"/g, '&quot;');",
+      "        const width = Math.max(80, Math.min(300, answer.length * 9 + 40));",
+      "        blankIndex++;",
+      '        return \'<input type="text" class="quiz-blank" placeholder="???" data-answer="\' + escapedAnswer + \'" style="width:\' + width + \'px">\';',
+      "      });",
+      "      return '<pre style=\"background:var(--vscode-textCodeBlock-background);padding:8px;border-radius:4px;overflow-x:auto;margin:4px 0;\"><code>' + code + '</code></pre>';",
+      "    } else {",
+      "      let normalText = part.replace(/\\n/g, '<br>');",
+      "      normalText = normalText.replace(/___BLANK___/g, function() {",
+      "        const answer = answers[blankIndex] || '';",
+      "        const escapedAnswer = answer.replace(/\"/g, '&quot;');",
+      "        blankIndex++;",
+      '        return \'<input type="text" class="quiz-blank" placeholder="???" data-answer="\' + escapedAnswer + \'">\';',
+      "      });",
+      "      return normalText;",
+      "    }",
+      "  }).join('');",
+      "",
+      "  if (answers.length > 0) {",
+      "    return html",
+      "      + '<button class=\"grade-btn\" onclick=\"gradeQuiz(this)\">採点する (' + answers.length + '問)</button>'",
+      "      + '<div class=\"grade-result\"></div>';",
+      "  }",
+      "  return html;",
+      "}",
+      "",
+      "function addMessage(text, className) {",
+      "  const msgDiv = document.createElement('div');",
+      "  msgDiv.className = 'message ' + className;",
+      "  if (className === 'bot-msg') {",
+      "    msgDiv.innerHTML = formatTextToHtml(text);",
+      "  } else {",
+      "    msgDiv.textContent = text;",
+      "  }",
+      "  messagesDiv.appendChild(msgDiv);",
+      "  messagesDiv.scrollTop = messagesDiv.scrollHeight;",
+      "}",
+      "",
+      "function setInputState(enabled, placeholder) {",
+      "  input.disabled = !enabled;",
+      "  sendBtn.disabled = !enabled;",
+      "  input.placeholder = placeholder;",
+      "}",
+      "",
+      "document.getElementById('send-btn').addEventListener('click', function() {",
+      "  const text = input.value.trim();",
+      "  if (text) {",
+      "    addMessage(text, 'user-msg');",
+      "    input.value = '';",
+      "    vscode.postMessage({ type: 'searchQuery', value: text });",
+      "  }",
+      "});",
+      "",
+      "document.getElementById('setup-btn').addEventListener('click', function() {",
+      "  vscode.postMessage({ type: 'requestSetApiKey' });",
+      "});",
+      "",
+      "document.getElementById('scan-btn').addEventListener('click', function() {",
+      "  vscode.postMessage({ type: 'requestScan' });",
+      "});",
+      "",
+      "document.getElementById('index-btn').addEventListener('click', function() {",
+      "  vscode.postMessage({ type: 'confirmBuildIndex' });",
+      "});",
+      "",
+      "input.addEventListener('keypress', function(e) {",
+      "  if (e.key === 'Enter') sendBtn.click();",
+      "});",
+      "",
+      "window.addEventListener('message', function(event) {",
+      "  const message = event.data;",
+      "  switch (message.type) {",
+      "    case 'state':",
+      "      if (message.value === 'require-api-key') {",
+      "        addMessage('APIキーが未設定です。API Keyボタンから設定してください。', 'bot-msg');",
+      "        setInputState(false, 'APIキーを設定してください...');",
+      "        indexActions.classList.remove('visible');",
+      "      } else if (message.value === 'require-scan') {",
+      "        addMessage('APIキーを確認しました。上部のベクトル化ボタンを押してスキャンを開始してください。', 'bot-msg');",
+      "        setInputState(false, 'スキャンを行ってください...');",
+      "        indexActions.classList.remove('visible');",
+      "      } else if (message.value === 'ready') {",
+      "        addMessage(message.message || '準備完了です。コードの機能や役割を入力してください。', 'bot-msg');",
+      "        setInputState(true, '例: ログイン処理のコードは？');",
+      "        indexActions.classList.remove('visible');",
+      "      }",
+      "      break;",
+      "    case 'scanResult':",
+      "      setInputState(false, '承認待ち...');",
+      "      indexSummary.textContent = message.summary;",
+      "      indexActions.classList.add('visible');",
+      "      addMessage('スキャンが完了しました。トークン数を確認し、よろしければ確定して実行ボタンを押してください。', 'bot-msg');",
+      "      break;",
+      "    case 'result':",
+      "    case 'status':",
+      "      addMessage(message.value, 'bot-msg');",
+      "      break;",
+      "    case 'error':",
+      "      addMessage('エラー: ' + message.value, 'error-msg');",
+      "      break;",
+      "  }",
+      "});",
+    ].join("\n");
   }
 }
