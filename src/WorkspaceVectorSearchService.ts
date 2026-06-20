@@ -853,6 +853,37 @@ export class WorkspaceVectorSearchService {
     return { changes, overallExplanation: parsed.overallExplanation };
   }
 
+  public async applyCode(
+    filePath: string,
+    startLine: number,
+    endLine: number,
+    quizCode: string,
+    userAnswers: string[],
+  ): Promise<void> {
+    // ___BLANK___ をユーザー回答で順番に置換して完成コードを作る
+    let answerIndex = 0;
+    const completedCode = quizCode.replace(/___BLANK___/g, () => {
+      return userAnswers[answerIndex++] ?? "";
+    });
+
+    // ファイル全体を読み込む
+    const fileUri = vscode.Uri.joinPath(this.workspaceFolder.uri, filePath);
+    const bytes = await vscode.workspace.fs.readFile(fileUri);
+    const text = new TextDecoder("utf-8").decode(bytes);
+    const lines = text.split(/\r?\n/);
+
+    // startLine〜endLine（1始まり）を完成コードの行で差し替える
+    const completedLines = completedCode.split("\n");
+    lines.splice(startLine - 1, endLine - startLine + 1, ...completedLines);
+
+    // 書き戻す
+    const newText = lines.join("\n");
+    await vscode.workspace.fs.writeFile(
+      fileUri,
+      new TextEncoder().encode(newText),
+    );
+  }
+
   public formatAnalysisResult(result: AnalysisResult): string {
     const sections: string[] = [result.overallExplanation, ""];
 
@@ -860,7 +891,14 @@ export class WorkspaceVectorSearchService {
       const answersJson = JSON.stringify(change.answers);
       const hintsJson = JSON.stringify(change.hints);
 
-      // quizCode からBLANKを含む行だけを抽出する
+      // applyCode用に必要な情報をすべてメタタグに含める
+      const metaJson = JSON.stringify({
+        filePath: change.targetFilePath,
+        startLine: change.startLine,
+        endLine: change.endLine,
+        quizCode: change.quizCode,
+      });
+
       const blankLines = change.quizCode
         .split("\n")
         .filter((line) => line.includes("___BLANK___"));
@@ -870,9 +908,9 @@ export class WorkspaceVectorSearchService {
         "",
         change.explanation,
         "",
-        // ヒントと入力欄をBLANK順に並べる
         `___QUIZ_ANSWERS___${answersJson}___QUIZ_ANSWERS___`,
         `___QUIZ_HINTS___${hintsJson}___QUIZ_HINTS___`,
+        `___QUIZ_META___${metaJson}___QUIZ_META___`, // ← 追加
         "```",
         blankLines.join("\n"),
         "```",

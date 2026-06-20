@@ -43,6 +43,9 @@ export class ChatSidebarProvider implements vscode.WebviewViewProvider {
         case "confirmBuildIndex":
           await this.handleBuildIndex();
           break;
+        case "applyCode":
+          await this.handleApplyCode(data);
+          break;
       }
     });
   }
@@ -154,6 +157,35 @@ export class ChatSidebarProvider implements vscode.WebviewViewProvider {
     }
   }
 
+  private async handleApplyCode(data: {
+    filePath: string;
+    startLine: number;
+    endLine: number;
+    quizCode: string;
+    userAnswers: string[];
+  }) {
+    try {
+      await this._vectorService.applyCode(
+        data.filePath,
+        data.startLine,
+        data.endLine,
+        data.quizCode,
+        data.userAnswers,
+      );
+      this._view?.webview.postMessage({
+        type: "applyCodeResult",
+        success: true,
+      });
+    } catch (error) {
+      this._view?.webview.postMessage({
+        type: "applyCodeResult",
+        success: false,
+        message:
+          error instanceof Error ? error.message : "反映に失敗しました。",
+      });
+    }
+  }
+
   private _getHtmlForWebview() {
     const script = this._getScriptContent();
     const style = this._getStyleContent();
@@ -227,6 +259,9 @@ export class ChatSidebarProvider implements vscode.WebviewViewProvider {
       ".result-correct { color: #4caf50; }",
       ".result-incorrect { color: #f44336; }",
       ".result-correct code, .result-incorrect code { background: var(--vscode-textCodeBlock-background); padding: 1px 4px; border-radius: 3px; font-family: var(--vscode-editor-font-family); }",
+      ".apply-btn { margin-top: 6px; background: var(--vscode-button-background); color: var(--vscode-button-foreground); width: 100%; }",
+      ".apply-btn:disabled { opacity: 0.5; }",
+      ".apply-btn.applied { background: var(--vscode-button-secondaryBackground); color: var(--vscode-button-secondaryForeground); }",
     ].join("\n");
   }
 
@@ -265,7 +300,30 @@ export class ChatSidebarProvider implements vscode.WebviewViewProvider {
       "  totalDiv.textContent = '結果: ' + rows.length + '問中 ' + correct + '問正解 (' + Math.round(correct / rows.length * 100) + '%)';",
       "  btn.disabled = true;",
       "  btn.textContent = '採点済み';",
-      "}",
+      "  const applyBtn = document.createElement('button');",
+      "  applyBtn.className = 'apply-btn';",
+      "  applyBtn.textContent = 'コードに反映する';",
+      "  btn.parentNode.insertBefore(applyBtn, totalDiv);",
+      "  applyBtn.addEventListener('click', function() {",
+      "    const msgDiv = applyBtn.closest('.message');",
+      // メタ情報を data 属性から取得
+      "    const metaEl = msgDiv.querySelector('[data-quiz-meta]');",
+      "    if (!metaEl) return;",
+      "    const meta = JSON.parse(metaEl.dataset.quizMeta);",
+      // 全inputの現在値をユーザー回答として収集
+      "    const inputs = msgDiv.querySelectorAll('.quiz-blank');",
+      "    const userAnswers = Array.from(inputs).map(function(inp) { return inp.value.trim(); });",
+      "    vscode.postMessage({",
+      "      type: 'applyCode',",
+      "      filePath: meta.filePath,",
+      "      startLine: meta.startLine,",
+      "      endLine: meta.endLine,",
+      "      quizCode: meta.quizCode,",
+      "      userAnswers: userAnswers,",
+      "    });",
+      "    applyBtn.disabled = true;",
+      "    applyBtn.textContent = '反映中...';",
+      "  });",
       "",
       "function formatTextToHtml(text) {",
       "  const escaped = text.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');",
@@ -278,9 +336,14 @@ export class ChatSidebarProvider implements vscode.WebviewViewProvider {
       "  const hMatch = escaped.match(/___QUIZ_HINTS___(.*?)___QUIZ_HINTS___/);",
       "  if (hMatch) { try { hints = JSON.parse(hMatch[1]); } catch(e) {} }",
       "",
+      "  let meta = null;", // ← 追加
+      "  const mMatch = escaped.match(/___QUIZ_META___(.*?)___QUIZ_META___/);", // ← 追加
+      "  if (mMatch) { try { meta = JSON.parse(mMatch[1]); } catch(e) {} }", // ← 追加
+      "",
       "  let cleaned = escaped",
       "    .replace(/___QUIZ_ANSWERS___.*?___QUIZ_ANSWERS___\\n?/g, '')",
-      "    .replace(/___QUIZ_HINTS___.*?___QUIZ_HINTS___\\n?/g, '');",
+      "    .replace(/___QUIZ_HINTS___.*?___QUIZ_HINTS___\\n?/g, '')",
+      "    .replace(/___QUIZ_META___.*?___QUIZ_META___\\n?/g, '');",
       "",
       "  const codeBlockRegex = new RegExp('(' + '`'.repeat(3) + '[\\\\s\\\\S]*?' + '`'.repeat(3) + ')', 'g');",
       "  const parts = cleaned.split(codeBlockRegex);",
@@ -317,7 +380,10 @@ export class ChatSidebarProvider implements vscode.WebviewViewProvider {
       "  }).join('');",
       "",
       "  if (answers.length > 0) {",
-      "    return htmlParts",
+      // メタ情報を不可視要素として埋め込む（gradeQuiz が参照する）
+      "    const metaAttr = meta ? ' data-quiz-meta=\'' + JSON.stringify(meta).replace(/'/g, '&#39;') + '\'' : '';",
+      "    return '<span style=\"display:none\"' + metaAttr + '></span>'",
+      "      + htmlParts",
       "      + '<button class=\"grade-btn\" onclick=\"gradeQuiz(this)\">解答チェック (' + answers.length + '問)</button>'",
       "      + '<div class=\"grade-result\"></div>';",
       "  }",
@@ -394,6 +460,19 @@ export class ChatSidebarProvider implements vscode.WebviewViewProvider {
       "    case 'result':",
       "    case 'status':",
       "      addMessage(message.value, 'bot-msg');",
+      "      break;",
+      "    case 'applyCodeResult':",
+      "      const applyBtns = document.querySelectorAll('.apply-btn');",
+      "      const lastApplyBtn = applyBtns[applyBtns.length - 1];",
+      "      if (lastApplyBtn) {",
+      "        if (message.success) {",
+      "          lastApplyBtn.textContent = '反映済み';",
+      "          lastApplyBtn.classList.add('applied');",
+      "        } else {",
+      "          lastApplyBtn.disabled = false;",
+      "          lastApplyBtn.textContent = '反映失敗 - 再試行';",
+      "        }",
+      "      }",
       "      break;",
       "    case 'error':",
       "      addMessage('エラー: ' + message.value, 'error-msg');",
