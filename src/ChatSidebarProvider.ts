@@ -107,7 +107,19 @@ export class ChatSidebarProvider implements vscode.WebviewViewProvider {
     });
     try {
       const results = await this._vectorService.search(query);
-      const formatted = this._vectorService.formatSearchResults(query, results);
+
+      // ---- ここから追加 ----
+      this._view?.webview.postMessage({
+        type: "status",
+        value: "変更案を分析中...",
+      });
+      const analysis = await this._vectorService.analyzeAndSuggest(
+        query,
+        results,
+      );
+      const formatted = this._vectorService.formatAnalysisResult(analysis);
+      // ---- ここまで追加（既存の formatSearchResults 呼び出しを置き換え） ----
+
       this._view?.webview.postMessage({ type: "result", value: formatted });
     } catch (error) {
       this._view?.webview.postMessage({

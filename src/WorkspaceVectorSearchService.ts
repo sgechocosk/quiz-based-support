@@ -51,6 +51,54 @@ interface SearchHit {
   snippet: string;
 }
 
+export interface CodeChange {
+  targetFilePath: string;
+  startLine: number;
+  endLine: number;
+  beforeCode: string;
+  afterCode: string;
+  explanation: string;
+}
+
+export interface AnalysisResult {
+  changes: CodeChange[];
+  overallExplanation: string;
+}
+
+const ANALYSIS_JSON_SCHEMA = {
+  name: "analysis_result",
+  strict: true,
+  schema: {
+    type: "object",
+    properties: {
+      changes: {
+        type: "array",
+        items: {
+          type: "object",
+          properties: {
+            targetFilePath: { type: "string" },
+            startLine: { type: "integer" },
+            endLine: { type: "integer" },
+            afterCode: { type: "string" },
+            explanation: { type: "string" },
+          },
+          required: [
+            "targetFilePath",
+            "startLine",
+            "endLine",
+            "afterCode",
+            "explanation",
+          ],
+          additionalProperties: false,
+        },
+      },
+      overallExplanation: { type: "string" },
+    },
+    required: ["changes", "overallExplanation"],
+    additionalProperties: false,
+  },
+} as const;
+
 export class WorkspaceVectorSearchService {
   private static parserInitPromise: Promise<void> | undefined;
   private static languageCache = new Map<
@@ -653,5 +701,146 @@ export class WorkspaceVectorSearchService {
       .update(this.workspaceFolder.uri.fsPath)
       .digest("hex")
       .slice(0, 12);
+  }
+
+  private async readFileWithLimit(
+    relativePath: string,
+    anchorLine: number,
+    maxLines = 1000,
+  ): Promise<string> {
+    const file = vscode.Uri.joinPath(this.workspaceFolder.uri, relativePath);
+    const text = await this.readFileText(file);
+    const lines = text.split(/\r?\n/);
+
+    let sliced: string[];
+    if (lines.length <= maxLines) {
+      sliced = lines;
+    } else {
+      // ヒット行を中心に前後均等にウィンドウを取る
+      const half = Math.floor(maxLines / 2);
+      const start = Math.max(0, anchorLine - 1 - half);
+      const end = Math.min(lines.length, start + maxLines);
+      sliced = lines.slice(start, end);
+      // 行番号は元ファイル基準にするためオフセットを保持
+      return sliced.map((line, i) => `${start + i + 1}: ${line}`).join("\n");
+    }
+
+    return sliced.map((line, i) => `${i + 1}: ${line}`).join("\n");
+  }
+
+  // ---- メインの公開メソッド ----
+  public async analyzeAndSuggest(
+    query: string,
+    hits: SearchHit[],
+  ): Promise<AnalysisResult> {
+    const apiKey = await this.context.secrets.get("openai-api-key");
+    if (!apiKey) {
+      throw new Error("OpenAI APIキーが設定されていません。");
+    }
+
+    if (hits.length === 0) {
+      throw new Error("関連するコードが見つかりませんでした。");
+    }
+
+    // プライマリ：スコア最上位ヒットのファイル全体（行番号付き・1000行制限）
+    const primary = hits[0]!;
+    const primaryCode = await this.readFileWithLimit(
+      primary.filePath,
+      primary.startLine,
+    );
+
+    // 補足：残りのヒットは既存スニペットをそのまま利用（追加I/Oゼロ）
+    const supplementSnippets = hits
+      .slice(1)
+      .map(
+        (hit) =>
+          `--- ${hit.filePath} (L${hit.startLine}-${hit.endLine}, ${hit.kind}: ${hit.symbolName}) ---\n${hit.snippet}`,
+      )
+      .join("\n\n");
+
+    const systemPrompt = [
+      "あなたはプログラミングアシスタントです。",
+      "ユーザーの要件を満たすための修正案を考え、以下の点を厳守して出力してください。",
+      "",
+      "【ルール】",
+      "- 必ず指定されたJSONスキーマに厳密に従って出力してください。",
+      "- targetFilePath は提示されたコードに含まれるファイルパスを正確に使用してください。",
+      "- startLine / endLine は提示されたコードの「行番号: コード」形式の数値を使用してください。",
+      "- afterCode には変更後のコード全体を記載してください（省略不可）。",
+      "- explanation には変更理由を日本語で簡潔に記載してください。",
+      "- overallExplanation には全体的な変更方針を日本語で記載してください。",
+    ].join("\n");
+
+    const userPrompt = [
+      `【要件】\n${query}`,
+      "",
+      `【メインファイル: ${primary.filePath}】`,
+      "```",
+      primaryCode,
+      "```",
+      supplementSnippets
+        ? `\n【参考スニペット（関連ファイル）】\n${supplementSnippets}`
+        : "",
+    ]
+      .join("\n")
+      .trim();
+
+    const client = new OpenAI({ apiKey });
+    const response = await client.chat.completions.create({
+      model: "gpt-4o",
+      messages: [
+        { role: "system", content: systemPrompt },
+        { role: "user", content: userPrompt },
+      ],
+      response_format: {
+        type: "json_schema",
+        json_schema: ANALYSIS_JSON_SCHEMA,
+      },
+    });
+
+    const content = response.choices[0]?.message?.content ?? "{}";
+    // structured outputs は JSON 以外が混入しないが念のためフェンス除去
+    const parsed = JSON.parse(content.replace(/```json|```/g, "").trim()) as {
+      changes: Omit<CodeChange, "beforeCode">[];
+      overallExplanation: string;
+    };
+
+    // beforeCode をサーバー側で注入（LLMに生成させない）
+    const changes: CodeChange[] = await Promise.all(
+      parsed.changes.map(async (c) => ({
+        ...c,
+        beforeCode: await this.readSnippet(
+          c.targetFilePath,
+          c.startLine,
+          c.endLine,
+        ),
+      })),
+    );
+
+    return { changes, overallExplanation: parsed.overallExplanation };
+  }
+
+  // ---- 整形メソッド ----
+  public formatAnalysisResult(result: AnalysisResult): string {
+    const sections: string[] = [result.overallExplanation, ""];
+
+    for (const [i, change] of result.changes.entries()) {
+      sections.push(
+        `【変更 ${i + 1}】${change.targetFilePath}（${change.startLine}〜${change.endLine}行目）`,
+        "",
+        `${change.explanation}`,
+        "",
+        "変更前:",
+        change.beforeCode,
+        "",
+        "変更後:",
+        "```",
+        change.afterCode,
+        "```",
+        "",
+      );
+    }
+
+    return sections.join("\n");
   }
 }
