@@ -43,6 +43,9 @@ export class ChatSidebarProvider implements vscode.WebviewViewProvider {
         case "confirmBuildIndex":
           await this.handleBuildIndex();
           break;
+        case "applyCorrectCode":
+          await this.handleApplyCorrectCode(data.change);
+          break;
       }
     });
   }
@@ -150,6 +153,26 @@ export class ChatSidebarProvider implements vscode.WebviewViewProvider {
         type: "error",
         value:
           error instanceof Error ? error.message : "ベクトル化に失敗しました。",
+      });
+    }
+  }
+
+  private async handleApplyCorrectCode(
+    change: import("./WorkspaceVectorSearchService").CodeChange,
+  ) {
+    try {
+      await this._vectorService.applyCorrectCode(change);
+      this._view?.webview.postMessage({
+        type: "status",
+        value: `✅ ${change.targetFilePath} の ${change.startLine}〜${change.endLine} 行目に正解コードを反映しました。`,
+      });
+    } catch (error) {
+      this._view?.webview.postMessage({
+        type: "error",
+        value:
+          error instanceof Error
+            ? error.message
+            : "コードの反映に失敗しました。",
       });
     }
   }
@@ -265,10 +288,37 @@ export class ChatSidebarProvider implements vscode.WebviewViewProvider {
       "  totalDiv.textContent = '結果: ' + rows.length + '問中 ' + correct + '問正解 (' + Math.round(correct / rows.length * 100) + '%)';",
       "  btn.disabled = true;",
       "  btn.textContent = '採点済み';",
+      "  const metaRaw = btn.dataset.meta;",
+      "  if (metaRaw) {",
+      "    try {",
+      "      const meta = JSON.parse(decodeURIComponent(metaRaw));",
+      "      const answers = [];",
+      "      const msgDiv = btn.closest('.message');",
+      "      msgDiv.querySelectorAll('.quiz-blank').forEach(function(inp) {",
+      "        answers.push(inp.dataset.answer || '');",
+      "      });",
+      "      const applyBtn = document.createElement('button');",
+      "      applyBtn.className = 'grade-btn apply-btn';",
+      "      applyBtn.textContent = '正解コードをファイルに反映';",
+      "      applyBtn.onclick = function() {",
+      "        applyBtn.disabled = true;",
+      "        applyBtn.textContent = '反映中...';",
+      "        vscode.postMessage({",
+      "          type: 'applyCorrectCode',",
+      "          change: { ...meta, answers: answers }",
+      "        });",
+      "      };",
+      "      btn.parentNode.insertBefore(applyBtn, btn.nextSibling);",
+      "    } catch(e) {}",
+      "  }",
       "}",
       "",
       "function formatTextToHtml(text) {",
       "  const escaped = text.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');",
+      "",
+      "  let meta = null;",
+      "  const mMatch = escaped.match(/___QUIZ_META___(.*?)___QUIZ_META___/);",
+      "  if (mMatch) { try { meta = JSON.parse(mMatch[1]); } catch(e) {} }",
       "",
       "  let answers = [];",
       "  const aMatch = escaped.match(/___QUIZ_ANSWERS___(.*?)___QUIZ_ANSWERS___/);",
@@ -280,7 +330,8 @@ export class ChatSidebarProvider implements vscode.WebviewViewProvider {
       "",
       "  let cleaned = escaped",
       "    .replace(/___QUIZ_ANSWERS___.*?___QUIZ_ANSWERS___\\n?/g, '')",
-      "    .replace(/___QUIZ_HINTS___.*?___QUIZ_HINTS___\\n?/g, '');",
+      "    .replace(/___QUIZ_HINTS___.*?___QUIZ_HINTS___\\n?/g, '')",
+      "    .replace(/___QUIZ_META___.*?___QUIZ_META___\\n?/g, '');",
       "",
       "  const codeBlockRegex = new RegExp('(' + '`'.repeat(3) + '[\\\\s\\\\S]*?' + '`'.repeat(3) + ')', 'g');",
       "  const parts = cleaned.split(codeBlockRegex);",
@@ -317,10 +368,12 @@ export class ChatSidebarProvider implements vscode.WebviewViewProvider {
       "  }).join('');",
       "",
       "  if (answers.length > 0) {",
+      "    const metaAttr = meta ? ' data-meta=\\''+encodeURIComponent(JSON.stringify(meta)).replace(/'/g, '%27')+'\\'' : '';",
       "    return htmlParts",
-      "      + '<button class=\"grade-btn\" onclick=\"gradeQuiz(this)\">解答チェック (' + answers.length + '問)</button>'",
+      "      + '<button class=\"grade-btn\" onclick=\"gradeQuiz(this)\"' + metaAttr + '>解答チェック (' + answers.length + '問)</button>'",
       "      + '<div class=\"grade-result\"></div>';",
       "  }",
+
       "  return htmlParts;",
       "}",
       "",

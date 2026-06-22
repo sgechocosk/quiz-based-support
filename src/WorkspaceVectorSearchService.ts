@@ -865,14 +865,21 @@ export class WorkspaceVectorSearchService {
         .split("\n")
         .filter((line) => line.includes("___BLANK___"));
 
+      const metaJson = JSON.stringify({
+        targetFilePath: change.targetFilePath,
+        startLine: change.startLine,
+        endLine: change.endLine,
+        quizCode: change.quizCode,
+      });
+
       sections.push(
         `【問題 ${i + 1}】${change.targetFilePath}(${change.startLine}〜${change.endLine}行目)`,
         "",
         change.explanation,
         "",
-        // ヒントと入力欄をBLANK順に並べる
         `___QUIZ_ANSWERS___${answersJson}___QUIZ_ANSWERS___`,
         `___QUIZ_HINTS___${hintsJson}___QUIZ_HINTS___`,
+        `___QUIZ_META___${metaJson}___QUIZ_META___`, // ← 追加
         "```",
         blankLines.join("\n"),
         "```",
@@ -881,5 +888,40 @@ export class WorkspaceVectorSearchService {
     }
 
     return sections.join("\n");
+  }
+
+  public async applyCorrectCode(change: CodeChange): Promise<void> {
+    // ___BLANK___ を answers で順番に置換して正解コードを復元
+    let resolved = change.quizCode;
+    for (const answer of change.answers) {
+      resolved = resolved.replace("___BLANK___", answer);
+    }
+
+    // 対象ファイルを読み込んで行単位で分割
+    const fileUri = vscode.Uri.joinPath(
+      this.workspaceFolder.uri,
+      change.targetFilePath,
+    );
+    const originalText = await this.readFileText(fileUri);
+    const lines = originalText.split(/\r?\n/);
+
+    // startLine / endLine は 1-based なので 0-based に変換
+    const startIdx = change.startLine - 1;
+    const endIdx = change.endLine; // slice の end は exclusive
+
+    // 該当範囲を正解コードで差し替え
+    const resolvedLines = resolved.split(/\r?\n/);
+    lines.splice(startIdx, endIdx - startIdx, ...resolvedLines);
+
+    // ファイルに書き戻す
+    const newText = lines.join("\n");
+    await vscode.workspace.fs.writeFile(
+      fileUri,
+      new TextEncoder().encode(newText),
+    );
+
+    // 書き込み後にエディタでファイルを開く
+    const doc = await vscode.workspace.openTextDocument(fileUri);
+    await vscode.window.showTextDocument(doc, { preview: false });
   }
 }
