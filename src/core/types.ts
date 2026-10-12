@@ -76,6 +76,8 @@ export interface GeneratedQuiz {
   overallExplanation: string;
   items: QuizItem[];
   rejected: string[];
+  /** 利用者に伝えるべき出題上の注意(例: 実装依頼なのに実装問題を作れなかった) */
+  notice?: string;
 }
 
 export const BLANK = "___BLANK___";

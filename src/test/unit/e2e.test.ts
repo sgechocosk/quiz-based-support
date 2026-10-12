@@ -221,6 +221,64 @@ test("再試行: 全問が検証落ちしたら理由を添えて出し直させ
   assert.equal(r.quiz.items.length, 1);
 });
 
+test("実装依頼: 読解問題しか返らなければ実装問題を要求して作り直させ、読解→実装の順に出題する", async (t) => {
+  const changeItem = {
+    ...goodItem,
+    kind: "change",
+    task: "パスワードの最低文字数を厳しくする(9文字以上で許可)",
+    newCode: ["export function login(user: string, password: string): boolean {", '  return password.length > 8 && user !== "";', "}"].join("\n"),
+    blanks: [blank(2, "password.length > 8")],
+    refs: [],
+  };
+  let quizCalls = 0;
+  let firstSystem = "";
+  let retryPrompt = "";
+  let exploreUser = "";
+  const { ws, index, client } = await setup(t, (req) => {
+    const b = req.body;
+    if (b.tools || !b.response_format) {
+      exploreUser = b.messages[1].content;
+      return { json: msg(null, [{ name: "read_file", args: { path: "src/auth.ts" } }]) };
+    }
+    if (b.response_format?.json_schema?.name !== "quiz") {
+      throw new Error("想定外のリクエスト");
+    }
+    quizCalls++;
+    if (quizCalls === 1) {
+      firstSystem = b.messages[0].content;
+      return { json: msg(JSON.stringify({ goal: "パスワード条件を変える", overallExplanation: "o", items: [goodItem] })) };
+    }
+    retryPrompt = b.messages[b.messages.length - 1].content;
+    return { json: msg(JSON.stringify({ goal: "", overallExplanation: "", items: [changeItem] })) };
+  });
+  const agent = new QuizAgent({ llm: client, ws, index, config: { ...CONFIG, maxSteps: 1 } });
+  const r = await agent.run("パスワードの最低文字数を9文字にしたい", "auto");
+  assert.match(exploreUser, /実装・修正の依頼です/);
+  assert.match(firstSystem, /kind="change" を必ず1問以上/);
+  assert.equal(quizCalls, 2);
+  assert.match(retryPrompt, /kind="change" の問題が必要ですが、まだ1問もありません/);
+  assert.deepEqual(
+    r.quiz.items.map((i) => i.kind),
+    ["read", "change"],
+  );
+  assert.equal(r.quiz.notice, undefined);
+  assert.equal(r.quiz.items[1]!.blanks[0]!.answer, "password.length > 8");
+});
+
+test("実装依頼: 実装問題をどうしても作れなければ、読解のみである旨を知らせる", async (t) => {
+  const { ws, index, client } = await setup(t, (req) => {
+    const b = req.body;
+    if (b.tools || !b.response_format) {
+      return { json: msg(null, [{ name: "read_file", args: { path: "src/auth.ts" } }]) };
+    }
+    return { json: msg(JSON.stringify({ goal: "g", overallExplanation: "o", items: [goodItem] })) };
+  });
+  const agent = new QuizAgent({ llm: client, ws, index, config: { ...CONFIG, maxSteps: 1 } });
+  const r = await agent.run("ログアウト機能を追加したい", "auto");
+  assert.equal(r.quiz.items.length, 1, "同じ読解問題は重複させない");
+  assert.match(r.quiz.notice ?? "", /読解問題のみ/);
+});
+
 test("答え漏れ: ヒント・課題文が答えを含むと書き直させ、直らなければ伏せ字・形のヒントにする", async (t) => {
   const leaky = {
     ...goodItem,

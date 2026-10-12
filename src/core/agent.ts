@@ -1,6 +1,6 @@
 import { answerSkeleton, maskAnswers, revealsAnswer } from "./leak";
 import type { ChatLlm, ChatMessage, LspPort, SyntaxChecker, WorkspacePort } from "./ports";
-import { applyItemToText, validateRawItem, type RawItem, type SemanticJudge, type Validation } from "./quiz";
+import { applyItemToText, compactItem, validateRawItem, type RawItem, type SemanticJudge, type Validation } from "./quiz";
 import { splitLines } from "./text";
 import { EvidenceStore, executeTool, normalizeRelPath, TOOL_DEFS, type CodeIndex } from "./tools";
 import type { CodeRef, GeneratedQuiz, QuizItem } from "./types";
@@ -124,13 +124,30 @@ export function exploreSystemPrompt(maxSteps: number, repoMap: string): string {
   ].join("\n");
 }
 
-export function quizSystemPrompt(mode: QuizMode): string {
+export type QuizIntent = "change" | "read";
+
+const CHANGE_WORDS =
+  /追加|実装|作りたい|作って|作成|作る|修正|直し|直す|直せ|変更|変えたい|変えて|対応させ|対応したい|導入|組み込|改善|改修|リファクタ|削除し|消したい|置き換|ようにしたい|ようにする|ようにして|にしたい|にして欲|にしてほし|できるようにし|欲しい|ほしい|書きたい|書いて|加えたい|入れたい|\b(add|implement|fix|create|build|support|refactor|change|remove|replace)\b/i;
+
+/** 質問文が「実装・修正の依頼」か「仕組みの質問」かを判定する。 */
+export function detectIntent(query: string): QuizIntent {
+  return CHANGE_WORDS.test(query) ? "change" : "read";
+}
+
+/** 実装問題(change)を最低1問必須にするか */
+export function requiresChange(mode: QuizMode, intent: QuizIntent): boolean {
+  return mode === "change" || (mode === "auto" && intent === "change");
+}
+
+export function quizSystemPrompt(mode: QuizMode, intent: QuizIntent = "read"): string {
   const modeLine =
     mode === "read"
       ? "今回はすべて kind=\"read\" にする。"
       : mode === "change"
         ? "今回はすべて kind=\"change\" にする。"
-        : "要求が質問(〜はどう動く/どこにある)なら read、実装・修正の依頼なら change を中心にする。迷えば read。";
+        : intent === "change"
+          ? "今回の要求は実装・修正の依頼。学習者が穴埋めで実装を完成させる kind=\"change\" を必ず1問以上作る(これが主役)。前提となる既存コードや手本を理解する kind=\"read\" は1問まで添えてよい。"
+          : "今回の要求は仕組みについての質問。kind=\"read\" を中心にする。";
   return [
     "あなたはプログラミング学習アシスタントです。答えを直接教えるのではなく、調査済みのコードだけを根拠に、",
     "学習者が「どのファイルのどのコードが、どういう仕組みで動いているか」を自分で考えて理解できる穴埋めクイズを作ります。",
@@ -167,7 +184,8 @@ export function quizSystemPrompt(mode: QuizMode): string {
     "- goal: このクイズで何を理解してほしいかを1〜2文。答えは含めない。",
     "",
     "【共通ルール】",
-    "- items は1〜3件。範囲は連続した40行以内を目安に、path/startLine/endLine は参照コードの表示どおり。firstLine/lastLine には範囲の最初と最後の行を逐語で入れる。",
+    "- items は1〜3件。path/startLine/endLine は参照コードの表示どおり。firstLine/lastLine には範囲の最初と最後の行を逐語で入れる。",
+    "- 範囲は空欄を含む関数・ブロックの必要最小限(目安15〜25行)。空欄と関係のない行は含めない(表示は空欄の前後数行に絞られる)。",
     "- concept は復習用の短いタグ(例: 非同期処理、条件分岐、配列操作、型注釈、状態管理)。答えの識別子は使わない。",
   ].join("\n");
 }
@@ -322,7 +340,12 @@ export class QuizAgent {
 
     const messages: ChatMessage[] = [
       { role: "system", content: exploreSystemPrompt(config.maxSteps, index.repoMap(config.repoMapChars)) },
-      { role: "user", content: query },
+      {
+        role: "user",
+        content: requiresChange(mode, detectIntent(query))
+          ? `${query}\n\n(これは実装・修正の依頼です。変更を入れる場所と、手本にすべき既存の実装を必ず特定してください)`
+          : query,
+      },
     ];
 
     let notes = "";
@@ -367,8 +390,10 @@ export class QuizAgent {
     hooks: RunHooks,
   ): Promise<GeneratedQuiz> {
     const { llm, config } = this.deps;
+    const intent = detectIntent(query);
+    const needChange = requiresChange(mode, intent);
     const messages: ChatMessage[] = [
-      { role: "system", content: quizSystemPrompt(mode) },
+      { role: "system", content: quizSystemPrompt(mode, intent) },
       {
         role: "user",
         content: [
@@ -400,7 +425,17 @@ export class QuizAgent {
 
       const reasons: string[] = [];
       const notesForFix: string[] = [];
-      for (const raw of (parsed.items ?? []).slice(0, MAX_ITEMS - accepted.length)) {
+      for (const raw of parsed.items ?? []) {
+        if (accepted.length >= MAX_ITEMS) {
+          break;
+        }
+        if (raw?.kind === "read" && mode === "change") {
+          reasons.push(`${raw.path}:${raw.startLine}-${raw.endLine} 今回は実装問題(kind="change")だけを出題します`);
+          continue;
+        }
+        if (raw?.kind === "read" && needChange && accepted.filter((a) => a.kind === "read").length >= 1) {
+          continue; // 実装依頼では読解は1問まで(実装問題の枠を残す)
+        }
         const verdict = await this.validate(raw);
         if (verdict.ok) {
           const { item } = verdict;
@@ -415,7 +450,9 @@ export class QuizAgent {
       }
       rejected.push(...reasons);
       // 1問も無いとき、または初回で2問未満しか残らなかったときは、不合格の問題だけ作り直させる
-      const retry = reasons.length > 0 && (accepted.length === 0 || (attempt === 0 && accepted.length < 2));
+      const missingChange = needChange && !accepted.some((a) => a.kind === "change");
+      const retry =
+        missingChange || (reasons.length > 0 && (accepted.length === 0 || (attempt === 0 && accepted.length < 2)));
       if (!retry) {
         break;
       }
@@ -431,6 +468,12 @@ export class QuizAgent {
             ...reasons.map((r) => `- ${r}`),
             ...(notesForFix.length > 0 ? ["参考(合格問題で除外した空欄):", ...notesForFix.map((r) => `- ${r}`)] : []),
             "",
+            ...(missingChange
+              ? [
+                  "これは実装・修正の依頼なので、学習者が穴埋めで実装する kind=\"change\" の問題が必要ですが、まだ1問もありません。",
+                  "変更を入れる範囲を参照コードから選び、newCode に変更後のコードを全部書き、変更した行に空欄を置いた change 問題を必ず含めてください。",
+                ]
+              : []),
             "参照コードを見直し、ルールを守って不合格だった問題の修正版(または別の範囲の問題)だけを items に入れて、JSON全体を出し直してください。",
             "空欄の target は、その行に実際に書かれている文字列をそのまま写してください。",
           ].join("\n"),
@@ -440,7 +483,13 @@ export class QuizAgent {
     if (accepted.length === 0) {
       throw new Error(`検証に通るクイズを作れませんでした。\n${rejected.slice(0, 4).join("\n")}`);
     }
-    return { goal, overallExplanation: overall, items: accepted, rejected };
+    // 実装問題を主役にする: 手本の読解 → 実装 の順に並べる
+    accepted.sort((a, b) => (a.kind === b.kind ? 0 : a.kind === "read" ? -1 : 1));
+    const notice =
+      needChange && !accepted.some((a) => a.kind === "change")
+        ? "実装問題を検証に通る形で作れなかったため、今回は読解問題のみです。変更したい場所(ファイル名や関数名)を含めて質問し直すと、実装問題を作りやすくなります。"
+        : undefined;
+    return { goal, overallExplanation: overall, items: accepted, rejected, notice };
   }
 
   /** 実ファイルと照合して問題を組み立て、構文・手がかりの場所を確認する。 */
@@ -471,7 +520,8 @@ export class QuizAgent {
       }
     }
     await this.checkRefs(item, fileText);
-    return verdict;
+    // 空欄と関係のない先頭・末尾の行は出題範囲から外す(反映結果は変わらない)
+    return { ...verdict, item: compactItem(item) };
   }
 
   /** 手がかり・参考コードの場所が実在し、その行に答えが書かれていないことを確かめる(満たさないものは外す)。 */

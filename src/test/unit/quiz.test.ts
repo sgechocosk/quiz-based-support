@@ -11,12 +11,18 @@ import {
   resolveBlanks,
   tokenizeCode,
   changedLineIndexes,
+  compactDiff,
+  compactItem,
+  foldRanges,
   validateRawItem,
   type RawBlank,
   type RawItem,
 } from "../../core/quiz";
 import { answerSkeleton, maskAnswers, revealsAnswer } from "../../core/leak";
 import type { KeyValueStore } from "../../core/ports";
+import { detectIntent, requiresChange } from "../../core/agent";
+import { splitLines } from "../../core/text";
+import type { QuizItem } from "../../core/types";
 
 const FILE = [
   "import { a } from './a';",
@@ -293,4 +299,69 @@ test("学習記録: 間違いが復習カードになり、再正解で間隔が
   const again = new LearnerLog(store);
   assert.equal(again.snapshot().cards.length, 1);
   assert.equal(again.summary(t0 + 4 * 86_400_000).sessions, 3);
+});
+
+const LONG = Array.from({ length: 30 }, (_, i) => `  line${i + 1}();`);
+const longItem = (over: Partial<QuizItem>): QuizItem => ({
+  kind: "read",
+  path: "a.ts",
+  startLine: 1,
+  endLine: 30,
+  original: LONG.join("\n"),
+  quizCode: LONG.join("\n"),
+  blanks: [{ answer: "x", concept: "c", hints: [] }],
+  explanation: "",
+  ...over,
+});
+
+test("表示量: read問題は空欄の前後3行まで範囲を切り詰める", () => {
+  const q = LONG.slice();
+  q[14] = "  ___BLANK___();";
+  const item = compactItem(longItem({ quizCode: q.join("\n"), blanks: [{ answer: "line15", concept: "c", hints: [] }] }));
+  assert.deepEqual([item.startLine, item.endLine], [12, 18]);
+  assert.equal(splitLines(item.quizCode).length, 7);
+  assert.equal(resolveBlanks(item.quizCode, ["line15"]), item.original);
+});
+
+test("表示量: change問題は元と同じ先頭・末尾だけ削り、反映結果は変わらない", () => {
+  const after = LONG.slice();
+  after.splice(20, 0, "  if (___BLANK___) return;");
+  const file = LONG.join("\n");
+  const full = longItem({ kind: "change", quizCode: after.join("\n"), blanks: [{ answer: "done", concept: "c", hints: [] }] });
+  const item = compactItem(full);
+  assert.deepEqual([item.startLine, item.endLine], [18, 23]);
+  assert.equal(applyItemToText(file, item), applyItemToText(file, full));
+  const diff = compactDiff(item.original, resolveBlanks(item.quizCode, ["done"]));
+  assert.match(diff, /^ {4}line19\(\);\n {4}line20\(\);\n\+ {3}if \(done\) return;\n {4}line21\(\);/m);
+  assert.ok(diff.split("\n").length <= 7, diff);
+});
+
+test("表示量: 空欄・変更行から離れた行を折りたたむ / 差分は変更の周辺だけ", () => {
+  const q = LONG.slice();
+  q[2] = "  ___BLANK___();";
+  q[25] = "  ___BLANK___();";
+  assert.deepEqual(foldRanges({ kind: "read", quizCode: q.join("\n"), original: "" }), [[5, 22]]);
+  const diff = compactDiff(LONG.join("\n"), LONG.map((l, i) => (i === 15 ? "  changed();" : l)).join("\n"));
+  assert.deepEqual(diff.split("\n"), [
+    "… (13行省略)",
+    "    line14();",
+    "    line15();",
+    "-   line16();",
+    "+   changed();",
+    "    line17();",
+    "    line18();",
+    "… (12行省略)",
+  ]);
+});
+
+test("意図判定: 実装・修正の依頼か、仕組みの質問か", () => {
+  assert.equal(detectIntent("ログアウト機能を追加したい"), "change");
+  assert.equal(detectIntent("パスワードが短いときエラーを出すようにしたい"), "change");
+  assert.equal(detectIntent("implement retry for fetch"), "change");
+  assert.equal(detectIntent("ログイン処理はどう動く?"), "read");
+  assert.equal(detectIntent("検索のインデックスはどこで作られる?"), "read");
+  assert.ok(requiresChange("auto", "change"));
+  assert.ok(!requiresChange("auto", "read"));
+  assert.ok(!requiresChange("read", "change"));
+  assert.ok(requiresChange("change", "read"));
 });

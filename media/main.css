@@ -39,6 +39,11 @@ textarea.prediction { width: 100%; box-sizing: border-box; resize: vertical; bac
 .badge { font-size: 11px; padding: 0 6px; border-radius: 8px; background: var(--vscode-badge-background); color: var(--vscode-badge-foreground); }
 pre.code { margin: 0; padding: 6px 8px; background: var(--vscode-textCodeBlock-background); border-radius: 3px; overflow-x: auto; font-family: var(--vscode-editor-font-family); font-size: var(--vscode-editor-font-size); line-height: 1.5; }
 .code-line { white-space: pre; }
+.code-line.add { background: rgba(63, 185, 80, 0.15); }
+.code-line.del { background: rgba(248, 81, 73, 0.15); }
+.code-line.skip, .code-fold { color: var(--vscode-descriptionForeground); font-style: italic; }
+.code-fold { cursor: pointer; }
+.code-fold:hover { color: var(--vscode-textLink-foreground); }
 input.blank { width: 8ch; background: var(--vscode-input-background); color: var(--vscode-input-foreground); border: 1px solid var(--vscode-input-border, var(--vscode-focusBorder)); border-radius: 3px; padding: 0 4px; margin: 0 2px; font-family: var(--vscode-editor-font-family); font-size: inherit; }
 input.blank.correct { border-color: var(--vscode-testing-iconPassed, #3fb950); background: rgba(63, 185, 80, 0.15); }
 input.blank.incorrect { border-color: var(--vscode-testing-iconFailed, #f85149); background: rgba(248, 81, 73, 0.15); }

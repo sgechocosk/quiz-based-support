@@ -10,6 +10,8 @@ import type { KeyValueStore } from "./core/ports";
 import { buildStructureQuestions } from "./core/questions";
 import {
   applyItemToText,
+  compactDiff,
+  foldRanges,
   gradeBlanks,
   isolateBlank,
   resolveBlanks,
@@ -447,6 +449,9 @@ export class ChatSidebarProvider implements vscode.WebviewViewProvider, vscode.D
       };
       this.sessions.set(session.id, session);
       this.post({ type: "quiz", quiz: this.payloadOf(session, text, result.quiz.goal) });
+      if (result.quiz.notice) {
+        this.status(`⚠ ${result.quiz.notice}`);
+      }
       if (result.quiz.rejected.length > 0) {
         this.status(`検証で不合格だった${result.quiz.rejected.length}件は作り直し、直らなかったものは除外しました。`);
       }
@@ -470,6 +475,8 @@ export class ChatSidebarProvider implements vscode.WebviewViewProvider, vscode.D
         startLine: item.startLine,
         endLine: item.endLine,
         code: item.quizCode,
+        // 空欄・変更行から離れた行は折りたたんで表示する(クリックで展開)
+        folds: foldRanges(item),
         task: item.task ?? "",
         refs: item.refs ?? [],
         blanks: item.blanks.map((b) => ({ concept: b.concept, hints: b.hints, clue: b.clue })),
@@ -538,7 +545,7 @@ export class ChatSidebarProvider implements vscode.WebviewViewProvider, vscode.D
         syntaxNote,
         canApply: item.kind === "change" && !session.review,
         // 変更問題は、空欄以外も含めた完成形を見せて「どこがどう変わるか」を確認できるようにする
-        completed: item.kind === "change" && !session.review ? resolveBlanks(item.quizCode, answerList) : undefined,
+        completed: item.kind === "change" && !session.review ? compactDiff(item.original, resolveBlanks(item.quizCode, answerList)) : undefined,
       });
 
       item.blanks.forEach((b, k) => {

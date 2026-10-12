@@ -419,6 +419,146 @@ export function validateRawItem(raw: RawItem, fileText: string): Validation {
 }
 
 
+// ---------- 表示量の調整 ----------
+
+/** 空欄・変更行の前後に残す行数 */
+export const CONTEXT_LINES = 3;
+
+/**
+ * 問題の範囲を「空欄(と変更行)の前後 context 行」まで切り詰める。
+ * read は先頭・末尾を、change は元コードと完全に同じ先頭・末尾の行だけを削るので、反映結果は変わらない。
+ */
+export function compactItem(item: QuizItem, context = CONTEXT_LINES): QuizItem {
+  const q = splitLines(item.quizCode);
+  const o = splitLines(item.original);
+  const blankLines = q.flatMap((l, i) => (l.includes(BLANK) ? [i] : []));
+  if (blankLines.length === 0) {
+    return item;
+  }
+  let head: number;
+  let tail: number;
+  if (item.kind === "read") {
+    head = Math.max(0, blankLines[0]! - context);
+    tail = Math.max(0, q.length - 1 - (blankLines[blankLines.length - 1]! + context));
+  } else {
+    // 元コードと一字一句同じ(空欄なし)の先頭・末尾の行数
+    let prefix = 0;
+    while (prefix < q.length && prefix < o.length && q[prefix] === o[prefix]) {
+      prefix++;
+    }
+    let suffix = 0;
+    while (
+      suffix < q.length - prefix &&
+      suffix < o.length - prefix &&
+      q[q.length - 1 - suffix] === o[o.length - 1 - suffix]
+    ) {
+      suffix++;
+    }
+    head = Math.max(0, prefix - context);
+    tail = Math.max(0, suffix - context);
+    if (o.length - head - tail <= 0) {
+      // 純粋な挿入で元の範囲が空になると反映位置を表せないので、元の行を1行は残す
+      tail = Math.max(0, tail - 1);
+    }
+  }
+  if (head === 0 && tail === 0) {
+    return item;
+  }
+  return {
+    ...item,
+    startLine: item.startLine + head,
+    endLine: item.endLine - tail,
+    quizCode: q.slice(head, q.length - tail).join("\n"),
+    original: o.slice(head, o.length - tail).join("\n"),
+  };
+}
+
+/**
+ * 表示時に折りたたむ行範囲(quizCode の0始まりの行番号, 両端含む)。
+ * 空欄・変更行の前後 context 行以外が minRun 行以上続く部分を返す。
+ */
+export function foldRanges(item: Pick<QuizItem, "kind" | "quizCode" | "original">, context = 2, minRun = 3): Array<[number, number]> {
+  const q = splitLines(item.quizCode);
+  const keep = new Set<number>();
+  const mark = (i: number): void => {
+    for (let k = Math.max(0, i - context); k <= Math.min(q.length - 1, i + context); k++) {
+      keep.add(k);
+    }
+  };
+  q.forEach((l, i) => l.includes(BLANK) && mark(i));
+  if (item.kind === "change") {
+    changedLineIndexes(splitLines(item.original), q).forEach(mark);
+  }
+  const folds: Array<[number, number]> = [];
+  let start = -1;
+  for (let i = 0; i <= q.length; i++) {
+    const hidden = i < q.length && !keep.has(i);
+    if (hidden && start < 0) {
+      start = i;
+    } else if (!hidden && start >= 0) {
+      if (i - start >= minRun) {
+        folds.push([start, i - 1]);
+      }
+      start = -1;
+    }
+  }
+  return folds;
+}
+
+/**
+ * 変更前後の差分を、変更行の前後 context 行だけに絞って返す(採点後の「完成形」表示用)。
+ * 各行は " "(同じ) / "-"(削除) / "+"(追加) / "…"(省略) のいずれかを先頭に付ける。
+ */
+export function compactDiff(before: string, after: string, context = 2): string {
+  const a = splitLines(before);
+  const b = splitLines(after);
+  const dp: number[][] = Array.from({ length: a.length + 1 }, () => new Array<number>(b.length + 1).fill(0));
+  for (let i = a.length - 1; i >= 0; i--) {
+    for (let j = b.length - 1; j >= 0; j--) {
+      dp[i]![j] = a[i] === b[j] ? dp[i + 1]![j + 1]! + 1 : Math.max(dp[i + 1]![j]!, dp[i]![j + 1]!);
+    }
+  }
+  const rows: Array<{ op: " " | "-" | "+"; text: string }> = [];
+  let i = 0;
+  let j = 0;
+  while (i < a.length || j < b.length) {
+    if (i < a.length && j < b.length && a[i] === b[j]) {
+      rows.push({ op: " ", text: a[i++]! });
+      j++;
+    } else if (i < a.length && (j >= b.length || dp[i + 1]![j]! >= dp[i]![j + 1]!)) {
+      // 置き換えは「- 旧」→「+ 新」の順に並べる
+      rows.push({ op: "-", text: a[i++]! });
+    } else {
+      rows.push({ op: "+", text: b[j++]! });
+    }
+  }
+  const near = new Set<number>();
+  rows.forEach((r, k) => {
+    if (r.op !== " ") {
+      for (let d = Math.max(0, k - context); d <= Math.min(rows.length - 1, k + context); d++) {
+        near.add(d);
+      }
+    }
+  });
+  const out: string[] = [];
+  let skipped = 0;
+  rows.forEach((r, k) => {
+    if (near.has(k)) {
+      if (skipped > 0) {
+        out.push(`… (${skipped}行省略)`);
+        skipped = 0;
+      }
+      out.push(`${r.op} ${r.text}`);
+    } else {
+      skipped++;
+    }
+  });
+  if (skipped > 0 && out.length > 0) {
+    out.push(`… (${skipped}行省略)`);
+  }
+  return out.join("\n");
+}
+
 // ---------- 反映(ファイル更新) ----------
 
 export function rangeText(fileText: string, startLine: number, endLine: number): string {

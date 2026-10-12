@@ -175,6 +175,16 @@
     return link;
   }
 
+  /** "+ " / "- " / "  " 始まりの行を色分けして表示する */
+  function diffBlock(text) {
+    const pre = el("pre", { class: "code" });
+    for (const line of text.split("\n")) {
+      const cls = line.startsWith("+ ") ? "add" : line.startsWith("- ") ? "del" : line.startsWith("…") ? "skip" : "";
+      pre.append(el("div", { class: `code-line ${cls}`, text: line || " " }));
+    }
+    return pre;
+  }
+
   /** 参考コード・手がかり(場所 + なぜ見るか) */
   function refLine(prefix, ref) {
     return el(
@@ -221,8 +231,28 @@
 
       const inputs = [];
       const pre = el("pre", { class: "code" });
-      for (const line of item.code.split("\n")) {
+      // 折りたたむ行 → その範囲の [開始, 終了]
+      const foldAt = new Map((item.folds || []).map((f) => [f[0], f]));
+      /** @type {HTMLElement[]} */
+      let foldedRows = [];
+      item.code.split("\n").forEach((line, lineIndex) => {
+        const fold = foldAt.get(lineIndex);
+        if (fold) {
+          const count = fold[1] - fold[0] + 1;
+          const rows = [];
+          foldedRows = rows;
+          const toggle = el("div", { class: "code-fold", text: `⋯ ${count}行省略(クリックで表示)`, title: "空欄と直接関係しない行" });
+          toggle.addEventListener("click", () => {
+            rows.forEach((r) => r.classList.remove("hidden"));
+            toggle.remove();
+          });
+          pre.append(toggle);
+        }
         const row = el("div", { class: "code-line" });
+        if ((item.folds || []).some((f) => lineIndex >= f[0] && lineIndex <= f[1])) {
+          row.classList.add("hidden");
+          foldedRows.push(row);
+        }
         const parts = line.split("___BLANK___");
         parts.forEach((part, i) => {
           if (part) {
@@ -241,7 +271,7 @@
           row.append(document.createTextNode(" "));
         }
         pre.append(row);
-      }
+      });
       block.append(pre);
 
       const levels = item.blanks.map(() => 0);
@@ -359,8 +389,8 @@
       }
       if (res.completed) {
         it.after.append(
-          el("div", { class: "muted", text: "完成形のコード(この範囲がこう置き換わります)" }),
-          el("pre", { class: "code", text: res.completed }),
+          el("div", { class: "muted", text: "変更点(- 削除 / + 追加。変更のない行は省略)" }),
+          diffBlock(res.completed),
         );
       }
       if (res.canApply) {
