@@ -35,7 +35,7 @@ export function distinctiveWords(answer: string): string[] {
  * - 答えを特徴づける識別子が2つ以上すべて含まれる(材料を全部言っている)
  * - 特徴的な識別子が1つだけの答え(例: this.cache / foo())で、その識別子が含まれる
  */
-export function revealsAnswer(text: string, answer: string): boolean {
+export function revealsAnswer(text: string, answer: string, shown: ReadonlySet<string> = new Set()): boolean {
   const t = text ?? "";
   const a = squash(answer ?? "");
   if (!t.trim() || a.length < 2) {
@@ -44,7 +44,8 @@ export function revealsAnswer(text: string, answer: string): boolean {
   if (squash(t).includes(a)) {
     return true;
   }
-  const words = distinctiveWords(answer);
+  // 解答前に明示している名前(新しく作るメソッド名など)は、答えを特定する材料に数えない
+  const words = distinctiveWords(answer).filter((w) => !shown.has(w));
   if (words.length === 0 || !words.every((w) => hasWord(t, w))) {
     return false;
   }
@@ -52,7 +53,7 @@ export function revealsAnswer(text: string, answer: string): boolean {
     return true;
   }
   let rest = answer;
-  for (const w of [words[0]!, ...TRIVIAL_WORDS]) {
+  for (const w of [words[0]!, ...TRIVIAL_WORDS, ...shown]) {
     rest = rest.replace(new RegExp(`(?<![\\w$])${escapeRegExp(w)}(?![\\w$])`, "g"), "");
   }
   return PUNCT_ONLY.test(rest);

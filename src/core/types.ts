@@ -57,6 +57,14 @@ export interface QuizItem {
   task?: string;
   /** 解答前に見せる参考コードの場所 */
   refs?: CodeRef[];
+  /** change で新しく作る名前(メソッド・変数など)。推測させず解答前に明示する */
+  newNames?: NewName[];
+}
+
+export interface NewName {
+  name: string;
+  /** 何のための名前か */
+  role: string;
 }
 
 export interface McqQuestion {

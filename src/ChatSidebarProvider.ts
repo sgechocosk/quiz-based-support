@@ -4,6 +4,7 @@ import * as vscode from "vscode";
 import { makeSemanticJudge, QuizAgent, type QuizMode } from "./core/agent";
 import { languageForPath } from "./core/chunker";
 import { IndexManager, type SyncPlan } from "./core/indexer";
+import { coerceLevel, LEARNER_LEVELS, LEVEL_DESCRIPTION, LEVEL_LABEL } from "./core/level";
 import { LearnerLog, type BlankResult, type ReviewCard } from "./core/learnerLog";
 import { OpenAiClient } from "./core/llm";
 import type { KeyValueStore } from "./core/ports";
@@ -59,6 +60,7 @@ function readConfig() {
     structureQuestions: c.get<boolean>("structureQuestions", true),
     autoEmbedMaxTokens: c.get<number>("autoEmbedMaxTokens", 100_000),
     maxFiles: c.get<number>("maxFiles", 3000),
+    level: coerceLevel(c.get<string>("learnerLevel", "intermediate")),
   };
 }
 
@@ -161,6 +163,11 @@ export class ChatSidebarProvider implements vscode.WebviewViewProvider, vscode.D
     <button id="btn-index" class="secondary">インデックス</button>
     <button id="btn-log" class="secondary">学習記録</button>
   </div>
+  <div id="level-row">
+    <label for="level" class="muted">学習レベル</label>
+    <select id="level" title="解説の細かさ・用語・問題の難しさが変わります"></select>
+  </div>
+  <div id="level-box" class="card hidden"></div>
   <div id="index-status" class="muted"></div>
   <div id="plan-box" class="card hidden"></div>
   <div id="log-box" class="card hidden"></div>
@@ -322,10 +329,19 @@ export class ChatSidebarProvider implements vscode.WebviewViewProvider, vscode.D
       type: "state",
       hasKey: !!this.apiKey,
       hasWorkspace: !!vscode.workspace.workspaceFolders?.[0],
+      level: readConfig().level,
+      levelChosen: this.levelChosen(),
+      levels: LEARNER_LEVELS.map((id) => ({ id, label: LEVEL_LABEL[id], description: LEVEL_DESCRIPTION[id] })),
       busy: this.busy,
       index: stats,
       learning: this.log.summary(),
     });
+  }
+
+  /** 利用者が学習レベルを一度でも選んだか(未選択なら初回に選んでもらう) */
+  private levelChosen(): boolean {
+    const i = vscode.workspace.getConfiguration("quizSupport").inspect<string>("learnerLevel");
+    return i?.globalValue !== undefined || i?.workspaceValue !== undefined || i?.workspaceFolderValue !== undefined;
   }
 
   // ---------- メッセージ処理 ----------
@@ -369,6 +385,12 @@ export class ChatSidebarProvider implements vscode.WebviewViewProvider, vscode.D
           break;
         case "startReview":
           await this.handleReview();
+          break;
+        case "setLevel":
+          await vscode.workspace
+            .getConfiguration("quizSupport")
+            .update("learnerLevel", coerceLevel(m.level), vscode.ConfigurationTarget.Global);
+          await this.pushState();
           break;
         case "resetLog":
           await this.log.reset();
@@ -423,6 +445,7 @@ export class ChatSidebarProvider implements vscode.WebviewViewProvider, vscode.D
           minSimilarity: cfg.minSimilarity,
           repoMapChars: 1800,
           evidenceChars: 16_000,
+          level: cfg.level,
         },
       });
       const result = await agent.run(text, mode, {
@@ -479,6 +502,7 @@ export class ChatSidebarProvider implements vscode.WebviewViewProvider, vscode.D
         folds: foldRanges(item),
         task: item.task ?? "",
         refs: item.refs ?? [],
+        newNames: item.newNames ?? [],
         blanks: item.blanks.map((b) => ({ concept: b.concept, hints: b.hints, clue: b.clue })),
       })),
       questions: session.questions.map((q, index) => ({

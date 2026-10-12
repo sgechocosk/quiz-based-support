@@ -1,5 +1,5 @@
 import { detectEol, splitLines } from "./text";
-import { BLANK, type BlankSpec, type QuizItem, type QuizKind } from "./types";
+import { BLANK, type BlankSpec, type NewName, type QuizItem, type QuizKind } from "./types";
 
 // ---------- ブランク操作 ----------
 
@@ -169,7 +169,111 @@ export interface RawItem {
   newCode: string;
   blanks: RawBlank[];
   refs: RawRef[];
+  /** change のみ: 新しく作る名前とその役割(解答前に明示する) */
+  newNames: NewName[];
   explanation: string;
+}
+
+export interface ValidateOptions {
+  /** 調査で読んだコード全体。既存の関数かどうかの判定に使う */
+  knownText?: string;
+}
+
+const IDENT_RE = /[A-Za-z_$][\w$]*/g;
+const CONTROL_WORDS = new Set([
+  "if", "for", "while", "switch", "catch", "function", "return", "new", "typeof", "await", "case", "default", "else",
+  "do", "try", "throw", "in", "of", "void", "delete", "super", "this", "import", "export", "from", "yield", "async",
+]);
+/** 定義を探さなくても使ってよい標準の名前(ここに無い未知の関数呼び出しは「推測不能」とみなす) */
+const STANDARD_GLOBALS = new Set([
+  "parseInt", "parseFloat", "isNaN", "isFinite", "setTimeout", "clearTimeout", "setInterval", "clearInterval",
+  "String", "Number", "Boolean", "Array", "Object", "JSON", "Math", "Date", "Promise", "Map", "Set", "WeakMap",
+  "RegExp", "Error", "TypeError", "Symbol", "BigInt", "console", "require", "fetch", "encodeURIComponent",
+  "decodeURIComponent", "structuredClone", "queueMicrotask", "Buffer", "process", "URL", "AbortController",
+  "System", "Integer", "Long", "Double", "List", "ArrayList", "HashMap", "HashSet", "Arrays", "Collections",
+  "Optional", "Objects", "StringBuilder", "Exception", "RuntimeException", "IllegalArgumentException",
+  "IllegalStateException", "assert", "len", "print", "range", "str", "int", "float", "dict", "list", "set",
+]);
+
+/** 識別子として妥当か */
+function isIdentifier(s: string): boolean {
+  return /^[A-Za-z_$][\w$]*$/.test(s) && !CONTROL_WORDS.has(s);
+}
+
+function wordsOf(text: string): Set<string> {
+  return new Set(text.match(IDENT_RE) ?? []);
+}
+
+/**
+ * コード中で「定義」されている名前(関数・クラス・変数・メソッド・フィールド・引数)を大まかに拾う。
+ * TS/JS/Java を想定した正規表現なので完全ではないが、新しく作る名前を見つける目的には十分。
+ */
+export function declaredNames(lines: string[]): Set<string> {
+  const names = new Set<string>();
+  const add = (n: string | undefined): void => {
+    if (n && isIdentifier(n)) {
+      names.add(n);
+    }
+  };
+  const params = (list: string): void => {
+    for (const p of list.split(",")) {
+      const head = p.replace(/=.*$/, "").replace(/:.*$/, "").replace(/[{}[\]().?]/g, " ").trim();
+      add(head.split(/\s+/).pop()); // Java の "Token t" は最後の語が名前
+    }
+  };
+  const MODS = "(?:(?:public|private|protected|static|async|override|readonly|final|abstract|synchronized|export|default)\\s+)*";
+  for (const line of lines) {
+    for (const m of line.matchAll(/\b(?:function\*?|class|interface|type|enum|const|let|var)\s+([A-Za-z_$][\w$]*)/g)) {
+      add(m[1]);
+    }
+    // const { a, b } = ... / const [a, b] = ...
+    for (const m of line.matchAll(/\b(?:const|let|var)\s+[{[]([^}\]]*)[}\]]/g)) {
+      params(m[1]!);
+    }
+    // メソッド・関数定義: name(params) { / name(params): T {
+    const def = line.match(
+      new RegExp(`^\\s*${MODS}(?:[\\w<>\\[\\],.?]+\\s+)?([A-Za-z_$][\\w$]*)\\s*\\(([^()]*)\\)\\s*(?::\\s*[^={;]+)?(?:throws\\s+[\\w., ]+)?\\{\\s*$`),
+    );
+    if (def && !CONTROL_WORDS.has(def[1]!)) {
+      add(def[1]);
+      params(def[2]!);
+    }
+    for (const m of line.matchAll(/\bfunction\*?\s*[\w$]*\s*\(([^()]*)\)/g)) {
+      params(m[1]!);
+    }
+    // アロー関数の引数: (a, b) => / a =>
+    for (const m of line.matchAll(/\(([^()]*)\)\s*(?::\s*[^=]+)?=>/g)) {
+      params(m[1]!);
+    }
+    for (const m of line.matchAll(/([A-Za-z_$][\w$]*)\s*=>/g)) {
+      add(m[1]);
+    }
+    // クラスのフィールド: private name: T / name = ...
+    const field = line.match(new RegExp(`^\\s*${MODS}([A-Za-z_$][\\w$]*)\\s*[?!]?\\s*:\\s*[^:]`));
+    if (field && /^\s*(?:public|private|protected|readonly|static)\b/.test(line)) {
+      add(field[1]);
+    }
+    // Java のローカル変数・フィールド: Type name = / Type name;
+    const javaVar = line.match(new RegExp(`^\\s*${MODS}[A-Z][\\w<>\\[\\],.?]*\\s+([a-z_$][\\w$]*)\\s*[=;]`));
+    add(javaVar?.[1]);
+  }
+  return names;
+}
+
+/**
+ * 答えの中で、学習者が既存コードから推測できない名前を探す。
+ * - 新しく作る名前(newNames)はあらかじめ示すので推測不要
+ * - 既存コード・表示中のコード・標準の名前にも無い関数呼び出し(先頭が . でない name(...))は推測不能
+ */
+export function unguessableCalls(answer: string, known: Set<string>): string[] {
+  const out: string[] = [];
+  for (const m of answer.matchAll(/(?<![\w$.])([A-Za-z_$][\w$]*)\s*\(/g)) {
+    const name = m[1]!;
+    if (!CONTROL_WORDS.has(name) && !STANDARD_GLOBALS.has(name) && !known.has(name)) {
+      out.push(name);
+    }
+  }
+  return [...new Set(out)];
 }
 
 export type Validation =
@@ -301,7 +405,7 @@ const MAX_ANSWER_CHARS = 100;
  * 個々の空欄の不備はその空欄だけ捨てて warnings に残す(問題全体は落とさない)。
  * 構文チェックは非同期なので呼び出し側(agent)が行う。
  */
-export function validateRawItem(raw: RawItem, fileText: string): Validation {
+export function validateRawItem(raw: RawItem, fileText: string, options: ValidateOptions = {}): Validation {
   const lines = splitLines(fileText);
   const label = `${raw.path}:${raw.startLine}-${raw.endLine}`;
   let range = locateRange(lines, raw.startLine, raw.endLine, raw.firstLine, raw.lastLine);
@@ -341,6 +445,25 @@ export function validateRawItem(raw: RawItem, fileText: string): Validation {
     }
   }
 
+  // 新しく作る名前: newCode で定義され、ファイルにまだ無い名前。LLM の申告 + 自動検出
+  const fileWords = wordsOf(fileText);
+  const codeWords = wordsOf(codeLines.join("\n"));
+  const newNames: NewName[] = [];
+  if (raw.kind === "change") {
+    for (const n of Array.isArray(raw.newNames) ? raw.newNames : []) {
+      const name = (n?.name ?? "").trim();
+      if (isIdentifier(name) && codeWords.has(name) && !fileWords.has(name) && !newNames.some((x) => x.name === name)) {
+        newNames.push({ name, role: (n.role ?? "").trim() });
+      }
+    }
+    for (const name of declaredNames(codeLines)) {
+      if (!fileWords.has(name) && !newNames.some((x) => x.name === name)) {
+        newNames.push({ name, role: "" });
+      }
+    }
+  }
+  const known = new Set([...fileWords, ...wordsOf(options.knownText ?? ""), ...newNames.map((n) => n.name)]);
+
   const warnings: string[] = [];
   const spans: Array<Span & { blank: RawBlank }> = [];
   const lineBase = raw.kind === "read" ? range.start : 1;
@@ -368,6 +491,25 @@ export function validateRawItem(raw: RawItem, fileText: string): Validation {
       continue;
     }
     spans.push({ ...span, blank: b });
+  }
+
+  // 理不尽な空欄を外す: 新しい名前そのもの / どこにも定義が無く推測しようのない関数呼び出し
+  const visible = wordsOf(blankOut(codeLines, spans).code);
+  for (let k = spans.length - 1; k >= 0; k--) {
+    const s = spans[k]!;
+    const answer = codeLines[s.line]!.slice(s.start, s.end).trim();
+    if (newNames.some((n) => n.name === answer)) {
+      warnings.push(`${label} 空欄「${answer}」: 新しく作る名前そのものは空欄にしません(名前は newNames で解答前に示します)`);
+      spans.splice(k, 1);
+      continue;
+    }
+    const unknown = unguessableCalls(answer, new Set([...known, ...visible]));
+    if (unknown.length > 0) {
+      warnings.push(
+        `${label} 空欄「${answer}」: ${unknown.join(", ")} は既存コードにも表示中のコードにも無く、学習者が推測できません。新しく作るなら newCode に定義を書き newNames で示してください`,
+      );
+      spans.splice(k, 1);
+    }
   }
   if (spans.length === 0) {
     return { ok: false, reason: `${label} 有効な空欄がありません。${warnings.slice(0, 3).join(" / ")}` };
@@ -414,6 +556,7 @@ export function validateRawItem(raw: RawItem, fileText: string): Validation {
       refs: (Array.isArray(raw.refs) ? raw.refs : [])
         .filter((r) => r && r.path && Number(r.line) > 0)
         .map((r) => ({ path: r.path, line: Number(r.line), note: (r.note ?? "").trim() })),
+      newNames,
     },
   };
 }

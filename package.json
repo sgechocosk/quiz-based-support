@@ -53,6 +53,17 @@
     "configuration": {
       "title": "Quiz Support",
       "properties": {
+        "quizSupport.learnerLevel": {
+          "type": "string",
+          "default": "intermediate",
+          "enum": ["beginner", "intermediate", "advanced"],
+          "enumDescriptions": [
+            "初学者・学生: 用語を言い換え、基本の仕組みから一歩ずつ説明します。",
+            "実務エンジニア: 一般的な用語はそのまま使い、設計意図や責務の分担を中心に説明します。",
+            "上級: 独自の仕組み・一般的でない技術・設計上のトレードオフを中心に扱います。"
+          ],
+          "description": "学習者のレベル。出題の難しさ・用語の扱い・解説の細かさが変わります(サイドバーからも変更できます)。"
+        },
         "quizSupport.model": {
           "type": "string",
           "default": "gpt-5-mini",

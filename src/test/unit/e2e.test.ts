@@ -265,6 +265,64 @@ test("実装依頼: 読解問題しか返らなければ実装問題を要求し
   assert.equal(r.quiz.items[1]!.blanks[0]!.answer, "password.length > 8");
 });
 
+test("実装依頼: 重要な読解は2問まで含められ、新しい名前は解答前に示され、レベルがプロンプトに反映される", async (t) => {
+  const appRead = {
+    ...goodItem,
+    path: "src/app.ts",
+    startLine: 3,
+    endLine: 5,
+    firstLine: "export function handleSubmit(u: string, p: string): boolean {",
+    lastLine: "}",
+    blanks: [blank(4, "login(u, p)", { hintApproach: "呼び出し先を見る" })],
+    refs: [],
+  };
+  const changeItem = {
+    ...goodItem,
+    kind: "change",
+    task: "パスワードの長さ判定を専用の関数に切り出して使う",
+    newCode: [
+      "export function login(user: string, password: string): boolean {",
+      '  return isLongEnough(password) && user !== "";',
+      "}",
+      "function isLongEnough(pw: string): boolean {",
+      "  return pw.length > 3;",
+      "}",
+    ].join("\n"),
+    newNames: [{ name: "isLongEnough", role: "パスワードが十分な長さかを判定する関数" }],
+    blanks: [blank(2, "isLongEnough(password)"), blank(5, "pw.length > 3", { hintApproach: "元の条件式を見る" })],
+    refs: [],
+  };
+  let system = "";
+  const { ws, index, client } = await setup(t, (req) => {
+    const b = req.body;
+    if (b.tools || !b.response_format) {
+      return { json: msg(null, [{ name: "read_file", args: { path: "src/auth.ts" } }]) };
+    }
+    if (b.response_format.json_schema.name === "leak_fix") {
+      assert.match(b.messages[0].content, /読み手は初学者です/);
+      return { json: msg(JSON.stringify({ fixes: [] })) };
+    }
+    system = b.messages[0].content;
+    return { json: msg(JSON.stringify({ goal: "判定を関数に分ける", overallExplanation: "o", items: [goodItem, appRead, changeItem] })) };
+  });
+  const agent = new QuizAgent({ llm: client, ws, index, config: { ...CONFIG, maxSteps: 1, level: "beginner" } });
+  const r = await agent.run("パスワード判定を関数に切り出したい", "auto");
+  assert.match(system, /学習者のレベル: 初学者・学生/);
+  assert.deepEqual(
+    r.quiz.items.map((i) => i.kind),
+    ["read", "read", "change"],
+  );
+  const change = r.quiz.items[2]!;
+  assert.deepEqual(
+    change.newNames?.map((n) => n.name),
+    ["isLongEnough", "pw"],
+  );
+  assert.deepEqual(
+    change.blanks.map((b) => b.answer),
+    ["isLongEnough(password)", "pw.length > 3"],
+  );
+});
+
 test("実装依頼: 実装問題をどうしても作れなければ、読解のみである旨を知らせる", async (t) => {
   const { ws, index, client } = await setup(t, (req) => {
     const b = req.body;

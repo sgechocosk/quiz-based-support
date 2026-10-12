@@ -1,4 +1,5 @@
 import { answerSkeleton, maskAnswers, revealsAnswer } from "./leak";
+import { levelGuide, levelStyle, type LearnerLevel } from "./level";
 import type { ChatLlm, ChatMessage, LspPort, SyntaxChecker, WorkspacePort } from "./ports";
 import { applyItemToText, compactItem, validateRawItem, type RawItem, type SemanticJudge, type Validation } from "./quiz";
 import { splitLines } from "./text";
@@ -12,6 +13,8 @@ export interface AgentConfig {
   minSimilarity: number;
   repoMapChars: number;
   evidenceChars: number;
+  /** 学習者のレベル(解説の細かさ・用語・空欄の難しさ) */
+  level?: LearnerLevel;
 }
 
 export interface AgentDeps {
@@ -92,10 +95,19 @@ export const QUIZ_SCHEMA = {
                 additionalProperties: false,
               },
             },
+            newNames: {
+              type: "array",
+              items: {
+                type: "object",
+                properties: { name: STRING, role: STRING },
+                required: ["name", "role"],
+                additionalProperties: false,
+              },
+            },
             explanation: STRING,
           },
           required: [
-            "kind", "path", "startLine", "endLine", "firstLine", "lastLine", "task", "newCode", "blanks", "refs", "explanation",
+            "kind", "path", "startLine", "endLine", "firstLine", "lastLine", "task", "newCode", "blanks", "refs", "newNames", "explanation",
           ],
           additionalProperties: false,
         },
@@ -139,14 +151,15 @@ export function requiresChange(mode: QuizMode, intent: QuizIntent): boolean {
   return mode === "change" || (mode === "auto" && intent === "change");
 }
 
-export function quizSystemPrompt(mode: QuizMode, intent: QuizIntent = "read"): string {
+export function quizSystemPrompt(mode: QuizMode, intent: QuizIntent = "read", level: LearnerLevel = "intermediate"): string {
   const modeLine =
     mode === "read"
       ? "今回はすべて kind=\"read\" にする。"
       : mode === "change"
         ? "今回はすべて kind=\"change\" にする。"
         : intent === "change"
-          ? "今回の要求は実装・修正の依頼。学習者が穴埋めで実装を完成させる kind=\"change\" を必ず1問以上作る(これが主役)。前提となる既存コードや手本を理解する kind=\"read\" は1問まで添えてよい。"
+          ? "今回の要求は実装・修正の依頼。学習者が穴埋めで実装を完成させる kind=\"change\" を必ず1問以上作る(これが主役)。" +
+            "加えて、実装の前に理解しておくべき重要なコードや設計(変更が依存する既存の仕組み・手本になる実装・データ構造・独自の約束事)があれば、kind=\"read\" を最大2問含めてよい。理解の助けにならない読解は入れない。"
           : "今回の要求は仕組みについての質問。kind=\"read\" を中心にする。";
   return [
     "あなたはプログラミング学習アシスタントです。答えを直接教えるのではなく、調査済みのコードだけを根拠に、",
@@ -158,13 +171,18 @@ export function quizSystemPrompt(mode: QuizMode, intent: QuizIntent = "read"): s
     "  コードを書き写す必要はない(システムが実ファイルから問題を組み立てる)。newCode は空文字にする。",
     "- \"change\": 実装・修正の問題。newCode に、対象範囲を置き換える「変更後のコード」を空欄なしで全部書く。",
     "  変更しない行は参照コードと一字一句同じにする。空欄のうち少なくとも1つは変更した行に置く。",
-    "  新しく作る関数名・変数名など、既存コードから推測できない名前は空欄にせず、task で名前を指定する。",
+    "",
+    "【新しい名前は先に決めて示す(理不尽な問題を作らない)】",
+    "- change で新しく作るメソッド・関数・変数・引数・フィールド・クラスの名前は、あなたが決めて newNames に {name, role} で全部書く(role はその名前の役割を一言で)。これらは解答前に学習者へ表示される。",
+    "- 新しい名前そのもの(例: 定義行の名前部分)は空欄にしない。空欄にするのは、その名前を使って何をするか(条件・呼び出し・引数・戻り値など)。",
+    "- 既存コードに無い関数を呼ぶなら、その定義も newCode に含めて newNames に載せる。参照コードに無い既存関数を想像で呼ばない。",
+    "- 名前はプロジェクトの既存の命名規則(大文字小文字・接頭辞・動詞の使い方)に合わせる。read では newNames は空配列。",
     modeLine,
     "",
     "【空欄 blanks の指定】",
     "- line: read はファイルの行番号(参照コードの L数字)、change は newCode の中での行番号(1始まり)。",
     "- target: その行に逐語で含まれる、空欄にする部分の文字列(1行以内・60文字以内)。行全体ではなく、条件式・呼び出し・引数・代入値・型など意味のある単位。",
-    "- item あたり2〜5個。周囲のコードと手がかりから一つに絞れる箇所を選ぶ(同じ意味の書き方が複数ありうる箇所や、根拠なく推測するしかない箇所は避ける)。",
+    "- 個数と難しさは下の【学習者のレベル】に従う。周囲のコードと手がかりから一つに絞れる箇所を選ぶ(同じ意味の書き方が複数ありうる箇所や、根拠なく推測するしかない箇所は避ける)。",
     "",
     "【答えを漏らさない(最重要)】",
     "解答前に見えるのは goal・task・refs・concept・3段階ヒント・clueNote。これらには、どの空欄の答えのコード片も、答えの識別子の組み合わせも書かない。",
@@ -187,6 +205,8 @@ export function quizSystemPrompt(mode: QuizMode, intent: QuizIntent = "read"): s
     "- items は1〜3件。path/startLine/endLine は参照コードの表示どおり。firstLine/lastLine には範囲の最初と最後の行を逐語で入れる。",
     "- 範囲は空欄を含む関数・ブロックの必要最小限(目安15〜25行)。空欄と関係のない行は含めない(表示は空欄の前後数行に絞られる)。",
     "- concept は復習用の短いタグ(例: 非同期処理、条件分岐、配列操作、型注釈、状態管理)。答えの識別子は使わない。",
+    "",
+    levelGuide(level),
   ].join("\n");
 }
 
@@ -223,8 +243,9 @@ interface Leak {
 export function findLeaks(goal: string, items: QuizItem[]): Leak[] {
   const leaks: Leak[] = [];
   const allAnswers = items.flatMap((it) => it.blanks.map((b) => b.answer));
+  const shown = new Set(items.flatMap((it) => (it.newNames ?? []).map((n) => n.name)));
   const check = (leak: Omit<Leak, "answers">, answers: string[]): void => {
-    const hit = answers.filter((a) => revealsAnswer(leak.text, a));
+    const hit = answers.filter((a) => revealsAnswer(leak.text, a, shown));
     if (hit.length > 0) {
       leaks.push({ ...leak, answers: hit });
     }
@@ -391,9 +412,10 @@ export class QuizAgent {
   ): Promise<GeneratedQuiz> {
     const { llm, config } = this.deps;
     const intent = detectIntent(query);
+    const knownText = evidence.allText();
     const needChange = requiresChange(mode, intent);
     const messages: ChatMessage[] = [
-      { role: "system", content: quizSystemPrompt(mode, intent) },
+      { role: "system", content: quizSystemPrompt(mode, intent, config.level) },
       {
         role: "user",
         content: [
@@ -433,10 +455,10 @@ export class QuizAgent {
           reasons.push(`${raw.path}:${raw.startLine}-${raw.endLine} 今回は実装問題(kind="change")だけを出題します`);
           continue;
         }
-        if (raw?.kind === "read" && needChange && accepted.filter((a) => a.kind === "read").length >= 1) {
-          continue; // 実装依頼では読解は1問まで(実装問題の枠を残す)
+        if (raw?.kind === "read" && needChange && !accepted.some((a) => a.kind === "change") && accepted.length >= MAX_ITEMS - 1) {
+          continue; // 実装依頼では、実装問題の枠を最低1つ残す
         }
-        const verdict = await this.validate(raw);
+        const verdict = await this.validate(raw, knownText);
         if (verdict.ok) {
           const { item } = verdict;
           if (accepted.some((a) => a.path === item.path && a.startLine === item.startLine && a.quizCode === item.quizCode)) {
@@ -493,7 +515,7 @@ export class QuizAgent {
   }
 
   /** 実ファイルと照合して問題を組み立て、構文・手がかりの場所を確認する。 */
-  private async validate(raw: RawItem): Promise<Validation> {
+  private async validate(raw: RawItem, knownText: string): Promise<Validation> {
     const rel = normalizeRelPath(raw?.path ?? "");
     if (!rel) {
       return { ok: false, reason: `${raw?.path} はワークスペース相対パスではありません` };
@@ -505,7 +527,7 @@ export class QuizAgent {
     } catch {
       return { ok: false, reason: `${rel} を読み込めません` };
     }
-    const verdict = validateRawItem(raw, fileText);
+    const verdict = validateRawItem(raw, fileText, { knownText });
     if (!verdict.ok) {
       return verdict;
     }
@@ -579,6 +601,7 @@ export class QuizAgent {
                 "あなたはプログラミング学習クイズの編集者です。以下の文章は、解答前に学習者へ見せるのに、答え(空欄に入るコード)を漏らしています。",
                 "各 id について、答えのコード片も、答えに含まれる識別子の組み合わせも使わずに、同じ役割の文章へ書き直してください。",
                 "答えを言う代わりに、関わる概念・見るべき場所・考え方・答えの形(言葉で)を示します。日本語で、元と同じくらいの長さにします。",
+                levelStyle(this.deps.config.level ?? "intermediate"),
               ].join("\n"),
             },
             {

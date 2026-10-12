@@ -11,6 +11,8 @@ import {
   resolveBlanks,
   tokenizeCode,
   changedLineIndexes,
+  declaredNames,
+  unguessableCalls,
   compactDiff,
   compactItem,
   foldRanges,
@@ -20,7 +22,8 @@ import {
 } from "../../core/quiz";
 import { answerSkeleton, maskAnswers, revealsAnswer } from "../../core/leak";
 import type { KeyValueStore } from "../../core/ports";
-import { detectIntent, requiresChange } from "../../core/agent";
+import { detectIntent, quizSystemPrompt, requiresChange } from "../../core/agent";
+import { coerceLevel } from "../../core/level";
 import { splitLines } from "../../core/text";
 import type { QuizItem } from "../../core/types";
 
@@ -61,6 +64,7 @@ const raw = (over: Partial<RawItem> = {}): RawItem => ({
   newCode: "",
   blanks: [blank(4, "a < 2 && b > 0"), blank(5, "a !== b", { concept: "比較" })],
   refs: [],
+  newNames: [],
   explanation: "e",
   ...over,
 });
@@ -364,4 +368,119 @@ test("意図判定: 実装・修正の依頼か、仕組みの質問か", () => 
   assert.ok(!requiresChange("auto", "read"));
   assert.ok(!requiresChange("read", "change"));
   assert.ok(requiresChange("change", "read"));
+});
+
+// ---------- 新しい名前・学習レベル ----------
+
+const SERVICE = [
+  "export class TokenService {",
+  "  private tokens = new Map<string, number>();",
+  "",
+  "  issue(user: string): string {",
+  "    const token = user + Date.now();",
+  "    this.tokens.set(token, Date.now() + 60_000);",
+  "    return token;",
+  "  }",
+  "}",
+].join("\n");
+
+const serviceChange = (over: Partial<RawItem> = {}): RawItem =>
+  raw({
+    kind: "change",
+    path: "src/token.ts",
+    startLine: 1,
+    endLine: 9,
+    firstLine: "export class TokenService {",
+    lastLine: "}",
+    newCode: [
+      ...SERVICE.split("\n").slice(0, 8),
+      "",
+      "  isExpired(token: string): boolean {",
+      "    const expiresAt = this.tokens.get(token) ?? 0;",
+      "    return expiresAt < Date.now();",
+      "  }",
+      "}",
+    ].join("\n"),
+    newNames: [{ name: "isExpired", role: "トークンの期限切れを判定するメソッド" }],
+    blanks: [blank(11, "this.tokens.get(token)"), blank(12, "expiresAt < Date.now()")],
+    ...over,
+  });
+
+test("新しい名前: newCode で定義される名前を拾う(TS/Java)", () => {
+  const names = declaredNames([
+    "  isExpired(token: string): boolean {",
+    "    const expiresAt = this.tokens.get(token) ?? 0;",
+    "    const { a, b: c } = obj;",
+    "    list.map((item, i) => item.id);",
+    "  public boolean isValid(Token t) {",
+    "    String label = t.name();",
+    "  if (ok) {",
+  ]);
+  for (const n of ["isExpired", "token", "expiresAt", "a", "item", "i", "isValid", "t", "label"]) {
+    assert.ok(names.has(n), `${n} が拾えていない: ${[...names].join(",")}`);
+  }
+  assert.ok(!names.has("if"));
+});
+
+test("新しい名前: 申告と自動検出をまとめて解答前に示し、既存の名前は含めない", () => {
+  const v = validateRawItem(serviceChange({ newNames: [] }), SERVICE);
+  assert.ok(v.ok, v.ok ? "" : v.reason);
+  if (!v.ok) {
+    return;
+  }
+  const names = (v.item.newNames ?? []).map((n) => n.name);
+  assert.ok(names.includes("isExpired") && names.includes("expiresAt"), names.join(","));
+  assert.ok(!names.includes("token"), "既存ファイルにある名前は新しい名前ではない");
+  const declared = validateRawItem(serviceChange(), SERVICE);
+  assert.ok(declared.ok);
+  if (declared.ok) {
+    assert.deepEqual(declared.item.newNames![0], { name: "isExpired", role: "トークンの期限切れを判定するメソッド" });
+  }
+});
+
+test("新しい名前: 名前そのものの空欄と、どこにも無い関数を答えにする空欄は外す", () => {
+  const v = validateRawItem(serviceChange({ blanks: [blank(10, "isExpired"), blank(12, "expiresAt < Date.now()")] }), SERVICE);
+  assert.ok(v.ok, v.ok ? "" : v.reason);
+  if (v.ok) {
+    assert.deepEqual(v.item.blanks.map((b) => b.answer), ["expiresAt < Date.now()"]);
+    assert.match(v.warnings.join("\n"), /新しく作る名前そのものは空欄にしません/);
+  }
+  const ghost = serviceChange({
+    newCode: serviceChange().newCode.replace("this.tokens.get(token) ?? 0", "lookupExpiry(token)"),
+    blanks: [blank(11, "lookupExpiry(token)")],
+  });
+  const g = validateRawItem(ghost, SERVICE);
+  assert.ok(!g.ok);
+  assert.match(g.ok ? "" : g.reason, /lookupExpiry は既存コードにも表示中のコードにも無く/);
+  // 調査で読んだ別ファイルにある関数なら推測できるので残す
+  const known = validateRawItem(ghost, SERVICE, { knownText: "export function lookupExpiry(t: string) {}" });
+  assert.ok(known.ok);
+  // 標準の関数・メソッド呼び出しは対象外
+  assert.deepEqual(unguessableCalls("Math.max(parseInt(x), arr.filter(f).length)", new Set()), []);
+});
+
+test("答え漏れ: 解答前に示す新しい名前は、漏れの判定材料にしない", () => {
+  // 課題文で「isExpired は token を受け取る」と仕様を示しても、どう使うか(三項演算子の中身)までは分からない
+  const spec = "isExpired は token を受け取るメソッドです";
+  assert.ok(revealsAnswer(spec, "isExpired(token) ? 401 : 200"));
+  assert.ok(!revealsAnswer(spec, "isExpired(token) ? 401 : 200", new Set(["isExpired"])));
+  assert.ok(revealsAnswer("isExpired で token を調べる", "isExpired(token)", new Set(["isExpired"])), "呼び出し方まで言えば漏れ");
+  assert.ok(revealsAnswer("isExpired(token) を書く", "isExpired(token)", new Set(["isExpired"])), "答えそのものは漏れ");
+});
+
+test("学習レベル: レベルごとに用語・空欄数・解説の方針が変わり、飛躍を避ける指示は共通", () => {
+  const beginner = quizSystemPrompt("auto", "read", "beginner");
+  const advanced = quizSystemPrompt("auto", "read", "advanced");
+  assert.match(beginner, /初学者・学生/);
+  assert.match(beginner, /初出で短く言い換える/);
+  assert.match(advanced, /不変条件/);
+  assert.ok(!advanced.includes("初出で短く言い換える"));
+  for (const p of [beginner, advanced, quizSystemPrompt("auto", "read")]) {
+    assert.match(p, /途中の段階を省かない/);
+    assert.match(p, /newNames に \{name, role\}/);
+  }
+  assert.match(quizSystemPrompt("auto", "read"), /実務エンジニア/, "既定は実務レベル");
+  assert.match(quizSystemPrompt("auto", "change"), /kind="read" を最大2問含めてよい/);
+  assert.equal(coerceLevel("advanced"), "advanced");
+  assert.equal(coerceLevel("expert"), "intermediate");
 });

@@ -41,6 +41,11 @@ export class EvidenceStore {
     return this.files.size === 0;
   }
 
+  /** 読んだ行すべて(行番号なし)。既存の名前かどうかの判定に使う */
+  allText(): string {
+    return [...this.files.values()].map((m) => [...m.values()].join("\n")).join("\n");
+  }
+
   /** 新しく見たファイルから優先して、文字数予算内で行番号付きに整形する。 */
   render(maxChars: number): string {
     const sections: string[] = [];

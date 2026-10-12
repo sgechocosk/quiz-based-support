@@ -30,6 +30,12 @@ button:disabled, input:disabled, select:disabled, textarea:disabled { opacity: 0
 .goal { margin: 0; }
 .task { white-space: pre-wrap; padding: 4px 6px; border-radius: 3px; background: var(--vscode-textBlockQuote-background); border-left: 3px solid var(--vscode-textBlockQuote-border, var(--vscode-focusBorder)); }
 .refs { display: flex; flex-direction: column; gap: 2px; font-size: 12px; }
+.names { display: flex; flex-direction: column; gap: 2px; font-size: 12px; padding: 4px 6px; border: 1px dashed var(--vscode-panel-border); border-radius: 3px; }
+.names code { font-family: var(--vscode-editor-font-family); background: var(--vscode-textCodeBlock-background); padding: 0 4px; border-radius: 3px; }
+#level-row { display: flex; gap: 6px; align-items: center; flex-shrink: 0; }
+#level { background: var(--vscode-dropdown-background); color: var(--vscode-dropdown-foreground); border: 1px solid var(--vscode-dropdown-border); border-radius: 3px; }
+button.level-choice { display: flex; flex-direction: column; align-items: flex-start; gap: 2px; text-align: left; }
+button.level-choice span { font-size: 12px; opacity: 0.9; }
 .ref { white-space: pre-wrap; }
 .why-blank { color: var(--vscode-foreground); margin-top: 2px; }
 textarea.prediction { width: 100%; box-sizing: border-box; resize: vertical; background: var(--vscode-input-background); color: var(--vscode-input-foreground); border: 1px solid var(--vscode-input-border, transparent); border-radius: 3px; padding: 4px 6px; font-family: inherit; }

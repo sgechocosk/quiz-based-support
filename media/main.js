@@ -84,6 +84,40 @@
     if (!$("log-box").classList.contains("hidden")) {
       renderLog();
     }
+    renderLevel();
+  }
+
+  // ---------- 学習レベル ----------
+
+  const levelSelect = /** @type {HTMLSelectElement} */ ($("level"));
+  levelSelect.addEventListener("change", () => vscode.postMessage({ type: "setLevel", level: levelSelect.value }));
+
+  function renderLevel() {
+    const levels = state.levels || [];
+    if (levelSelect.options.length !== levels.length) {
+      levelSelect.replaceChildren(...levels.map((l) => el("option", { value: l.id, text: l.label, title: l.description })));
+    }
+    if (state.level) {
+      levelSelect.value = state.level;
+    }
+    const current = levels.find((l) => l.id === state.level);
+    levelSelect.title = current ? current.description : "";
+
+    // 初回は、出題の前にレベルを選んでもらう
+    const box = $("level-box");
+    box.classList.toggle("hidden", !!state.levelChosen || levels.length === 0);
+    if (state.levelChosen || box.childElementCount > 0) {
+      return;
+    }
+    box.append(
+      el("h4", { text: "はじめに: 学習レベルを選んでください" }),
+      el("div", { class: "muted", text: "レベルに合わせて、問題の難しさ・用語の説明・解説の細かさを調整します。あとから上の「学習レベル」でいつでも変えられます。" }),
+    );
+    for (const l of levels) {
+      const btn = el("button", { class: "level-choice" }, el("strong", { text: l.label }), el("span", { text: l.description }));
+      btn.onclick = () => vscode.postMessage({ type: "setLevel", level: l.id });
+      box.append(btn);
+    }
   }
 
   function renderLog() {
@@ -222,6 +256,13 @@
       );
       if (item.task) {
         block.append(el("div", { class: "task", text: `${item.kind === "change" ? "課題" : "読みどころ"}: ${item.task}` }));
+      }
+      if (item.newNames && item.newNames.length > 0) {
+        const names = el("div", { class: "names" }, el("div", { class: "muted", text: "この問題で新しく作る名前(この名前を使って書きます)" }));
+        for (const n of item.newNames) {
+          names.append(el("div", {}, el("code", { text: n.name }), n.role ? document.createTextNode(` — ${n.role}`) : null));
+        }
+        block.append(names);
       }
       if (item.refs && item.refs.length > 0) {
         const refs = el("div", { class: "refs" }, el("div", { class: "muted", text: "参考にするコード" }));
