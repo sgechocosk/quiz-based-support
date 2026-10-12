@@ -1,462 +1,745 @@
+import * as crypto from "node:crypto";
+import * as path from "node:path";
 import * as vscode from "vscode";
-import { WorkspaceVectorSearchService } from "./WorkspaceVectorSearchService";
+import { makeSemanticJudge, QuizAgent, type QuizMode } from "./core/agent";
+import { languageForPath } from "./core/chunker";
+import { IndexManager, type SyncPlan } from "./core/indexer";
+import { LearnerLog, type BlankResult, type ReviewCard } from "./core/learnerLog";
+import { OpenAiClient } from "./core/llm";
+import type { KeyValueStore } from "./core/ports";
+import { buildStructureQuestions } from "./core/questions";
+import {
+  applyItemToText,
+  gradeBlanks,
+  isolateBlank,
+  resolveBlanks,
+  scoreOf,
+  windowAround,
+  type BlankGrade,
+} from "./core/quiz";
+import { makeRng, sha1 } from "./core/text";
+import type { McqQuestion, QuizItem } from "./core/types";
+import { TreeSitterProvider } from "./host/parser";
+import { VscodeLsp, VscodeWorkspace } from "./host/workspaceVscode";
 
-export class ChatSidebarProvider implements vscode.WebviewViewProvider {
-  private _view?: vscode.WebviewView;
-  private readonly _vectorService: WorkspaceVectorSearchService;
+const SECRET_KEY = "openai-api-key";
 
-  constructor(private readonly _context: vscode.ExtensionContext) {
-    this._vectorService = new WorkspaceVectorSearchService(_context);
-    this._context.secrets.onDidChange((e) => {
-      if (e.key === "openai-api-key") {
-        void this.syncState();
-      }
+interface Services {
+  ws: VscodeWorkspace;
+  lsp: VscodeLsp;
+  index: IndexManager;
+  watcher: vscode.FileSystemWatcher;
+}
+
+/**
+ * 正解・解説・元コードはここ(拡張機能ホスト)にだけ保持する。
+ * webview には出題に必要な情報(空欄入りコードとヒント)しか渡さない。
+ */
+interface QuizSession {
+  id: string;
+  review: boolean;
+  items: QuizItem[];
+  questions: McqQuestion[];
+  overall: string;
+  graded: boolean;
+}
+
+function readConfig() {
+  const c = vscode.workspace.getConfiguration("quizSupport");
+  return {
+    model: c.get<string>("model", "gpt-5-mini"),
+    embeddingModel: c.get<string>("embeddingModel", "text-embedding-3-small"),
+    baseUrl: c.get<string>("baseUrl", "https://api.openai.com/v1"),
+    maxAgentSteps: c.get<number>("maxAgentSteps", 8),
+    minSimilarity: c.get<number>("minSimilarity", 0.2),
+    semanticGrading: c.get<boolean>("semanticGrading", true),
+    structureQuestions: c.get<boolean>("structureQuestions", true),
+    autoEmbedMaxTokens: c.get<number>("autoEmbedMaxTokens", 100_000),
+    maxFiles: c.get<number>("maxFiles", 3000),
+  };
+}
+
+function errorMessage(error: unknown, fallback: string): string {
+  return error instanceof Error ? error.message : fallback;
+}
+
+export class ChatSidebarProvider implements vscode.WebviewViewProvider, vscode.Disposable {
+  private view?: vscode.WebviewView;
+  private services?: Services;
+  private servicesPromise?: Promise<Services | undefined>;
+  private apiKey: string | undefined;
+  private readonly parser: TreeSitterProvider;
+  private readonly client: OpenAiClient;
+  private readonly log: LearnerLog;
+  private readonly sessions = new Map<string, QuizSession>();
+  private pendingPlan?: SyncPlan;
+  private abort?: AbortController;
+  private busy = false;
+  private syncing = false;
+  private syncTimer?: ReturnType<typeof setTimeout>;
+  private readonly dirty = new Set<string>();
+  private needFullSync = false;
+  private readonly disposables: vscode.Disposable[] = [];
+
+  constructor(private readonly context: vscode.ExtensionContext) {
+    this.parser = new TreeSitterProvider(context.extensionUri.fsPath);
+    this.client = new OpenAiClient({
+      apiKey: async () => this.apiKey ?? (await context.secrets.get(SECRET_KEY)),
+      baseUrl: () => readConfig().baseUrl,
+      model: () => readConfig().model,
+      embeddingModel: () => readConfig().embeddingModel,
     });
-  }
-
-  public resolveWebviewView(
-    webviewView: vscode.WebviewView,
-    context: vscode.WebviewViewResolveContext,
-    _token: vscode.CancellationToken,
-  ) {
-    this._view = webviewView;
-
-    webviewView.webview.options = {
-      enableScripts: true,
-      localResourceRoots: [this._context.extensionUri],
+    const store: KeyValueStore = {
+      get: <T>(key: string) => context.workspaceState.get<T>(key),
+      update: async (key, value) => {
+        await context.workspaceState.update(key, value);
+      },
     };
+    this.log = new LearnerLog(store);
 
-    webviewView.webview.html = this._getHtmlForWebview();
-    void this.syncState();
-
-    webviewView.webview.onDidReceiveMessage(async (data) => {
-      switch (data.type) {
-        case "searchQuery":
-          await this.handleSearchQuery(data.value);
-          break;
-        case "requestSetApiKey":
-          vscode.commands.executeCommand("quiz-based-support.setApiKey");
-          break;
-        case "requestScan":
-          await this.handleScan();
-          break;
-        case "confirmBuildIndex":
-          await this.handleBuildIndex();
-          break;
-        case "applyCorrectCode":
-          await this.handleApplyCorrectCode(data.change);
-          break;
-      }
-    });
-  }
-
-  private async syncState() {
-    const apiKey = await this._context.secrets.get("openai-api-key");
-    if (!apiKey) {
-      this._view?.webview.postMessage({
-        type: "state",
-        value: "require-api-key",
-      });
-      return;
-    }
-
-    try {
-      const status = await this._vectorService.getStatus();
-      if (status.ready) {
-        this._view?.webview.postMessage({
-          type: "state",
-          value: "ready",
-          message: await this._vectorService.getReadyMessage(),
-        });
-      } else {
-        this._view?.webview.postMessage({
-          type: "state",
-          value: "require-scan",
-        });
-      }
-    } catch (error) {
-      this._view?.webview.postMessage({
-        type: "error",
-        value:
-          error instanceof Error ? error.message : "状態取得に失敗しました。",
-      });
-    }
-  }
-
-  private async handleScan() {
-    this._view?.webview.postMessage({
-      type: "status",
-      value: "ワークスペースをスキャン中...",
-    });
-    try {
-      const summary = await this._vectorService.prepareIndexSummary(true);
-      this._view?.webview.postMessage({
-        type: "scanResult",
-        summary: `ワークスペースから ${summary.files} ファイル、${summary.chunks} チャンク、約 ${summary.tokens} トークンを抽出します。`,
-      });
-    } catch (error) {
-      this._view?.webview.postMessage({
-        type: "error",
-        value:
-          error instanceof Error ? error.message : "スキャンに失敗しました。",
-      });
-    }
-  }
-
-  private async handleSearchQuery(query: string) {
-    this._view?.webview.postMessage({
-      type: "status",
-      value: "コードを検索中...",
-    });
-    try {
-      const results = await this._vectorService.search(query);
-
-      this._view?.webview.postMessage({
-        type: "status",
-        value: "変更案を分析中...",
-      });
-      const analysis = await this._vectorService.analyzeAndSuggest(
-        query,
-        results,
-      );
-      const formatted = this._vectorService.formatAnalysisResult(analysis);
-
-      this._view?.webview.postMessage({ type: "result", value: formatted });
-    } catch (error) {
-      this._view?.webview.postMessage({
-        type: "error",
-        value:
-          error instanceof Error
-            ? error.message
-            : "検索中にエラーが発生しました。",
-      });
-    }
-  }
-
-  private async handleBuildIndex() {
-    try {
-      const customProgress = {
-        report: (value: { message?: string }) => {
-          if (value.message) {
-            this._view?.webview.postMessage({
-              type: "status",
-              value: value.message,
-            });
-          }
-        },
-      };
-
-      await this._vectorService.buildIndex(true, customProgress);
-      void this.syncState();
-    } catch (error) {
-      this._view?.webview.postMessage({
-        type: "error",
-        value:
-          error instanceof Error ? error.message : "ベクトル化に失敗しました。",
-      });
-    }
-  }
-
-  private async handleApplyCorrectCode(
-    change: import("./WorkspaceVectorSearchService").CodeChange,
-  ) {
-    try {
-      await this._vectorService.applyCorrectCode(change);
-      this._view?.webview.postMessage({
-        type: "status",
-        value: `✅ ${change.targetFilePath} の ${change.startLine}〜${change.endLine} 行目に正解コードを反映しました。`,
-      });
-    } catch (error) {
-      // applyCodeChangeToText からの「内容不一致」エラーは
-      // そのままユーザーに表示することで、誤った場所への書き込みを未然に防げたことを伝える
-      this._view?.webview.postMessage({
-        type: "error",
-        value:
-          error instanceof Error
-            ? error.message
-            : "コードの反映に失敗しました。",
-      });
-    }
-  }
-
-  private _getHtmlForWebview() {
-    const script = this._getScriptContent();
-    const style = this._getStyleContent();
-
-    return (
-      "<!DOCTYPE html>" +
-      '<html lang="ja">' +
-      "<head>" +
-      '<meta charset="UTF-8">' +
-      '<meta name="viewport" content="width=device-width, initial-scale=1.0">' +
-      "<style>" +
-      style +
-      "</style>" +
-      "</head>" +
-      "<body>" +
-      '<div id="chat-container">' +
-      '<div id="top-actions">' +
-      '<button id="setup-btn">API Key</button>' +
-      '<button id="scan-btn">ベクトル化</button>' +
-      "</div>" +
-      '<div id="index-actions">' +
-      '<div id="index-summary" class="message notice-msg"></div>' +
-      '<button id="index-btn">確定して実行</button>' +
-      "</div>" +
-      '<div id="messages"></div>' +
-      '<div id="input-container">' +
-      '<input type="text" id="query-input" placeholder="準備中..." disabled />' +
-      '<button id="send-btn" disabled>送信</button>' +
-      "</div>" +
-      "</div>" +
-      "<script>" +
-      script +
-      "</script>" +
-      "</body>" +
-      "</html>"
+    this.disposables.push(
+      context.secrets.onDidChange((e) => {
+        if (e.key === SECRET_KEY) {
+          void this.refreshKey().then(() => this.pushState());
+        }
+      }),
+      vscode.workspace.onDidChangeConfiguration((e) => {
+        if (e.affectsConfiguration("quizSupport")) {
+          void this.pushState();
+        }
+      }),
     );
   }
 
-  private _getStyleContent(): string {
-    return [
-      "html, body { height: 100%; margin: 0; padding: 0; overflow: hidden; }",
-      "body { font-family: var(--vscode-font-family); color: var(--vscode-foreground); }",
-      "#chat-container { display: flex; flex-direction: column; height: 100%; padding: 10px; box-sizing: border-box; }",
-      "#messages { flex-grow: 1; overflow-y: auto; margin-bottom: 10px; display: flex; flex-direction: column; gap: 8px; padding-right: 4px; }",
-      ".message { padding: 8px; border-radius: 6px; font-size: 13px; line-height: 1.4; word-wrap: break-word; white-space: pre-wrap; }",
-      ".user-msg { background-color: var(--vscode-button-background); color: var(--vscode-button-foreground); align-self: flex-end; max-width: 85%; }",
-      ".bot-msg { background-color: var(--vscode-editor-inactiveSelectionBackground); align-self: flex-start; max-width: 95%; }",
-      ".error-msg { color: var(--vscode-errorForeground); }",
-      ".notice-msg { background: var(--vscode-editorHoverWidget-background); border: 1px solid var(--vscode-editorHoverWidget-border); align-self: stretch; max-width: 100%; }",
-      "#input-container { display: flex; gap: 5px; flex-shrink: 0; }",
-      'input[type="text"] { flex-grow: 1; background: var(--vscode-input-background); color: var(--vscode-input-foreground); border: 1px solid var(--vscode-input-border); padding: 6px; border-radius: 4px; outline: none; }',
-      'input[type="text"]:focus { border-color: var(--vscode-focusBorder); }',
-      "button { background: var(--vscode-button-background); color: var(--vscode-button-foreground); border: 1px solid rgba(255, 255, 255, 0.2); padding: 6px 12px; border-radius: 4px; cursor: pointer; flex-shrink: 0; filter: brightness(1.2); }",
-      "button:hover { filter: brightness(1.35); }",
-      "button:disabled, input:disabled { opacity: 0.5; cursor: not-allowed; }",
-      "#top-actions { display: flex; gap: 8px; margin-bottom: 10px; flex-shrink: 0; }",
-      "#top-actions button { flex: 1; background: var(--vscode-button-secondaryBackground); color: var(--vscode-button-secondaryForeground); }",
-      "#index-actions { display: none; flex-direction: column; gap: 8px; padding: 8px; border: 1px solid var(--vscode-editorWidget-border); border-radius: 6px; margin-bottom: 10px; }",
-      "#index-actions.visible { display: flex; }",
-      ".quiz-blank { background: var(--vscode-input-background); color: var(--vscode-input-foreground); border: 1px solid var(--vscode-input-border); padding: 2px 6px; margin: 0 4px; border-radius: 3px; font-family: var(--vscode-editor-font-family); font-size: 0.95em; }",
-      ".quiz-blank.correct { border-color: #4caf50; background: rgba(76, 175, 80, 0.15); }",
-      ".quiz-blank.incorrect { border-color: #f44336; background: rgba(244, 67, 54, 0.15); }",
-      ".grade-btn { margin-top: 6px; background: var(--vscode-button-secondaryBackground); color: var(--vscode-button-secondaryForeground); width: 100%; }",
-      ".grade-result { font-size: 12px; margin-top: 4px; color: var(--vscode-foreground); opacity: 0.8; }",
-      ".quiz-block { margin: 4px 0; }",
-      ".quiz-code-line { padding: 1px 8px; font-family: var(--vscode-editor-font-family); font-size: 0.9em; opacity: 0.5; }",
-      ".quiz-row { border-left: 3px solid var(--vscode-focusBorder); padding: 6px 8px; margin: 6px 0; border-radius: 0 4px 4px 0; background: var(--vscode-editor-inactiveSelectionBackground); }",
-      ".quiz-hint { font-size: 12px; color: var(--vscode-descriptionForeground); margin-bottom: 4px; }",
-      ".quiz-line-pre { margin: 2px 0; padding: 4px 8px; background: var(--vscode-textCodeBlock-background); border-radius: 3px; overflow-x: auto; white-space: pre; }",
-      ".quiz-row-result { font-size: 12px; margin-top: 4px; min-height: 16px; }",
-      ".result-correct { color: #4caf50; }",
-      ".result-incorrect { color: #f44336; }",
-      ".result-correct code, .result-incorrect code { background: var(--vscode-textCodeBlock-background); padding: 1px 4px; border-radius: 3px; font-family: var(--vscode-editor-font-family); }",
-    ].join("\n");
+  dispose(): void {
+    this.abort?.abort();
+    if (this.syncTimer) {
+      clearTimeout(this.syncTimer);
+    }
+    this.services?.watcher.dispose();
+    this.disposables.forEach((d) => d.dispose());
   }
 
-  private _getScriptContent(): string {
-    return [
-      "const vscode = acquireVsCodeApi();",
-      "const messagesDiv = document.getElementById('messages');",
-      "const input = document.getElementById('query-input');",
-      "const sendBtn = document.getElementById('send-btn');",
-      "const indexActions = document.getElementById('index-actions');",
-      "const indexSummary = document.getElementById('index-summary');",
-      "",
-      // _getScriptContent() の配列を以下に差し替え
-      "function gradeQuiz(btn) {",
-      "  const msgDiv = btn.closest('.message');",
-      "  const rows = msgDiv.querySelectorAll('.quiz-row');",
-      "  let correct = 0;",
-      "  rows.forEach(function(row) {",
-      "    const inp = row.querySelector('.quiz-blank');",
-      "    const resultDiv = row.querySelector('.quiz-row-result');",
-      "    const userAnswer = inp.value.trim();",
-      "    const correctAnswer = inp.dataset.answer || '';",
-      "    const normalize = function(s) { return s.trim().replace(/;$/, '').replace(/\\s+/g, ' '); };",
-      "    const isCorrect = normalize(userAnswer) === normalize(correctAnswer);",
-      "    inp.classList.remove('correct', 'incorrect');",
-      "    inp.classList.add(isCorrect ? 'correct' : 'incorrect');",
-      // 正解・不正解どちらもユーザー入力と正解を両方表示
-      "    if (isCorrect) {",
-      "      resultDiv.innerHTML = '<span class=\"result-correct\">正解！　あなたの回答: <code>' + userAnswer + '</code></span>';",
-      "    } else {",
-      "      resultDiv.innerHTML = '<span class=\"result-incorrect\">不正解　あなたの回答: <code>' + (userAnswer || '(未入力)') + '</code>　正解: <code>' + correctAnswer + '</code></span>';",
-      "    }",
-      "    if (isCorrect) correct++;",
-      "  });",
-      "  const totalDiv = btn.nextElementSibling;",
-      "  totalDiv.textContent = '結果: ' + rows.length + '問中 ' + correct + '問正解 (' + Math.round(correct / rows.length * 100) + '%)';",
-      "  btn.disabled = true;",
-      "  btn.textContent = '採点済み';",
-      "  const metaRaw = btn.dataset.meta;",
-      "  if (metaRaw) {",
-      "    try {",
-      "      const meta = JSON.parse(decodeURIComponent(metaRaw));",
-      "      const applyBtn = document.createElement('button');",
-      "      applyBtn.className = 'grade-btn apply-btn';",
-      "      applyBtn.textContent = '正解コードをファイルに反映';",
-      "      applyBtn.onclick = function() {",
-      "        applyBtn.disabled = true;",
-      "        applyBtn.textContent = '反映中...';",
-      // meta に answers/hints が既に含まれているため、DOM からの再収集は不要
-      "        vscode.postMessage({",
-      "          type: 'applyCorrectCode',",
-      "          change: meta",
-      "        });",
-      "      };",
-      "      btn.parentNode.insertBefore(applyBtn, btn.nextSibling);",
-      "    } catch(e) {",
-      // パース失敗時もユーザーに分かるようにエラーメッセージを表示する
-      "      const errDiv = document.createElement('div');",
-      "      errDiv.className = 'message error-msg';",
-      "      errDiv.textContent = 'クイズ情報の読み込みに失敗したため、コード反映ボタンを表示できませんでした。';",
-      "      btn.parentNode.insertBefore(errDiv, btn.nextSibling);",
-      "    }",
-      "  }",
-      "}",
-      "",
-      "function formatTextToHtml(text) {",
-      "  const escaped = text.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');",
-      "",
-      "  let meta = null;",
-      "  const mMatch = escaped.match(/___QUIZ_META___(.*?)___QUIZ_META___/);",
-      "  if (mMatch) { try { meta = JSON.parse(mMatch[1]); } catch(e) {} }",
-      "",
-      "  let answers = [];",
-      "  const aMatch = escaped.match(/___QUIZ_ANSWERS___(.*?)___QUIZ_ANSWERS___/);",
-      "  if (aMatch) { try { answers = JSON.parse(aMatch[1]); } catch(e) {} }",
-      "",
-      "  let hints = [];",
-      "  const hMatch = escaped.match(/___QUIZ_HINTS___(.*?)___QUIZ_HINTS___/);",
-      "  if (hMatch) { try { hints = JSON.parse(hMatch[1]); } catch(e) {} }",
-      "",
-      "  let cleaned = escaped",
-      "    .replace(/___QUIZ_ANSWERS___.*?___QUIZ_ANSWERS___\\n?/g, '')",
-      "    .replace(/___QUIZ_HINTS___.*?___QUIZ_HINTS___\\n?/g, '')",
-      "    .replace(/___QUIZ_META___.*?___QUIZ_META___\\n?/g, '');",
-      "",
-      "  const codeBlockRegex = new RegExp('(' + '`'.repeat(3) + '[\\\\s\\\\S]*?' + '`'.repeat(3) + ')', 'g');",
-      "  const parts = cleaned.split(codeBlockRegex);",
-      "",
-      "  let blankIndex = 0;",
-      "  const htmlParts = parts.map(function(part) {",
-      "    const fence = '`'.repeat(3);",
-      "    if (part.startsWith(fence) && part.endsWith(fence)) {",
-      "      const code = part.slice(3, -3).replace(/^\\n/, '');",
-      "      const lines = code.split('\\n');",
-      // BLANK行ごとにヒント→入力欄の「quiz-row」を生成
-      "      const rowsHtml = lines.map(function(line) {",
-      "        if (line.indexOf('___BLANK___') === -1) {",
-      "          return '<div class=\"quiz-code-line\"><code>' + line + '</code></div>';",
-      "        }",
-      "        const hint = hints[blankIndex] || '';",
-      "        const answer = answers[blankIndex] || '';",
-      "        const escapedAnswer = answer.replace(/\"/g, '&quot;');",
-      "        const width = Math.max(100, Math.min(320, answer.length * 9 + 40));",
-      "        blankIndex++;",
-      "        const inputHtml = line.replace('___BLANK___',",
-      '          \'<input type="text" class="quiz-blank" placeholder="???" data-answer="\' + escapedAnswer + \'" style="width:\' + width + \'px">\'',
-      "        );",
-      "        return '<div class=\"quiz-row\">'",
-      "          + (hint ? '<div class=\"quiz-hint\">' + hint + '</div>' : '')",
-      "          + '<pre class=\"quiz-line-pre\"><code>' + inputHtml + '</code></pre>'",
-      "          + '<div class=\"quiz-row-result\"></div>'",
-      "          + '</div>';",
-      "      }).join('');",
-      "      return '<div class=\"quiz-block\">' + rowsHtml + '</div>';",
-      "    } else {",
-      "      return part.replace(/\\n/g, '<br>');",
-      "    }",
-      "  }).join('');",
-      "",
-      "  if (answers.length > 0) {",
-      "    const metaAttr = meta ? ' data-meta=\\''+encodeURIComponent(JSON.stringify(meta)).replace(/'/g, '%27')+'\\'' : '';",
-      "    return htmlParts",
-      "      + '<button class=\"grade-btn\" onclick=\"gradeQuiz(this)\"' + metaAttr + '>解答チェック (' + answers.length + '問)</button>'",
-      "      + '<div class=\"grade-result\"></div>';",
-      "  }",
+  // ---------- webview ----------
 
-      "  return htmlParts;",
-      "}",
-      "",
-      "function addMessage(text, className) {",
-      "  const msgDiv = document.createElement('div');",
-      "  msgDiv.className = 'message ' + className;",
-      "  if (className === 'bot-msg') {",
-      "    msgDiv.innerHTML = formatTextToHtml(text);",
-      "  } else {",
-      "    msgDiv.textContent = text;",
-      "  }",
-      "  messagesDiv.appendChild(msgDiv);",
-      "  messagesDiv.scrollTop = messagesDiv.scrollHeight;",
-      "}",
-      "",
-      "function setInputState(enabled, placeholder) {",
-      "  input.disabled = !enabled;",
-      "  sendBtn.disabled = !enabled;",
-      "  input.placeholder = placeholder;",
-      "}",
-      "",
-      "document.getElementById('send-btn').addEventListener('click', function() {",
-      "  const text = input.value.trim();",
-      "  if (text) {",
-      "    addMessage(text, 'user-msg');",
-      "    input.value = '';",
-      "    vscode.postMessage({ type: 'searchQuery', value: text });",
-      "  }",
-      "});",
-      "",
-      "document.getElementById('setup-btn').addEventListener('click', function() {",
-      "  vscode.postMessage({ type: 'requestSetApiKey' });",
-      "});",
-      "",
-      "document.getElementById('scan-btn').addEventListener('click', function() {",
-      "  vscode.postMessage({ type: 'requestScan' });",
-      "});",
-      "",
-      "document.getElementById('index-btn').addEventListener('click', function() {",
-      "  vscode.postMessage({ type: 'confirmBuildIndex' });",
-      "});",
-      "",
-      "input.addEventListener('keypress', function(e) {",
-      "  if (e.key === 'Enter') sendBtn.click();",
-      "});",
-      "",
-      "window.addEventListener('message', function(event) {",
-      "  const message = event.data;",
-      "  switch (message.type) {",
-      "    case 'state':",
-      "      if (message.value === 'require-api-key') {",
-      "        addMessage('APIキーが未設定です。API Keyボタンから設定してください。', 'bot-msg');",
-      "        setInputState(false, 'APIキーを設定してください...');",
-      "        indexActions.classList.remove('visible');",
-      "      } else if (message.value === 'require-scan') {",
-      "        addMessage('APIキーを確認しました。上部のベクトル化ボタンを押してスキャンを開始してください。', 'bot-msg');",
-      "        setInputState(false, 'スキャンを行ってください...');",
-      "        indexActions.classList.remove('visible');",
-      "      } else if (message.value === 'ready') {",
-      "        addMessage(message.message || '準備完了です。コードの機能や役割を入力してください。', 'bot-msg');",
-      "        setInputState(true, '例: ログイン処理のコードは？');",
-      "        indexActions.classList.remove('visible');",
-      "      }",
-      "      break;",
-      "    case 'scanResult':",
-      "      setInputState(false, '承認待ち...');",
-      "      indexSummary.textContent = message.summary;",
-      "      indexActions.classList.add('visible');",
-      "      addMessage('スキャンが完了しました。トークン数を確認し、よろしければ確定して実行ボタンを押してください。', 'bot-msg');",
-      "      break;",
-      "    case 'result':",
-      "    case 'status':",
-      "      addMessage(message.value, 'bot-msg');",
-      "      break;",
-      "    case 'error':",
-      "      addMessage('エラー: ' + message.value, 'error-msg');",
-      "      break;",
-      "  }",
-      "});",
-    ].join("\n");
+  resolveWebviewView(webviewView: vscode.WebviewView): void {
+    this.view = webviewView;
+    const mediaRoot = vscode.Uri.joinPath(this.context.extensionUri, "media");
+    webviewView.webview.options = { enableScripts: true, localResourceRoots: [mediaRoot] };
+    webviewView.webview.html = this.html(webviewView.webview, mediaRoot);
+    webviewView.webview.onDidReceiveMessage((message: unknown) => {
+      void this.onMessage(message);
+    });
+    void this.init();
+  }
+
+  private html(webview: vscode.Webview, mediaRoot: vscode.Uri): string {
+    const nonce = crypto.randomBytes(16).toString("base64");
+    const css = webview.asWebviewUri(vscode.Uri.joinPath(mediaRoot, "main.css"));
+    const js = webview.asWebviewUri(vscode.Uri.joinPath(mediaRoot, "main.js"));
+    const csp = [
+      "default-src 'none'",
+      `style-src ${webview.cspSource}`,
+      `script-src 'nonce-${nonce}'`,
+    ].join("; ");
+    return `<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<meta http-equiv="Content-Security-Policy" content="${csp}">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<link rel="stylesheet" href="${css}">
+</head>
+<body>
+<div id="app">
+  <div id="top-actions">
+    <button id="btn-key" class="secondary">APIキー</button>
+    <button id="btn-index" class="secondary">インデックス</button>
+    <button id="btn-log" class="secondary">学習記録</button>
+  </div>
+  <div id="index-status" class="muted"></div>
+  <div id="plan-box" class="card hidden"></div>
+  <div id="log-box" class="card hidden"></div>
+  <div id="messages"></div>
+  <div id="input-area">
+    <div id="input-row">
+      <select id="mode" title="出題の種類">
+        <option value="auto">自動</option>
+        <option value="read">読んで理解</option>
+        <option value="change">実装して学ぶ</option>
+      </select>
+      <input type="text" id="query" placeholder="準備中..." disabled>
+      <button id="btn-send" disabled>送信</button>
+      <button id="btn-cancel" class="secondary hidden">中止</button>
+    </div>
+  </div>
+</div>
+<script nonce="${nonce}" src="${js}"></script>
+</body>
+</html>`;
+  }
+
+  private post(message: Record<string, unknown>): void {
+    void this.view?.webview.postMessage(message);
+  }
+
+  /** live=true は画面下部の1行表示(進捗など)。false は会話に残るお知らせ。 */
+  private status(text: string, live = false): void {
+    this.post({ type: "status", text, live });
+  }
+
+  private fail(error: unknown, fallback: string): void {
+    this.post({ type: "error", text: errorMessage(error, fallback) });
+  }
+
+  // ---------- 初期化・サービス ----------
+
+  private async refreshKey(): Promise<void> {
+    this.apiKey = (await this.context.secrets.get(SECRET_KEY)) || undefined;
+  }
+
+  private async init(): Promise<void> {
+    await this.refreshKey();
+    await this.pushState();
+    const services = await this.ensureServices();
+    await this.pushState();
+    if (services) {
+      this.needFullSync = true; // 起動時は全体を走査する(以降は変更通知のあったファイルだけ)
+      void this.autoSync();
+    }
+  }
+
+  private ensureServices(): Promise<Services | undefined> {
+    this.servicesPromise ??= this.createServices();
+    return this.servicesPromise;
+  }
+
+  private async createServices(): Promise<Services | undefined> {
+    const folder = vscode.workspace.workspaceFolders?.[0];
+    if (!folder) {
+      return undefined;
+    }
+    const ws = new VscodeWorkspace(folder);
+    await ws.refreshIgnore();
+    const dir = path.join(this.context.globalStorageUri.fsPath, "index-v2", sha1(ws.id).slice(0, 12));
+    const index = new IndexManager({
+      dir,
+      workspace: ws,
+      parser: this.parser,
+      embedder: () => (this.apiKey ? this.client : undefined),
+      embeddingModel: () => readConfig().embeddingModel,
+      maxFiles: readConfig().maxFiles,
+    });
+    await index.load();
+
+    const watcher = vscode.workspace.createFileSystemWatcher(new vscode.RelativePattern(folder, "**/*"));
+    const mark = (uri: vscode.Uri, deleted: boolean): void => {
+      const rel = ws.relativeOf(uri);
+      if (!rel) {
+        return;
+      }
+      if (rel === ".gitignore") {
+        void ws.refreshIgnore().then(() => {
+          this.needFullSync = true;
+          this.scheduleSync();
+        });
+        return;
+      }
+      if (languageForPath(rel)) {
+        this.dirty.add(rel);
+      } else if (deleted) {
+        // フォルダ削除などは個別ファイルの通知が来ないことがあるので、全体を再走査する
+        this.needFullSync = true;
+      } else {
+        return;
+      }
+      this.scheduleSync();
+    };
+    watcher.onDidChange((u) => mark(u, false));
+    watcher.onDidCreate((u) => mark(u, false));
+    watcher.onDidDelete((u) => mark(u, true));
+
+    this.services = { ws, lsp: new VscodeLsp(ws), index, watcher };
+    return this.services;
+  }
+
+  private scheduleSync(): void {
+    if (this.syncTimer) {
+      clearTimeout(this.syncTimer);
+    }
+    this.syncTimer = setTimeout(() => void this.autoSync(), 1500);
+  }
+
+  /** 起動時・ファイル変更時の自動同期。チャンク化(無料)は常に行い、埋め込みは有効化済みで差分が小さいときだけ行う。 */
+  private async autoSync(): Promise<void> {
+    const services = this.services;
+    if (!services || this.syncing) {
+      if (this.syncing) {
+        this.scheduleSync();
+      }
+      return;
+    }
+    this.syncing = true;
+    try {
+      const paths = this.needFullSync ? undefined : [...this.dirty];
+      const first = !services.index.hasChunks();
+      this.dirty.clear();
+      this.needFullSync = false;
+      if (paths && paths.length === 0) {
+        return;
+      }
+      if (first) {
+        this.status("コードを解析しています(初回のみ・APIは使いません)...", true);
+      }
+      const plan = await services.index.prepare(paths);
+      if (plan.updates.size === 0) {
+        return;
+      }
+      const cfg = readConfig();
+      const wantEmbed = services.index.isSemanticEnabled() && !!this.apiKey;
+      const embed = wantEmbed && plan.pendingTokens <= cfg.autoEmbedMaxTokens;
+      await services.index.commit(plan, { embed });
+      if (wantEmbed && !embed && plan.pendingEmbeds.length > 0) {
+        this.status(
+          `セマンティック検索に未反映の差分が約${plan.pendingTokens.toLocaleString()}トークンあります。「インデックス」から更新できます。`,
+        );
+      }
+    } catch (error) {
+      this.fail(error, "インデックスの更新に失敗しました。");
+    } finally {
+      this.syncing = false;
+      await this.pushState();
+    }
+  }
+
+  private async pushState(): Promise<void> {
+    const stats = this.services?.index.stats();
+    this.post({
+      type: "state",
+      hasKey: !!this.apiKey,
+      hasWorkspace: !!vscode.workspace.workspaceFolders?.[0],
+      busy: this.busy,
+      index: stats,
+      learning: this.log.summary(),
+    });
+  }
+
+  // ---------- メッセージ処理 ----------
+
+  private async onMessage(raw: unknown): Promise<void> {
+    if (typeof raw !== "object" || raw === null) {
+      return;
+    }
+    const m = raw as Record<string, any>;
+    try {
+      switch (m.type) {
+        case "ready":
+          await this.pushState();
+          break;
+        case "setApiKey":
+          await vscode.commands.executeCommand("quiz-based-support.setApiKey");
+          break;
+        case "ask":
+          await this.handleAsk(String(m.query ?? ""), this.coerceMode(m.mode));
+          break;
+        case "cancel":
+          this.abort?.abort();
+          break;
+        case "grade":
+          await this.handleGrade(m);
+          break;
+        case "apply":
+          await this.handleApply(String(m.quizId ?? ""), Number(m.itemIndex));
+          break;
+        case "open":
+          await this.handleOpen(String(m.path ?? ""), Number(m.line) || 1);
+          break;
+        case "planIndex":
+          await this.handlePlan();
+          break;
+        case "confirmIndex":
+          await this.handleConfirm(Boolean(m.embed));
+          break;
+        case "clearIndex":
+          await this.handleClear();
+          break;
+        case "startReview":
+          await this.handleReview();
+          break;
+        case "resetLog":
+          await this.log.reset();
+          await this.pushState();
+          break;
+      }
+    } catch (error) {
+      this.fail(error, "処理中にエラーが発生しました。");
+      this.busy = false;
+      await this.pushState();
+    }
+  }
+
+  private coerceMode(value: unknown): QuizMode {
+    return value === "read" || value === "change" ? value : "auto";
+  }
+
+  // ---------- 出題 ----------
+
+  private async handleAsk(query: string, mode: QuizMode): Promise<void> {
+    const text = query.trim();
+    if (!text) {
+      return;
+    }
+    if (this.busy) {
+      this.status("前の処理が終わるまでお待ちください。");
+      return;
+    }
+    if (!this.apiKey) {
+      this.fail(new Error("OpenAI APIキーが未設定です。「APIキー」から設定してください。"), "");
+      return;
+    }
+    const services = await this.ensureServices();
+    if (!services) {
+      this.fail(new Error("フォルダを開いてから使ってください。"), "");
+      return;
+    }
+
+    const cfg = readConfig();
+    this.busy = true;
+    this.abort = new AbortController();
+    await this.pushState();
+    try {
+      const agent = new QuizAgent({
+        llm: this.client,
+        ws: services.ws,
+        lsp: services.lsp,
+        index: services.index,
+        syntax: this.parser,
+        config: {
+          maxSteps: cfg.maxAgentSteps,
+          minSimilarity: cfg.minSimilarity,
+          repoMapChars: 1800,
+          evidenceChars: 16_000,
+        },
+      });
+      const result = await agent.run(text, mode, {
+        onStatus: (s) => this.status(s, true),
+        signal: this.abort.signal,
+      });
+
+      let questions: McqQuestion[] = [];
+      const first = result.quiz.items[0];
+      if (cfg.structureQuestions && first) {
+        this.status("構造クイズ(呼び出し関係)を作成中...", true);
+        questions = (
+          await buildStructureQuestions({ ws: services.ws, lsp: services.lsp }, first, makeRng(Date.now()))
+        ).slice(0, 2);
+      }
+
+      const session: QuizSession = {
+        id: crypto.randomUUID(),
+        review: false,
+        items: result.quiz.items,
+        questions,
+        overall: result.quiz.overallExplanation,
+        graded: false,
+      };
+      this.sessions.set(session.id, session);
+      this.post({ type: "quiz", quiz: this.payloadOf(session, text, result.quiz.goal) });
+      if (result.quiz.rejected.length > 0) {
+        this.status(`検証で${result.quiz.rejected.length}問を除外しました(実コードと食い違うなどの理由)。`);
+      }
+    } finally {
+      this.busy = false;
+      this.abort = undefined;
+      await this.pushState();
+    }
+  }
+
+  private payloadOf(session: QuizSession, query: string, goal: string): Record<string, unknown> {
+    return {
+      id: session.id,
+      query,
+      goal,
+      review: session.review,
+      items: session.items.map((item, index) => ({
+        index,
+        kind: item.kind,
+        path: item.path,
+        startLine: item.startLine,
+        endLine: item.endLine,
+        code: item.quizCode,
+        blanks: item.blanks.map((b) => ({ concept: b.concept, hints: b.hints })),
+      })),
+      questions: session.questions.map((q, index) => ({
+        index,
+        prompt: q.prompt,
+        options: q.options,
+        multi: q.correct.length > 1,
+      })),
+    };
+  }
+
+  // ---------- 採点・反映 ----------
+
+  private async handleGrade(m: Record<string, any>): Promise<void> {
+    const session = this.sessions.get(String(m.quizId ?? ""));
+    if (!session) {
+      this.fail(new Error("このクイズは失効しました。もう一度質問してください。"), "");
+      return;
+    }
+    if (session.graded) {
+      return;
+    }
+    const cfg = readConfig();
+    const services = this.services;
+    const given: string[][] = Array.isArray(m.blanks) ? m.blanks.map((a: unknown) => (Array.isArray(a) ? a.map(String) : [])) : [];
+    const hints: number[][] = Array.isArray(m.hints) ? m.hints.map((a: unknown) => (Array.isArray(a) ? a.map(Number) : [])) : [];
+    const choices: number[][] = Array.isArray(m.choices) ? m.choices.map((a: unknown) => (Array.isArray(a) ? a.map(Number) : [])) : [];
+
+    this.status("採点中...", true);
+    const judge = cfg.semanticGrading && this.apiKey ? makeSemanticJudge(this.client) : undefined;
+    const results: BlankResult[] = [];
+    const itemResults: Array<{ grades: BlankGrade[]; explanation: string; syntaxNote?: string; canApply: boolean }> = [];
+    let correct = 0;
+    let total = 0;
+
+    for (const [i, item] of session.items.entries()) {
+      const answers = given[i] ?? [];
+      const grades = await gradeBlanks(item, answers, judge);
+      const score = scoreOf(grades);
+      correct += score.correct;
+      total += score.total;
+
+      let syntaxNote: string | undefined;
+      if (item.kind === "change" && !session.review && services && grades.some((g) => !g.correct) && answers.every((a) => a.trim())) {
+        try {
+          const text = await services.ws.readText(item.path);
+          if ((await this.parser.isValid(item.path, applyItemToText(text, item, answers))) === false) {
+            syntaxNote = "入力どおりに埋めると構文エラーになります。括弧・区切り・キーワードを見直してみましょう。";
+          }
+        } catch {
+          // 構文チェックは補助。失敗しても採点は続ける。
+        }
+      }
+      itemResults.push({
+        grades,
+        explanation: item.explanation,
+        syntaxNote,
+        canApply: item.kind === "change" && !session.review,
+      });
+
+      const answerList = item.blanks.map((b) => b.answer);
+      item.blanks.forEach((b, k) => {
+        results.push({
+          path: item.path,
+          startLine: item.startLine,
+          endLine: item.endLine,
+          concept: b.concept,
+          snippet: windowAround(isolateBlank(item.quizCode, answerList, k)),
+          answer: b.answer,
+          hints: b.hints,
+          correct: grades[k]?.correct ?? false,
+          hintsUsed: hints[i]?.[k] ?? 0,
+        });
+      });
+    }
+
+    const questionResults = session.questions.map((q, i) => {
+      const chosen = [...new Set(choices[i] ?? [])].sort((a, b) => a - b);
+      const ok = chosen.length === q.correct.length && chosen.every((c, k) => c === q.correct[k]);
+      total++;
+      if (ok) {
+        correct++;
+      }
+      return { correct: ok, correctIndexes: q.correct, chosen, explanation: q.explanation, concept: q.concept };
+    });
+
+    session.graded = true;
+    await this.log.record(results);
+    await this.log.recordConceptOnly(questionResults.map((q) => ({ concept: q.concept, correct: q.correct })));
+    this.post({
+      type: "graded",
+      quizId: session.id,
+      items: itemResults,
+      questions: questionResults,
+      overall: session.overall,
+      score: { correct, total },
+    });
+    await this.pushState();
+  }
+
+  private async handleApply(quizId: string, itemIndex: number): Promise<void> {
+    const session = this.sessions.get(quizId);
+    const item = session?.items[itemIndex];
+    const services = this.services;
+    if (!session || !item || !services) {
+      this.fail(new Error("反映対象が見つかりません(クイズが失効した可能性があります)。"), "");
+      return;
+    }
+    if (item.kind !== "change" || session.review) {
+      this.fail(new Error("この問題は既存コードの理解問題なので、反映対象ではありません。"), "");
+      return;
+    }
+    if (!session.graded) {
+      this.fail(new Error("先に解答して採点してください。"), "");
+      return;
+    }
+    const uri = services.ws.uriOf(item.path);
+    const doc = await vscode.workspace.openTextDocument(uri);
+    // 生成時の内容と一致するか検証(不一致なら例外)
+    applyItemToText(doc.getText(), item);
+
+    const choice = await vscode.window.showWarningMessage(
+      `${item.path} の ${item.startLine}〜${item.endLine} 行目を、正解コードで書き換えます。`,
+      { modal: true, detail: "反映後は通常の編集と同じく、元に戻す(Undo)で取り消せます。" },
+      "反映する",
+    );
+    if (choice !== "反映する") {
+      return;
+    }
+    const eol = doc.eol === vscode.EndOfLine.CRLF ? "\r\n" : "\n";
+    const resolved = resolveBlanks(
+      item.quizCode,
+      item.blanks.map((b) => b.answer),
+    )
+      .split(/\r?\n/)
+      .join(eol);
+    const range = new vscode.Range(item.startLine - 1, 0, item.endLine - 1, doc.lineAt(item.endLine - 1).text.length);
+    const edit = new vscode.WorkspaceEdit();
+    edit.replace(uri, range, resolved);
+    if (!(await vscode.workspace.applyEdit(edit))) {
+      throw new Error("編集を適用できませんでした。");
+    }
+    await vscode.window.showTextDocument(doc, { preview: false, selection: new vscode.Range(item.startLine - 1, 0, item.startLine - 1, 0) });
+    this.status(`✅ ${item.path} の ${item.startLine}〜${item.endLine} 行目に反映しました(Undoで元に戻せます)。`);
+  }
+
+  private async handleOpen(relPath: string, line: number): Promise<void> {
+    const services = this.services;
+    if (!services || !relPath) {
+      return;
+    }
+    const rel = relPath.replace(/\\/g, "/");
+    if (rel.startsWith("/") || rel.split("/").includes("..")) {
+      return;
+    }
+    const pos = new vscode.Position(Math.max(line - 1, 0), 0);
+    await vscode.window.showTextDocument(services.ws.uriOf(rel), { selection: new vscode.Range(pos, pos), preview: true });
+  }
+
+  // ---------- 復習 ----------
+
+  private async handleReview(): Promise<void> {
+    if (this.busy) {
+      return;
+    }
+    const cards: ReviewCard[] = this.log.dueCards(Date.now(), 5);
+    if (cards.length === 0) {
+      this.status("いま復習するカードはありません。");
+      return;
+    }
+    const items: QuizItem[] = cards.map((c) => ({
+      kind: "read",
+      path: c.path,
+      startLine: c.startLine,
+      endLine: c.endLine,
+      original: "",
+      quizCode: c.snippet,
+      blanks: [{ answer: c.answer, concept: c.concept, hints: c.hints }],
+      explanation: "",
+    }));
+    const session: QuizSession = {
+      id: crypto.randomUUID(),
+      review: true,
+      items,
+      questions: [],
+      overall: "復習おつかれさまです。間違えた箇所は間隔を空けてまた出題されます。",
+      graded: false,
+    };
+    this.sessions.set(session.id, session);
+    this.post({
+      type: "quiz",
+      quiz: this.payloadOf(session, "復習", "前に間違えた・ヒントを使った箇所をもう一度。"),
+    });
+  }
+
+  // ---------- インデックス ----------
+
+  private async handlePlan(): Promise<void> {
+    const services = await this.ensureServices();
+    if (!services) {
+      this.fail(new Error("フォルダを開いてから使ってください。"), "");
+      return;
+    }
+    this.status("差分を計算しています...", true);
+    const plan = await services.index.prepare(undefined, (s) => this.status(s, true));
+    this.pendingPlan = plan;
+    this.post({
+      type: "plan",
+      files: plan.changedFiles,
+      removed: plan.removedFiles,
+      chunks: plan.newChunks,
+      pendingEmbeds: plan.pendingEmbeds.length,
+      tokens: plan.pendingTokens,
+      truncated: plan.truncated,
+      hasKey: !!this.apiKey,
+      semantic: services.index.isSemanticEnabled(),
+    });
+  }
+
+  private async handleConfirm(embed: boolean): Promise<void> {
+    const services = this.services;
+    if (!services) {
+      return;
+    }
+    if (!this.pendingPlan) {
+      await this.handlePlan();
+    }
+    const plan = this.pendingPlan;
+    if (!plan) {
+      return;
+    }
+    this.pendingPlan = undefined;
+    this.busy = true;
+    this.abort = new AbortController();
+    await this.pushState();
+    try {
+      const stats = await services.index.commit(plan, { embed: embed && !!this.apiKey }, (s) => this.status(s, true), this.abort.signal);
+      this.status(
+        `インデックスを更新しました(${stats.files}ファイル / ${stats.chunks}チャンク / ベクトル${stats.vectors}件${embed ? "" : "・キーワード検索のみ"})。`,
+      );
+    } finally {
+      this.busy = false;
+      this.abort = undefined;
+      await this.pushState();
+    }
+  }
+
+  private async handleClear(): Promise<void> {
+    const services = this.services;
+    if (!services) {
+      return;
+    }
+    await services.index.clear();
+    this.pendingPlan = undefined;
+    this.status("インデックスを削除しました。再作成するには「インデックス」を押してください。");
+    await this.pushState();
+    this.needFullSync = true;
+    this.scheduleSync();
+  }
+
+  // ---------- コマンドから ----------
+
+  async commandRebuildIndex(): Promise<void> {
+    await this.handleClear();
+    await this.handlePlan();
+  }
+
+  commandShowLog(): void {
+    this.post({ type: "showLog" });
+  }
+
+  async commandClearIndex(): Promise<void> {
+    await this.handleClear();
   }
 }

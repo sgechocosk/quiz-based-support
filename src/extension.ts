@@ -1,35 +1,44 @@
 import * as vscode from "vscode";
-import { ChatSidebarProvider } from "./ChatSidebarProvider"; // 後述
+import { ChatSidebarProvider } from "./ChatSidebarProvider";
+
+const SECRET_KEY = "openai-api-key";
 
 export function activate(context: vscode.ExtensionContext) {
-  console.log("Quiz-based Support is now active!");
+  const provider = new ChatSidebarProvider(context);
 
-  // 1. APIキーを設定・保存するコマンド
-  const setApiKeyCommand = vscode.commands.registerCommand(
-    "quiz-based-support.setApiKey",
-    async () => {
-      const apiKey = await vscode.window.showInputBox({
-        prompt: "OpenAI API Keyを入力してください (sk-... )",
-        password: true, // 入力を隠す
-        ignoreFocusOut: true,
-      });
+  // APIキーはOSのセキュア領域(SecretStorage)に保存する
+  const setApiKey = vscode.commands.registerCommand("quiz-based-support.setApiKey", async () => {
+    const apiKey = await vscode.window.showInputBox({
+      prompt: "OpenAI(または互換サービス)のAPIキーを入力してください",
+      password: true,
+      ignoreFocusOut: true,
+    });
+    if (apiKey && apiKey.trim()) {
+      await context.secrets.store(SECRET_KEY, apiKey.trim());
+      void vscode.window.showInformationMessage("APIキーを安全に保存しました。");
+    }
+  });
 
-      if (apiKey) {
-        // SecretStorageを使用してOSのセキュア領域に暗号化して保存
-        await context.secrets.store("openai-api-key", apiKey);
-        vscode.window.showInformationMessage("APIキーを安全に保存しました。");
-      }
-    },
-  );
+  const rebuildIndex = vscode.commands.registerCommand("quiz-based-support.rebuildIndex", async () => {
+    await vscode.commands.executeCommand("workbench.view.extension.quiz-support-sidebar");
+    await provider.commandRebuildIndex();
+  });
 
-  // 2. サイドバーのWebviewプロバイダーを登録
-  const sidebarProvider = new ChatSidebarProvider(context);
-  const viewRegistration = vscode.window.registerWebviewViewProvider(
-    "quiz-support-chat", // package.jsonで定義するIDと一致させる
-    sidebarProvider,
-  );
+  const clearIndex = vscode.commands.registerCommand("quiz-based-support.clearIndex", async () => {
+    await provider.commandClearIndex();
+  });
 
-  context.subscriptions.push(setApiKeyCommand, viewRegistration);
+  const showLog = vscode.commands.registerCommand("quiz-based-support.showLearningLog", async () => {
+    await vscode.commands.executeCommand("workbench.view.extension.quiz-support-sidebar");
+    provider.commandShowLog();
+  });
+
+  const view = vscode.window.registerWebviewViewProvider("quiz-support-chat", provider, {
+    // サイドバーを閉じても、入力途中のクイズ画面を保持する
+    webviewOptions: { retainContextWhenHidden: true },
+  });
+
+  context.subscriptions.push(provider, setApiKey, rebuildIndex, clearIndex, showLog, view);
 }
 
 export function deactivate() {}

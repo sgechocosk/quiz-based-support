@@ -35,14 +35,9 @@ async function main() {
     sourcesContent: false,
     platform: "node",
     outfile: "dist/extension.js",
-    external: [
-      "vscode",
-      "@huggingface/transformers",
-      "js-tiktoken",
-      "vectra",
-      "openai",
-      "web-tree-sitter",
-    ],
+    // web-tree-sitter などの依存はすべてバンドルに含める(VSIXに node_modules を入れないため)。
+    // WASM本体は resources/parsers から実行時に読み込む。
+    external: ["vscode"],
     logLevel: "silent",
     plugins: [
       /* add to the end of plugins array */
