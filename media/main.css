@@ -28,6 +28,10 @@ button:disabled, input:disabled, select:disabled, textarea:disabled { opacity: 0
 .quiz { display: flex; flex-direction: column; gap: 8px; white-space: normal; }
 .quiz-title { font-weight: 600; }
 .goal { margin: 0; }
+.task { white-space: pre-wrap; padding: 4px 6px; border-radius: 3px; background: var(--vscode-textBlockQuote-background); border-left: 3px solid var(--vscode-textBlockQuote-border, var(--vscode-focusBorder)); }
+.refs { display: flex; flex-direction: column; gap: 2px; font-size: 12px; }
+.ref { white-space: pre-wrap; }
+.why-blank { color: var(--vscode-foreground); margin-top: 2px; }
 textarea.prediction { width: 100%; box-sizing: border-box; resize: vertical; background: var(--vscode-input-background); color: var(--vscode-input-foreground); border: 1px solid var(--vscode-input-border, transparent); border-radius: 3px; padding: 4px 6px; font-family: inherit; }
 .quiz-item { border-left: 3px solid var(--vscode-focusBorder); padding-left: 8px; display: flex; flex-direction: column; gap: 6px; }
 .quiz-head { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }

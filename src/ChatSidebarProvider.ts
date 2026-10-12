@@ -448,7 +448,7 @@ export class ChatSidebarProvider implements vscode.WebviewViewProvider, vscode.D
       this.sessions.set(session.id, session);
       this.post({ type: "quiz", quiz: this.payloadOf(session, text, result.quiz.goal) });
       if (result.quiz.rejected.length > 0) {
-        this.status(`検証で${result.quiz.rejected.length}問を除外しました(実コードと食い違うなどの理由)。`);
+        this.status(`検証で不合格だった${result.quiz.rejected.length}件は作り直し、直らなかったものは除外しました。`);
       }
     } finally {
       this.busy = false;
@@ -470,7 +470,9 @@ export class ChatSidebarProvider implements vscode.WebviewViewProvider, vscode.D
         startLine: item.startLine,
         endLine: item.endLine,
         code: item.quizCode,
-        blanks: item.blanks.map((b) => ({ concept: b.concept, hints: b.hints })),
+        task: item.task ?? "",
+        refs: item.refs ?? [],
+        blanks: item.blanks.map((b) => ({ concept: b.concept, hints: b.hints, clue: b.clue })),
       })),
       questions: session.questions.map((q, index) => ({
         index,
@@ -501,7 +503,13 @@ export class ChatSidebarProvider implements vscode.WebviewViewProvider, vscode.D
     this.status("採点中...", true);
     const judge = cfg.semanticGrading && this.apiKey ? makeSemanticJudge(this.client) : undefined;
     const results: BlankResult[] = [];
-    const itemResults: Array<{ grades: BlankGrade[]; explanation: string; syntaxNote?: string; canApply: boolean }> = [];
+    const itemResults: Array<{
+      grades: Array<BlankGrade & { why?: string }>;
+      explanation: string;
+      syntaxNote?: string;
+      canApply: boolean;
+      completed?: string;
+    }> = [];
     let correct = 0;
     let total = 0;
 
@@ -523,14 +531,16 @@ export class ChatSidebarProvider implements vscode.WebviewViewProvider, vscode.D
           // 構文チェックは補助。失敗しても採点は続ける。
         }
       }
+      const answerList = item.blanks.map((b) => b.answer);
       itemResults.push({
-        grades,
+        grades: grades.map((g, k) => ({ ...g, why: item.blanks[k]?.why })),
         explanation: item.explanation,
         syntaxNote,
         canApply: item.kind === "change" && !session.review,
+        // 変更問題は、空欄以外も含めた完成形を見せて「どこがどう変わるか」を確認できるようにする
+        completed: item.kind === "change" && !session.review ? resolveBlanks(item.quizCode, answerList) : undefined,
       });
 
-      const answerList = item.blanks.map((b) => b.answer);
       item.blanks.forEach((b, k) => {
         results.push({
           path: item.path,
@@ -540,6 +550,7 @@ export class ChatSidebarProvider implements vscode.WebviewViewProvider, vscode.D
           snippet: windowAround(isolateBlank(item.quizCode, answerList, k)),
           answer: b.answer,
           hints: b.hints,
+          why: b.why,
           correct: grades[k]?.correct ?? false,
           hintsUsed: hints[i]?.[k] ?? 0,
         });
@@ -647,7 +658,7 @@ export class ChatSidebarProvider implements vscode.WebviewViewProvider, vscode.D
       endLine: c.endLine,
       original: "",
       quizCode: c.snippet,
-      blanks: [{ answer: c.answer, concept: c.concept, hints: c.hints }],
+      blanks: [{ answer: c.answer, concept: c.concept, hints: c.hints, why: c.why }],
       explanation: "",
     }));
     const session: QuizSession = {

@@ -165,6 +165,27 @@
 
   // ---------- クイズ ----------
 
+  /** ワークスペース内の場所を開くリンク */
+  function codeLink(path, line, label) {
+    const link = el("a", { class: "file-link", href: "#", text: label || `${path}:${line}` });
+    link.addEventListener("click", (e) => {
+      e.preventDefault();
+      vscode.postMessage({ type: "open", path, line });
+    });
+    return link;
+  }
+
+  /** 参考コード・手がかり(場所 + なぜ見るか) */
+  function refLine(prefix, ref) {
+    return el(
+      "div",
+      { class: "ref" },
+      document.createTextNode(prefix),
+      codeLink(ref.path, ref.line),
+      ref.note ? document.createTextNode(` — ${ref.note}`) : null,
+    );
+  }
+
   function renderQuiz(q) {
     const root = el("div", { class: "message bot quiz" });
     root.append(el("div", { class: "quiz-title", text: q.review ? "復習" : "クイズ" }));
@@ -185,14 +206,18 @@
 
     for (const item of q.items) {
       const block = el("div", { class: "quiz-item" });
-      const link = el("a", { class: "file-link", href: "#", text: `${item.path}:${item.startLine}-${item.endLine}` });
-      link.addEventListener("click", (e) => {
-        e.preventDefault();
-        vscode.postMessage({ type: "open", path: item.path, line: item.startLine });
-      });
+      const link = codeLink(item.path, item.startLine, `${item.path}:${item.startLine}-${item.endLine}`);
       block.append(
         el("div", { class: "quiz-head" }, link, el("span", { class: "badge", text: item.kind === "change" ? "実装" : "読解" })),
       );
+      if (item.task) {
+        block.append(el("div", { class: "task", text: `${item.kind === "change" ? "課題" : "読みどころ"}: ${item.task}` }));
+      }
+      if (item.refs && item.refs.length > 0) {
+        const refs = el("div", { class: "refs" }, el("div", { class: "muted", text: "参考にするコード" }));
+        item.refs.forEach((r) => refs.append(refLine("・", r)));
+        block.append(refs);
+      }
 
       const inputs = [];
       const pre = el("pre", { class: "code" });
@@ -222,16 +247,21 @@
       const levels = item.blanks.map(() => 0);
       const results = [];
       item.blanks.forEach((blank, k) => {
-        const hints = blank.hints.filter((h) => h && h.trim());
+        // 段階: 概念 → 考え方 → 手がかりの場所(あれば) → 答えの形
+        const steps = blank.hints.filter((h) => h && h.trim()).map((h) => () => document.createTextNode(h));
+        if (blank.clue) {
+          steps.splice(Math.min(2, steps.length), 0, () => refLine("この場所を読んでみよう: ", blank.clue));
+        }
         const text = el("div", { class: "hint-text" });
-        const btn = el("button", { class: "link", text: hints.length ? "ヒント" : "ヒントなし" });
-        btn.disabled = hints.length === 0;
+        const btn = el("button", { class: "link", text: steps.length ? "ヒント" : "ヒントなし" });
+        btn.disabled = steps.length === 0;
         btn.onclick = () => {
-          if (levels[k] < hints.length) {
+          if (levels[k] < steps.length) {
+            const step = steps[levels[k]];
             levels[k]++;
-            text.textContent = hints.slice(0, levels[k]).map((h, i) => `ヒント${i + 1}: ${h}`).join("\n");
-            btn.textContent = levels[k] < hints.length ? `次のヒント(${levels[k]}/${hints.length})` : "ヒントは以上";
-            btn.disabled = levels[k] >= hints.length;
+            text.append(el("div", {}, document.createTextNode(`ヒント${levels[k]}: `), step()));
+            btn.textContent = levels[k] < steps.length ? `次のヒント(${levels[k]}/${steps.length})` : "ヒントは以上";
+            btn.disabled = levels[k] >= steps.length;
           }
         };
         const result = el("div", { class: "result" });
@@ -317,12 +347,21 @@
         if (g.note && g.note !== "未入力") {
           out.append(document.createTextNode(`\n${g.note}`));
         }
+        if (g.why) {
+          out.append(el("div", { class: "why-blank", text: `なぜ: ${g.why}` }));
+        }
       });
       if (res.syntaxNote) {
         it.after.append(el("div", { class: "result ng", text: `⚠ ${res.syntaxNote}` }));
       }
       if (res.explanation) {
         it.after.append(el("div", { class: "explain", text: res.explanation }));
+      }
+      if (res.completed) {
+        it.after.append(
+          el("div", { class: "muted", text: "完成形のコード(この範囲がこう置き換わります)" }),
+          el("pre", { class: "code", text: res.completed }),
+        );
       }
       if (res.canApply) {
         const apply = el("button", { class: "secondary", text: "正解コードをファイルに反映(確認あり)" });

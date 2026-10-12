@@ -1,7 +1,9 @@
+import { answerSkeleton, maskAnswers, revealsAnswer } from "./leak";
 import type { ChatLlm, ChatMessage, LspPort, SyntaxChecker, WorkspacePort } from "./ports";
-import { applyItemToText, validateRawItem, type RawItem, type SemanticJudge } from "./quiz";
-import { EvidenceStore, executeTool, TOOL_DEFS, type CodeIndex } from "./tools";
-import type { GeneratedQuiz, QuizItem } from "./types";
+import { applyItemToText, validateRawItem, type RawItem, type SemanticJudge, type Validation } from "./quiz";
+import { splitLines } from "./text";
+import { EvidenceStore, executeTool, normalizeRelPath, TOOL_DEFS, type CodeIndex } from "./tools";
+import type { CodeRef, GeneratedQuiz, QuizItem } from "./types";
 
 export type QuizMode = "auto" | "change" | "read";
 
@@ -34,6 +36,10 @@ export interface AgentResult {
 }
 
 const STRING = { type: "string" } as const;
+const INTEGER = { type: "integer" } as const;
+const MAX_ITEMS = 3;
+/** 初回 + 不合格だった問題の作り直し(最大2回) */
+const MAX_QUIZ_ATTEMPTS = 3;
 
 export const QUIZ_SCHEMA = {
   name: "quiz",
@@ -49,29 +55,48 @@ export const QUIZ_SCHEMA = {
           properties: {
             kind: { type: "string", enum: ["read", "change"] },
             path: STRING,
-            startLine: { type: "integer" },
-            endLine: { type: "integer" },
+            startLine: INTEGER,
+            endLine: INTEGER,
             firstLine: STRING,
             lastLine: STRING,
-            quizCode: STRING,
+            task: STRING,
+            newCode: STRING,
             blanks: {
               type: "array",
               items: {
                 type: "object",
                 properties: {
-                  answer: STRING,
+                  line: INTEGER,
+                  target: STRING,
                   concept: STRING,
                   hintConcept: STRING,
                   hintApproach: STRING,
                   hintSyntax: STRING,
+                  why: STRING,
+                  cluePath: STRING,
+                  clueLine: INTEGER,
+                  clueNote: STRING,
                 },
-                required: ["answer", "concept", "hintConcept", "hintApproach", "hintSyntax"],
+                required: [
+                  "line", "target", "concept", "hintConcept", "hintApproach", "hintSyntax", "why", "cluePath", "clueLine", "clueNote",
+                ],
+                additionalProperties: false,
+              },
+            },
+            refs: {
+              type: "array",
+              items: {
+                type: "object",
+                properties: { path: STRING, line: INTEGER, note: STRING },
+                required: ["path", "line", "note"],
                 additionalProperties: false,
               },
             },
             explanation: STRING,
           },
-          required: ["kind", "path", "startLine", "endLine", "firstLine", "lastLine", "quizCode", "blanks", "explanation"],
+          required: [
+            "kind", "path", "startLine", "endLine", "firstLine", "lastLine", "task", "newCode", "blanks", "refs", "explanation",
+          ],
           additionalProperties: false,
         },
       },
@@ -90,7 +115,8 @@ export function exploreSystemPrompt(maxSteps: number, repoMap: string): string {
     "- まず下の「リポジトリ概観」で当たりを付け、search_code(識別子や英語のキーワードを含めると精度が上がる)で探す。名前や文字列を厳密に探すなら grep。",
     "- 候補が見つかったら read_file で実際のコードを読む。構造や呼び出し関係は outline / find_references / find_definition で確かめる。",
     "- 要求が「〜を追加・修正したい」なら、変更が入る場所と、手本にすべき既存の実装を見つける。「〜はどう動く/どこ?」なら、中心となる処理と呼び出し関係を見つける。",
-    `- ツール呼び出しは最大${maxSteps}回まで。必要十分に調べたら、ツールを呼ばずに「どのファイルの何行目付近が重要で、なぜか」を短い箇条書きで答えて終了する。`,
+    "- 中心のコードが呼んでいる関数・使っている型の定義も read_file で読んでおく(学習者が答えを自力で導くための手がかりとして使う)。",
+    `- ツール呼び出しは最大${maxSteps}回まで。必要十分に調べたら、ツールを呼ばずに「どのファイルの何行目付近が重要で、なぜか(何を受け取り、何を返し、誰から呼ばれるか)」を短い箇条書きで答えて終了する。`,
     "- 行番号は read_file の表示(L数字|)のとおりに引用する。推測で行番号を作らない。",
     "",
     "【リポジトリ概観(ファイル — 主なシンボル。他から参照される順)】",
@@ -106,22 +132,43 @@ export function quizSystemPrompt(mode: QuizMode): string {
         ? "今回はすべて kind=\"change\" にする。"
         : "要求が質問(〜はどう動く/どこにある)なら read、実装・修正の依頼なら change を中心にする。迷えば read。";
   return [
-    "あなたはプログラミング学習アシスタントです。調査済みのコードだけを根拠に、ユーザーが自分で考えて理解できる穴埋めクイズを作ります。",
+    "あなたはプログラミング学習アシスタントです。答えを直接教えるのではなく、調査済みのコードだけを根拠に、",
+    "学習者が「どのファイルのどのコードが、どういう仕組みで動いているか」を自分で考えて理解できる穴埋めクイズを作ります。",
     "出力は指定のJSONスキーマに厳密に従ってください。",
     "",
     "【問題の種類 kind】",
-    "- \"read\": 既存コードの理解問題。quizCode は対象範囲の実コードをそのまま写し(インデント・空白の差は可)、重要な箇所だけを ___BLANK___ に置き換える。正解で埋めると実コードに戻ること(システムが自動検証し、戻らない問題は破棄される)。",
-    "- \"change\": 実装・修正の問題。ユーザーの要求を満たす変更後のコードを quizCode に書き、変更の核心を ___BLANK___ にする。変更しない行はそのまま。正解で埋めると元コードと異なること。",
+    "- \"read\": 既存コードの読解問題。対象範囲(path/startLine/endLine)を指定し、空欄にする部分を blanks で指定する。",
+    "  コードを書き写す必要はない(システムが実ファイルから問題を組み立てる)。newCode は空文字にする。",
+    "- \"change\": 実装・修正の問題。newCode に、対象範囲を置き換える「変更後のコード」を空欄なしで全部書く。",
+    "  変更しない行は参照コードと一字一句同じにする。空欄のうち少なくとも1つは変更した行に置く。",
+    "  新しく作る関数名・変数名など、既存コードから推測できない名前は空欄にせず、task で名前を指定する。",
     modeLine,
     "",
-    "【共通ルール】",
-    "- items は1〜3件。各 item の範囲は連続した40行以内を目安にし、path/startLine/endLine は「参照コード」の表示どおり。firstLine/lastLine には範囲の最初と最後の行を逐語で入れる(行番号のずれを補正するために使う)。",
-    "- ___BLANK___ は item あたり3〜6個。単語1〜2つ、または意味のある単位(条件式、メソッド呼び出し、型注釈、引数リスト、代入値)。blanks は quizCode での出現順。",
-    "- answer は60文字以内で、周囲のコードから一つに絞れる箇所を選ぶ(同じ意味の書き方が複数ありうる箇所は避ける)。",
-    "- hintConcept / hintApproach / hintSyntax は段階的ヒント。(1)どんな概念を使うか (2)どこを見てどう考えるか (3)答えの形(骨組み)。いずれも正解そのものは書かず、「〇〇するために、□□を使って、〜する」の形で書く。",
-    "- concept は復習用の短いタグ(例: 非同期処理、条件分岐、配列操作、型注釈、状態管理)。",
+    "【空欄 blanks の指定】",
+    "- line: read はファイルの行番号(参照コードの L数字)、change は newCode の中での行番号(1始まり)。",
+    "- target: その行に逐語で含まれる、空欄にする部分の文字列(1行以内・60文字以内)。行全体ではなく、条件式・呼び出し・引数・代入値・型など意味のある単位。",
+    "- item あたり2〜5個。周囲のコードと手がかりから一つに絞れる箇所を選ぶ(同じ意味の書き方が複数ありうる箇所や、根拠なく推測するしかない箇所は避ける)。",
+    "",
+    "【答えを漏らさない(最重要)】",
+    "解答前に見えるのは goal・task・refs・concept・3段階ヒント・clueNote。これらには、どの空欄の答えのコード片も、答えの識別子の組み合わせも書かない。",
+    "- hintConcept: どんな概念・仕組みが関わるか(例: 「非同期処理の完了を待つ必要がある」)。",
+    "- hintApproach: どこを見て、どう考えれば導けるか(例: 「この関数の戻り値の型と、呼び出し元での使われ方を見比べる」)。",
+    "- hintSyntax: 答えの形を言葉で(例: 「オブジェクトのメソッドを1つ呼ぶ式。引数は1つ」)。コードは書かない。",
+    "- cluePath/clueLine/clueNote: 答えを導く根拠になる「別の場所」(呼び出す関数の定義・型定義・手本になる類似コードなど)。参照コードにある行を指定し、",
+    "  その行自体に答えが書かれていてはいけない。適切な場所が無ければ cluePath は空文字、clueLine は0。",
+    "",
+    "【学習者が導けるための説明】",
+    "- task(解答前に表示): read なら「この範囲がシステムの中で何を担い、どこから呼ばれ、何を読み取ってほしいか」。",
+    "  change なら「何を実現するために、どこを、どう変えるか」という仕様(入力・出力・満たすべき条件・使うべき既存の関数や手本)。答えのコードは書かない。",
+    "- refs(解答前に表示, 0〜3件): 読むと理解が進む参照コードの場所(path, line, なぜ見るべきか)。",
+    "- why(採点後に表示): その空欄がなぜそのコードになるか。根拠となる行(ファイル名:行)と、仕組み(データの流れ・型・呼び出し関係)を2〜3文で。",
+    "- explanation(各item・採点後): この範囲の役割、処理の流れ、他のファイルとの関係(誰が呼び、何を呼ぶか)を具体的に。",
+    "- overallExplanation(採点後): 要求に関わるシステム全体の流れを、ファイル名を挙げながら順に説明する。",
     "- goal: このクイズで何を理解してほしいかを1〜2文。答えは含めない。",
-    "- explanation(各item)と overallExplanation: 採点後に読まれる解説。なぜそのコードになるか、全体の流れ。答えを書いてよい。___BLANK___ は使わない。",
+    "",
+    "【共通ルール】",
+    "- items は1〜3件。範囲は連続した40行以内を目安に、path/startLine/endLine は参照コードの表示どおり。firstLine/lastLine には範囲の最初と最後の行を逐語で入れる。",
+    "- concept は復習用の短いタグ(例: 非同期処理、条件分岐、配列操作、型注釈、状態管理)。答えの識別子は使わない。",
   ].join("\n");
 }
 
@@ -135,6 +182,129 @@ function summarizeArgs(raw: string): string {
     return "";
   }
 }
+
+function parseJson<T>(content: string | null | undefined): T {
+  return JSON.parse((content ?? "").replace(/^```json\s*|```\s*$/g, "").trim()) as T;
+}
+
+// ---------- 答え漏れの検出と修正 ----------
+
+type LeakField = "goal" | "task" | "refNote" | "concept" | "hint0" | "hint1" | "hint2" | "clueNote";
+
+interface Leak {
+  id: string;
+  field: LeakField;
+  text: string;
+  answers: string[];
+  item?: number;
+  blank?: number;
+  ref?: number;
+}
+
+/** 解答前に見える文章のうち、答えを漏らしているものを列挙する。 */
+export function findLeaks(goal: string, items: QuizItem[]): Leak[] {
+  const leaks: Leak[] = [];
+  const allAnswers = items.flatMap((it) => it.blanks.map((b) => b.answer));
+  const check = (leak: Omit<Leak, "answers">, answers: string[]): void => {
+    const hit = answers.filter((a) => revealsAnswer(leak.text, a));
+    if (hit.length > 0) {
+      leaks.push({ ...leak, answers: hit });
+    }
+  };
+  check({ id: "goal", field: "goal", text: goal }, allAnswers);
+  items.forEach((item, i) => {
+    // 別の問題の答えも、同じ画面に並ぶので漏れになる
+    const answers = allAnswers;
+    check({ id: `${i}.task`, field: "task", text: item.task ?? "", item: i }, answers);
+    (item.refs ?? []).forEach((r, k) => check({ id: `${i}.ref${k}`, field: "refNote", text: r.note, item: i, ref: k }, answers));
+    item.blanks.forEach((b, k) => {
+      check({ id: `${i}.${k}.concept`, field: "concept", text: b.concept, item: i, blank: k }, answers);
+      b.hints.forEach((h, level) =>
+        check({ id: `${i}.${k}.hint${level}`, field: `hint${level}` as LeakField, text: h, item: i, blank: k }, answers),
+      );
+      if (b.clue) {
+        check({ id: `${i}.${k}.clue`, field: "clueNote", text: b.clue.note, item: i, blank: k }, answers);
+      }
+    });
+  });
+  return leaks;
+}
+
+function applyLeakFix(goal: { value: string }, items: QuizItem[], leak: Leak, text: string): void {
+  const item = leak.item !== undefined ? items[leak.item] : undefined;
+  const blank = item && leak.blank !== undefined ? item.blanks[leak.blank] : undefined;
+  switch (leak.field) {
+    case "goal":
+      goal.value = text;
+      break;
+    case "task":
+      if (item) {
+        item.task = text;
+      }
+      break;
+    case "refNote":
+      if (item?.refs && leak.ref !== undefined && item.refs[leak.ref]) {
+        item.refs[leak.ref]!.note = text;
+      }
+      break;
+    case "concept":
+      if (blank) {
+        blank.concept = text;
+      }
+      break;
+    case "clueNote":
+      if (blank?.clue) {
+        blank.clue.note = text;
+      }
+      break;
+    default:
+      if (blank) {
+        blank.hints[Number(leak.field.slice(4))] = text;
+      }
+  }
+}
+
+/** LLM で書き直せなかった文章の最終手段(伏せ字・形だけのヒント・汎用タグ) */
+function fallbackText(leak: Leak, items: QuizItem[]): string {
+  if (leak.field === "concept") {
+    return "コード理解";
+  }
+  if (leak.field === "hint2" && leak.item !== undefined && leak.blank !== undefined) {
+    return answerSkeleton(items[leak.item]!.blanks[leak.blank]!.answer);
+  }
+  return maskAnswers(leak.text, leak.answers);
+}
+
+const LEAK_FIX_SCHEMA = {
+  name: "leak_fix",
+  schema: {
+    type: "object",
+    properties: {
+      fixes: {
+        type: "array",
+        items: {
+          type: "object",
+          properties: { id: STRING, text: STRING },
+          required: ["id", "text"],
+          additionalProperties: false,
+        },
+      },
+    },
+    required: ["fixes"],
+    additionalProperties: false,
+  },
+} as const;
+
+const FIELD_LABEL: Record<LeakField, string> = {
+  goal: "クイズの目標",
+  task: "課題文",
+  refNote: "参考コードの説明",
+  concept: "概念タグ(短い名詞)",
+  hint0: "ヒント1(どんな概念・仕組みが関わるか)",
+  hint1: "ヒント2(どこを見てどう考えるか)",
+  hint2: "ヒント3(答えの形を言葉で)",
+  clueNote: "手がかりの説明",
+};
 
 /**
  * 2段構えのエージェント。
@@ -184,6 +354,8 @@ export class QuizAgent {
 
     status("クイズを作成中...");
     const quiz = await this.generateQuiz(query, mode, notes, evidence, hooks);
+    status("ヒントが答えを漏らしていないか確認中...");
+    await this.removeLeaks(quiz, hooks);
     return { quiz, evidencePaths: evidence.paths(), notes, steps };
   }
 
@@ -207,65 +379,198 @@ export class QuizAgent {
       },
     ];
 
+    const accepted: QuizItem[] = [];
     const rejected: string[] = [];
-    for (let attempt = 0; attempt < 2; attempt++) {
+    let goal = "";
+    let overall = "";
+    for (let attempt = 0; attempt < MAX_QUIZ_ATTEMPTS && accepted.length < MAX_ITEMS; attempt++) {
       const res = await llm.chat({ messages, jsonSchema: QUIZ_SCHEMA, signal: hooks.signal });
       const content = res.content ?? "";
       let parsed: { goal?: string; overallExplanation?: string; items?: RawItem[] };
       try {
-        parsed = JSON.parse(content.replace(/^```json\s*|```\s*$/g, "").trim());
+        parsed = parseJson(content);
       } catch {
+        if (accepted.length > 0) {
+          break;
+        }
         throw new Error("クイズのJSONを解釈できませんでした。もう一度お試しください。");
       }
-      const accepted: QuizItem[] = [];
+      goal ||= parsed.goal ?? "";
+      overall ||= parsed.overallExplanation ?? "";
+
       const reasons: string[] = [];
-      for (const raw of (parsed.items ?? []).slice(0, 3)) {
+      const notesForFix: string[] = [];
+      for (const raw of (parsed.items ?? []).slice(0, MAX_ITEMS - accepted.length)) {
         const verdict = await this.validate(raw);
         if (verdict.ok) {
-          accepted.push(verdict.item);
+          const { item } = verdict;
+          if (accepted.some((a) => a.path === item.path && a.startLine === item.startLine && a.quizCode === item.quizCode)) {
+            continue; // 作り直しで合格済みの問題がもう一度返ってきた
+          }
+          accepted.push(item);
+          notesForFix.push(...verdict.warnings);
         } else {
           reasons.push(verdict.reason);
         }
       }
       rejected.push(...reasons);
-      if (accepted.length > 0) {
-        return {
-          goal: parsed.goal ?? "",
-          overallExplanation: parsed.overallExplanation ?? "",
-          items: accepted,
-          rejected,
-        };
+      // 1問も無いとき、または初回で2問未満しか残らなかったときは、不合格の問題だけ作り直させる
+      const retry = reasons.length > 0 && (accepted.length === 0 || (attempt === 0 && accepted.length < 2));
+      if (!retry) {
+        break;
       }
       messages.push(
         { role: "assistant", content },
         {
           role: "user",
-          content: `検証で全問不合格でした。理由:\n${reasons.map((r) => `- ${r}`).join("\n")}\n\nルールを守って、JSON全体を出し直してください。`,
+          content: [
+            accepted.length === 0
+              ? "検証で全問不合格でした。"
+              : `検証で${accepted.length}問は合格し、${reasons.length}問が不合格でした。合格した問題は出し直さないでください。`,
+            "不合格の理由:",
+            ...reasons.map((r) => `- ${r}`),
+            ...(notesForFix.length > 0 ? ["参考(合格問題で除外した空欄):", ...notesForFix.map((r) => `- ${r}`)] : []),
+            "",
+            "参照コードを見直し、ルールを守って不合格だった問題の修正版(または別の範囲の問題)だけを items に入れて、JSON全体を出し直してください。",
+            "空欄の target は、その行に実際に書かれている文字列をそのまま写してください。",
+          ].join("\n"),
         },
       );
     }
-    throw new Error(`検証に通るクイズを作れませんでした。\n${rejected.slice(0, 4).join("\n")}`);
+    if (accepted.length === 0) {
+      throw new Error(`検証に通るクイズを作れませんでした。\n${rejected.slice(0, 4).join("\n")}`);
+    }
+    return { goal, overallExplanation: overall, items: accepted, rejected };
   }
 
-  private async validate(raw: RawItem): Promise<ReturnType<typeof validateRawItem>> {
+  /** 実ファイルと照合して問題を組み立て、構文・手がかりの場所を確認する。 */
+  private async validate(raw: RawItem): Promise<Validation> {
+    const rel = normalizeRelPath(raw?.path ?? "");
+    if (!rel) {
+      return { ok: false, reason: `${raw?.path} はワークスペース相対パスではありません` };
+    }
+    raw.path = rel;
     let fileText: string;
     try {
-      fileText = await this.deps.ws.readText(raw.path);
+      fileText = await this.deps.ws.readText(rel);
     } catch {
-      return { ok: false, reason: `${raw.path} を読み込めません` };
+      return { ok: false, reason: `${rel} を読み込めません` };
     }
     const verdict = validateRawItem(raw, fileText);
-    if (!verdict.ok || verdict.item.kind !== "change" || !this.deps.syntax) {
+    if (!verdict.ok) {
       return verdict;
     }
-    const before = await this.deps.syntax.isValid(raw.path, fileText);
-    if (before === true) {
-      const after = await this.deps.syntax.isValid(raw.path, applyItemToText(fileText, verdict.item));
-      if (after === false) {
-        return { ok: false, reason: `${raw.path}:${verdict.item.startLine}-${verdict.item.endLine} 正解で埋めると構文エラーになります` };
+    const { item } = verdict;
+    if (item.kind === "change" && this.deps.syntax) {
+      const before = await this.deps.syntax.isValid(rel, fileText);
+      if (before === true) {
+        const after = await this.deps.syntax.isValid(rel, applyItemToText(fileText, item));
+        if (after === false) {
+          return { ok: false, reason: `${rel}:${item.startLine}-${item.endLine} 正解で埋めると構文エラーになります` };
+        }
       }
     }
+    await this.checkRefs(item, fileText);
     return verdict;
+  }
+
+  /** 手がかり・参考コードの場所が実在し、その行に答えが書かれていないことを確かめる(満たさないものは外す)。 */
+  private async checkRefs(item: QuizItem, ownText: string): Promise<void> {
+    const cache = new Map<string, string[] | undefined>([[item.path, splitLines(ownText)]]);
+    const answers = item.blanks.map((b) => b.answer);
+    const verify = async (ref: CodeRef | undefined): Promise<CodeRef | undefined> => {
+      const rel = ref && normalizeRelPath(ref.path);
+      if (!ref || !rel) {
+        return undefined;
+      }
+      if (!cache.has(rel)) {
+        cache.set(rel, await this.deps.ws.readText(rel).then(splitLines, () => undefined));
+      }
+      const lines = cache.get(rel);
+      const text = lines?.[ref.line - 1];
+      if (text === undefined || text.trim() === "") {
+        return undefined;
+      }
+      const squashed = text.replace(/\s+/g, "");
+      if (answers.some((a) => a.replace(/\s+/g, "").length >= 2 && squashed.includes(a.replace(/\s+/g, "")))) {
+        return undefined;
+      }
+      return { ...ref, path: rel };
+    };
+    for (const b of item.blanks) {
+      b.clue = await verify(b.clue);
+    }
+    const refs: CodeRef[] = [];
+    for (const r of (item.refs ?? []).slice(0, 3)) {
+      const ok = await verify(r);
+      if (ok) {
+        refs.push(ok);
+      }
+    }
+    item.refs = refs;
+    for (const b of item.blanks) {
+      if (!b.clue) {
+        delete b.clue;
+      }
+    }
+  }
+
+  /** 解答前に見える文章の答え漏れを LLM に書き直させ、それでも残るものは伏せ字にする。 */
+  private async removeLeaks(quiz: GeneratedQuiz, hooks: RunHooks): Promise<void> {
+    const goal = { value: quiz.goal };
+    let leaks = findLeaks(goal.value, quiz.items);
+    if (leaks.length > 0) {
+      try {
+        const res = await this.deps.llm.chat({
+          messages: [
+            {
+              role: "system",
+              content: [
+                "あなたはプログラミング学習クイズの編集者です。以下の文章は、解答前に学習者へ見せるのに、答え(空欄に入るコード)を漏らしています。",
+                "各 id について、答えのコード片も、答えに含まれる識別子の組み合わせも使わずに、同じ役割の文章へ書き直してください。",
+                "答えを言う代わりに、関わる概念・見るべき場所・考え方・答えの形(言葉で)を示します。日本語で、元と同じくらいの長さにします。",
+              ].join("\n"),
+            },
+            {
+              role: "user",
+              content: leaks
+                .map((l) => {
+                  const item = l.item !== undefined ? quiz.items[l.item] : undefined;
+                  return [
+                    `id: ${l.id}`,
+                    `種類: ${FIELD_LABEL[l.field]}`,
+                    `現在の文章: ${l.text}`,
+                    `漏れている答え: ${l.answers.join(" / ")}`,
+                    item ? `問題のコード(___BLANK___が空欄):\n${item.quizCode}` : "",
+                  ]
+                    .filter(Boolean)
+                    .join("\n");
+                })
+                .join("\n\n"),
+            },
+          ],
+          jsonSchema: LEAK_FIX_SCHEMA,
+          signal: hooks.signal,
+        });
+        const fixes = parseJson<{ fixes?: Array<{ id: string; text: string }> }>(res.content).fixes ?? [];
+        for (const leak of leaks) {
+          const fix = fixes.find((f) => f.id === leak.id)?.text?.trim();
+          if (fix && !leak.answers.some((a) => revealsAnswer(fix, a))) {
+            applyLeakFix(goal, quiz.items, leak, fix);
+          }
+        }
+      } catch (error) {
+        if (hooks.signal?.aborted) {
+          throw error;
+        }
+        // 書き直しに失敗しても、下の伏せ字処理で必ず漏れは塞ぐ
+      }
+      leaks = findLeaks(goal.value, quiz.items);
+      for (const leak of leaks) {
+        applyLeakFix(goal, quiz.items, leak, fallbackText(leak, quiz.items));
+      }
+    }
+    quiz.goal = goal.value;
   }
 }
 

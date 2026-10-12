@@ -22,11 +22,23 @@ export interface SearchHit {
   similarity?: number;
 }
 
+/** 実ファイル上の位置(検証済み)。手がかり・参考コードのリンクに使う。 */
+export interface CodeRef {
+  path: string;
+  /** 1始まり */
+  line: number;
+  note: string;
+}
+
 export interface BlankSpec {
   answer: string;
   concept: string;
   /** [概念, 方針, 形] の3段階 */
   hints: string[];
+  /** 採点後に見せる「なぜこのコードになるか」 */
+  why?: string;
+  /** 答えを導く手がかりになる別の場所(答えそのものは含まない行) */
+  clue?: CodeRef;
 }
 
 export type QuizKind = "change" | "read";
@@ -41,6 +53,10 @@ export interface QuizItem {
   quizCode: string;
   blanks: BlankSpec[];
   explanation: string;
+  /** 解答前に見せる課題文(read: この範囲の役割と読みどころ / change: 何をどう変えるか)。答えは含まない */
+  task?: string;
+  /** 解答前に見せる参考コードの場所 */
+  refs?: CodeRef[];
 }
 
 export interface McqQuestion {

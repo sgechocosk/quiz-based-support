@@ -16,6 +16,8 @@ export interface ReviewCard {
   snippet: string;
   answer: string;
   hints: string[];
+  /** 採点後の解説(旧データには無い) */
+  why?: string;
   box: number;
   due: number;
   attempts: number;
@@ -44,6 +46,7 @@ export interface BlankResult {
   snippet: string;
   answer: string;
   hints: string[];
+  why?: string;
   correct: boolean;
   hintsUsed: number;
 }
@@ -105,6 +108,7 @@ export class LearnerLog {
           snippet: r.snippet,
           answer: r.answer,
           hints: r.hints,
+          why: r.why,
           box: 0,
           due: now,
           attempts: 0,
@@ -123,6 +127,7 @@ export class LearnerLog {
         card.attempts++;
         card.lastTs = now;
         card.snippet = r.snippet;
+        card.why = r.why ?? card.why;
         card.startLine = r.startLine;
         card.endLine = r.endLine;
       }

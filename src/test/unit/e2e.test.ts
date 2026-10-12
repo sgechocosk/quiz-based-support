@@ -78,6 +78,20 @@ async function setup(t: TestContext, handler: Parameters<typeof startFakeOpenAi>
   return { root, ws, server, client, index, lsp };
 }
 
+const blank = (line: number, target: string, over: Record<string, unknown> = {}) => ({
+  line,
+  target,
+  concept: "条件式",
+  hintConcept: "長さの比較",
+  hintApproach: "passwordに注目",
+  hintSyntax: "プロパティと数値の比較",
+  why: "src/auth.ts:2 で長さを確かめている",
+  cluePath: "",
+  clueLine: 0,
+  clueNote: "",
+  ...over,
+});
+
 const goodItem = {
   kind: "read",
   path: "src/auth.ts",
@@ -85,18 +99,34 @@ const goodItem = {
   endLine: 4,
   firstLine: "export function login(user: string, password: string): boolean {",
   lastLine: "}",
-  quizCode: ["export function login(user: string, password: string): ___BLANK___ {", "  return ___BLANK___ && user !== \"\";", "}"].join("\n"),
+  task: "login がどんな条件でログインを許可するかを読み取る",
+  newCode: "",
   blanks: [
-    { answer: "boolean", concept: "型注釈", hintConcept: "戻り値の型を考える", hintApproach: "return式の型を見る", hintSyntax: "プリミティブ型の名前" },
-    { answer: "password.length > 3", concept: "条件式", hintConcept: "長さの比較", hintApproach: "passwordに注目", hintSyntax: "obj.prop > 数値" },
+    blank(1, "boolean", {
+      concept: "型注釈",
+      hintConcept: "戻り値の型を考える",
+      hintApproach: "return式の型を見る",
+      hintSyntax: "プリミティブ型の名前",
+      cluePath: "src/app.ts",
+      clueLine: 3, // handleSubmit の戻り値型にも同じ型が書かれている → 答えを含むので外される
+      clueNote: "呼び出し元の型",
+    }),
+    // 空白を省いて写しても、実コードの表記に揃う
+    blank(2, "password.length>3", { cluePath: "src/app.ts", clueLine: 4, clueNote: "ここから呼ばれる" }),
+  ],
+  refs: [
+    { path: "src/app.ts", line: 4, note: "login の呼び出し元" },
+    { path: "src/nope.ts", line: 1, note: "存在しない" },
   ],
   explanation: "login は 3 文字より長いパスワードかつ空でないユーザーを許可する。",
 };
-const hallucinated = { ...goodItem, blanks: [goodItem.blanks[0]!, { ...goodItem.blanks[1]!, answer: "password.length > 8" }] };
+// 実コードに無い答え(幻覚)。空欄が1つも実コードに見つからないので不採用
+const hallucinated = { ...goodItem, blanks: [blank(2, "password.length > 8")] };
 
-test("通し: 調査(検索→読み取り)→出題→検証(行ずれ補正・幻覚の排除)→採点→反映", async (t) => {
+test("通し: 調査(検索→読み取り)→出題→検証(行ずれ補正・幻覚の排除・手がかり確認)→採点→反映", async (t) => {
   let quizCalls = 0;
-  const { server, index, ws, lsp, client } = await setup(t, (req) => {
+  let retryPrompt = "";
+  const { index, ws, lsp, client } = await setup(t, (req) => {
     const b = req.body;
     if (b.tools) {
       const toolMsgs = b.messages.filter((m: any) => m.role === "tool").length;
@@ -114,9 +144,12 @@ test("通し: 調査(検索→読み取り)→出題→検証(行ずれ補正・
       const user = b.messages[1].content as string;
       assert.match(user, /L2\|\s+return password\.length > 3/, "実際に読んだ行が根拠として渡されていない");
       assert.ok(!user.includes("formatDate"), "読んでいないファイルが混入している");
-      return {
-        json: msg(JSON.stringify({ goal: "loginの判定条件を理解する", overallExplanation: "全体", items: [goodItem, hallucinated] })),
-      };
+      if (quizCalls === 1) {
+        return { json: msg(JSON.stringify({ goal: "loginの判定条件を理解する", overallExplanation: "全体", items: [goodItem, hallucinated] })) };
+      }
+      // 2回目は不合格だった問題だけの作り直し
+      retryPrompt = b.messages[b.messages.length - 1].content;
+      return { json: msg(JSON.stringify({ goal: "", overallExplanation: "", items: [hallucinated] })) };
     }
     if (b.response_format?.json_schema?.name === "judge") {
       return { json: msg(JSON.stringify({ results: [{ index: 0, equivalent: true, reason: "同値" }] })) };
@@ -127,19 +160,37 @@ test("通し: 調査(検索→読み取り)→出題→検証(行ずれ補正・
   const agent = new QuizAgent({ llm: client, ws, lsp, index, config: CONFIG });
   const result = await agent.run("loginのパスワード判定はどう動く?", "auto", { onStatus: (s) => statuses.push(s) });
 
-  assert.equal(quizCalls, 1);
+  assert.equal(quizCalls, 2, "1問しか残らなかったので、不合格分だけ1回作り直させる");
+  assert.match(retryPrompt, /1問は合格し、1問が不合格/);
+  assert.match(retryPrompt, /見つかりません/);
   assert.equal(result.steps, 2);
   assert.ok(statuses.some((s) => s.startsWith("調査 1: search_code")));
   assert.equal(result.quiz.items.length, 1, "幻覚を含む問題は除外され、正しい問題だけ残る");
-  assert.equal(result.quiz.rejected.length, 1);
+  assert.equal(result.quiz.rejected.length, 2);
+  assert.equal(result.quiz.goal, "loginの判定条件を理解する");
   const item = result.quiz.items[0]!;
   assert.deepEqual([item.startLine, item.endLine], [1, 3], "行番号が補正されていない");
   assert.ok(!item.original.includes("```"));
+  assert.deepEqual(
+    item.blanks.map((b) => b.answer),
+    ["boolean", "password.length > 3"],
+  );
+  assert.equal(item.task, "login がどんな条件でログインを許可するかを読み取る");
+  // 手がかり: 答えを含む行は外し、含まない行は残す。存在しない参考コードも外す
+  assert.equal(item.blanks[0]!.clue, undefined);
+  assert.deepEqual(item.blanks[1]!.clue, { path: "src/app.ts", line: 4, note: "ここから呼ばれる" });
+  assert.deepEqual(item.refs, [{ path: "src/app.ts", line: 4, note: "login の呼び出し元" }]);
 
   // 採点: 厳密一致 + 空白差は正解、不一致は判定器で救済
   const judge = makeSemanticJudge(client);
   const grades = await gradeBlanks(item, ["boolean", "3 < password.length"], judge);
-  assert.deepEqual(grades.map((g) => [g.correct, g.via]), [[true, "exact"], [true, "semantic"]]);
+  assert.deepEqual(
+    grades.map((g) => [g.correct, g.via]),
+    [
+      [true, "exact"],
+      [true, "semantic"],
+    ],
+  );
 
   // read問題は反映対象ではないが、change化した場合にも安全に反映できる
   const changed = { ...item, kind: "change" as const, quizCode: item.quizCode.replace("___BLANK___ &&", "___BLANK___ ||") };
@@ -150,7 +201,7 @@ test("通し: 調査(検索→読み取り)→出題→検証(行ずれ補正・
 test("再試行: 全問が検証落ちしたら理由を添えて出し直させる", async (t) => {
   let quizCalls = 0;
   let sawFeedback = false;
-  const { server, ws, index, client } = await setup(t, (req) => {
+  const { ws, index, client } = await setup(t, (req) => {
     const b = req.body;
     if (b.tools) {
       return { json: msg("調査メモ") };
@@ -160,7 +211,7 @@ test("再試行: 全問が検証落ちしたら理由を添えて出し直させ
       return { json: msg(JSON.stringify({ goal: "g", overallExplanation: "o", items: [hallucinated] })) };
     }
     const last = b.messages[b.messages.length - 1].content as string;
-    sawFeedback = /検証で全問不合格/.test(last) && /一致しません/.test(last);
+    sawFeedback = /検証で全問不合格/.test(last) && /見つかりません/.test(last);
     return { json: msg(JSON.stringify({ goal: "g", overallExplanation: "o", items: [goodItem] })) };
   });
   const agent = new QuizAgent({ llm: client, ws, index, config: CONFIG });
@@ -170,14 +221,66 @@ test("再試行: 全問が検証落ちしたら理由を添えて出し直させ
   assert.equal(r.quiz.items.length, 1);
 });
 
+test("答え漏れ: ヒント・課題文が答えを含むと書き直させ、直らなければ伏せ字・形のヒントにする", async (t) => {
+  const leaky = {
+    ...goodItem,
+    task: "password.length > 3 かどうかを読む",
+    blanks: [
+      blank(1, "boolean", { concept: "型注釈", hintConcept: "戻り値の型", hintApproach: "return を見る", hintSyntax: "boolean と書く" }),
+      blank(2, "password.length > 3", { hintApproach: "password の length を 3 と比べる", hintSyntax: "password.length > 3" }),
+    ],
+    refs: [],
+  };
+  let fixRequest = "";
+  const { ws, index, client } = await setup(t, (req) => {
+    const b = req.body;
+    if (b.tools || !b.response_format) {
+      return { json: msg(null, [{ name: "read_file", args: { path: "src/auth.ts" } }]) };
+    }
+    if (b.response_format?.json_schema?.name === "quiz") {
+      return { json: msg(JSON.stringify({ goal: "login の条件を理解する", overallExplanation: "o", items: [leaky] })) };
+    }
+    if (b.response_format?.json_schema?.name === "leak_fix") {
+      fixRequest = b.messages[1].content;
+      return {
+        json: msg(
+          JSON.stringify({
+            fixes: [
+              { id: "0.task", text: "login がどんな入力を受け入れるか、条件式を読み解く" },
+              { id: "0.1.hint1", text: "引数のうち文字列の長さを確かめている方に注目する" },
+              // 書き直しても漏れている → 形だけのヒントに置き換わる
+              { id: "0.1.hint2", text: "password.length > 3 です" },
+            ],
+          }),
+        ),
+      };
+    }
+    throw new Error("想定外のリクエスト");
+  });
+  const agent = new QuizAgent({ llm: client, ws, index, config: { ...CONFIG, maxSteps: 1 } });
+  const r = await agent.run("login", "read");
+  assert.match(fixRequest, /id: 0\.task/);
+  assert.match(fixRequest, /id: 0\.0\.hint2/);
+  const item = r.quiz.items[0]!;
+  assert.equal(item.task, "login がどんな入力を受け入れるか、条件式を読み解く");
+  assert.equal(item.blanks[1]!.hints[1], "引数のうち文字列の長さを確かめている方に注目する");
+  assert.match(item.blanks[1]!.hints[2]!, /___\.___ > \(数値\)/);
+  assert.match(item.blanks[0]!.hints[2]!, /1つの語/, "返ってこなかった修正は、形のヒントで埋める");
+  const visible = [r.quiz.goal, item.task ?? "", ...item.blanks.flatMap((b) => [b.concept, ...b.hints])].join("\n");
+  for (const b of item.blanks) {
+    assert.ok(!visible.includes(b.answer), `解答前の文章に答え「${b.answer}」が残っている`);
+  }
+});
+
 test("構文チェッカがあると、構文を壊すchange問題は不採用になる", async (t) => {
   const change = {
     ...goodItem,
     kind: "change",
-    quizCode: ["export function login(user: string, password: string): boolean {", "  return ___BLANK___;", "}"].join("\n"),
-    blanks: [{ ...goodItem.blanks[1]!, answer: "password.length >" }],
+    newCode: ["export function login(user: string, password: string): boolean {", "  return password.length >;", "}"].join("\n"),
+    blanks: [blank(2, "password.length >")],
+    refs: [],
   };
-  const { server, ws, index, client } = await setup(t, (req) => {
+  const { ws, index, client } = await setup(t, (req) => {
     if (req.body.tools) {
       return { json: msg("メモ") };
     }
