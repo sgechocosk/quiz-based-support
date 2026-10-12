@@ -869,7 +869,10 @@ export class WorkspaceVectorSearchService {
         targetFilePath: change.targetFilePath,
         startLine: change.startLine,
         endLine: change.endLine,
+        beforeCode: change.beforeCode,
         quizCode: change.quizCode,
+        answers: change.answers,
+        hints: change.hints,
       });
 
       sections.push(
@@ -890,37 +893,62 @@ export class WorkspaceVectorSearchService {
     return sections.join("\n");
   }
 
-  public async applyCorrectCode(change: CodeChange): Promise<void> {
-    // ___BLANK___ を answers で順番に置換して正解コードを復元
-    let resolved = change.quizCode;
-    for (const answer of change.answers) {
-      resolved = resolved.replace("___BLANK___", answer);
+  /**
+   * quizCode の ___BLANK___ を answers で埋め、対象ファイルの該当範囲に
+   * 安全に反映したテキストを生成する。
+   * - startLine/endLine の実テキストが beforeCode と一致するか検証してから置換する
+   *   (誤った箇所を書き換えないようにするため)
+   * - ___BLANK___ の置換はコールバック形式で行い、$& 等の特殊置換パターンを回避する
+   * - 元ファイルの改行コード(CRLF/LF)を保持する
+   */
+  public static applyCodeChangeToText(
+    originalText: string,
+    change: CodeChange,
+  ): string {
+    const eol = originalText.includes("\r\n") ? "\r\n" : "\n";
+    const normalizedOriginal = originalText.replace(/\r\n/g, "\n");
+    const lines = normalizedOriginal.split("\n");
+
+    const startIdx = Math.max(change.startLine - 1, 0);
+    const endIdx = Math.min(change.endLine, lines.length);
+    const actualTarget = lines.slice(startIdx, endIdx).join("\n");
+    const normalizedBefore = (change.beforeCode ?? "").replace(/\r\n/g, "\n");
+
+    if (normalizedBefore && actualTarget.trim() !== normalizedBefore.trim()) {
+      throw new Error(
+        "対象コードがファイルの現在の内容と一致しません。ファイルが変更された可能性があるため反映を中止しました。",
+      );
     }
 
-    // 対象ファイルを読み込んで行単位で分割
+    let blankIdx = 0;
+    const resolved = change.quizCode.replace(/___BLANK___/g, () => {
+      return change.answers[blankIdx++] ?? "___BLANK___";
+    });
+
+    const resolvedLines = resolved.split(/\r?\n/);
+    lines.splice(startIdx, endIdx - startIdx, ...resolvedLines);
+
+    return lines.join(eol);
+  }
+
+  public async applyCorrectCode(change: CodeChange): Promise<void> {
     const fileUri = vscode.Uri.joinPath(
       this.workspaceFolder.uri,
       change.targetFilePath,
     );
     const originalText = await this.readFileText(fileUri);
-    const lines = originalText.split(/\r?\n/);
 
-    // startLine / endLine は 1-based なので 0-based に変換
-    const startIdx = change.startLine - 1;
-    const endIdx = change.endLine; // slice の end は exclusive
+    // 安全性検証込みの置換処理を呼び出す
+    const newText = WorkspaceVectorSearchService.applyCodeChangeToText(
+      originalText,
+      change,
+    );
 
-    // 該当範囲を正解コードで差し替え
-    const resolvedLines = resolved.split(/\r?\n/);
-    lines.splice(startIdx, endIdx - startIdx, ...resolvedLines);
-
-    // ファイルに書き戻す
-    const newText = lines.join("\n");
     await vscode.workspace.fs.writeFile(
       fileUri,
       new TextEncoder().encode(newText),
     );
 
-    // 書き込み後にエディタでファイルを開く
     const doc = await vscode.workspace.openTextDocument(fileUri);
     await vscode.window.showTextDocument(doc, { preview: false });
   }

@@ -167,6 +167,8 @@ export class ChatSidebarProvider implements vscode.WebviewViewProvider {
         value: `✅ ${change.targetFilePath} の ${change.startLine}〜${change.endLine} 行目に正解コードを反映しました。`,
       });
     } catch (error) {
+      // applyCodeChangeToText からの「内容不一致」エラーは
+      // そのままユーザーに表示することで、誤った場所への書き込みを未然に防げたことを伝える
       this._view?.webview.postMessage({
         type: "error",
         value:
@@ -292,24 +294,26 @@ export class ChatSidebarProvider implements vscode.WebviewViewProvider {
       "  if (metaRaw) {",
       "    try {",
       "      const meta = JSON.parse(decodeURIComponent(metaRaw));",
-      "      const answers = [];",
-      "      const msgDiv = btn.closest('.message');",
-      "      msgDiv.querySelectorAll('.quiz-blank').forEach(function(inp) {",
-      "        answers.push(inp.dataset.answer || '');",
-      "      });",
       "      const applyBtn = document.createElement('button');",
       "      applyBtn.className = 'grade-btn apply-btn';",
       "      applyBtn.textContent = '正解コードをファイルに反映';",
       "      applyBtn.onclick = function() {",
       "        applyBtn.disabled = true;",
       "        applyBtn.textContent = '反映中...';",
+      // meta に answers/hints が既に含まれているため、DOM からの再収集は不要
       "        vscode.postMessage({",
       "          type: 'applyCorrectCode',",
-      "          change: { ...meta, answers: answers }",
+      "          change: meta",
       "        });",
       "      };",
       "      btn.parentNode.insertBefore(applyBtn, btn.nextSibling);",
-      "    } catch(e) {}",
+      "    } catch(e) {",
+      // パース失敗時もユーザーに分かるようにエラーメッセージを表示する
+      "      const errDiv = document.createElement('div');",
+      "      errDiv.className = 'message error-msg';",
+      "      errDiv.textContent = 'クイズ情報の読み込みに失敗したため、コード反映ボタンを表示できませんでした。';",
+      "      btn.parentNode.insertBefore(errDiv, btn.nextSibling);",
+      "    }",
       "  }",
       "}",
       "",
