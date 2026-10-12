@@ -49,6 +49,7 @@ function readConfig() {
   return {
     model: c.get<string>("model", "gpt-5-mini"),
     embeddingModel: c.get<string>("embeddingModel", "text-embedding-3-small"),
+    reasoningEffort: c.get<string>("reasoningEffort", "auto"),
     baseUrl: c.get<string>("baseUrl", "https://api.openai.com/v1"),
     maxAgentSteps: c.get<number>("maxAgentSteps", 8),
     minSimilarity: c.get<number>("minSimilarity", 0.2),
@@ -88,6 +89,7 @@ export class ChatSidebarProvider implements vscode.WebviewViewProvider, vscode.D
       baseUrl: () => readConfig().baseUrl,
       model: () => readConfig().model,
       embeddingModel: () => readConfig().embeddingModel,
+      reasoningEffort: () => readConfig().reasoningEffort,
     });
     const store: KeyValueStore = {
       get: <T>(key: string) => context.workspaceState.get<T>(key),

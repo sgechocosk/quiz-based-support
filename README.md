@@ -21,6 +21,7 @@
 | 設定 | 既定 | 内容 |
 |---|---|---|
 | quizSupport.model | gpt-5-mini | 生成モデル |
+| quizSupport.reasoningEffort | auto | 推論強度。auto は gpt-6-luna 等「ツールと併用不可」のモデルで自動的に none へ切替 |
 | quizSupport.embeddingModel | text-embedding-3-small | 埋め込みモデル |
 | quizSupport.baseUrl | OpenAI | OpenAI互換エンドポイント |
 | quizSupport.maxAgentSteps | 8 | 調査の最大ステップ |

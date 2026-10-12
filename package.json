@@ -58,6 +58,12 @@
           "default": "gpt-5-mini",
           "description": "調査・出題・採点補助に使うチャットモデル名。"
         },
+        "quizSupport.reasoningEffort": {
+          "type": "string",
+          "default": "auto",
+          "enum": ["auto", "default", "none", "minimal", "low", "medium", "high"],
+          "description": "推論強度。auto: 通常は未指定で送り、「ツールと reasoning_effort は併用不可」と返すモデル(gpt-6-luna 等)では自動で none に切り替えて再試行。default: 常に未指定。それ以外: その値を常に送信。"
+        },
         "quizSupport.embeddingModel": {
           "type": "string",
           "default": "text-embedding-3-small",
