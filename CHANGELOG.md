@@ -1,9 +1,7 @@
 # Change Log
 
-All notable changes to the "quiz-based-support" extension will be documented in this file.
-
-Check [Keep a Changelog](http://keepachangelog.com/) for recommendations on how to structure this file.
-
-## [Unreleased]
-
-- Initial release
+## [0.1.0]
+- 検索基盤を刷新: AST/行ベースチャンク、BM25+ベクトルの RRF、差分インデックス(ハッシュ/埋め込みキャッシュ)、ファイル監視。
+- エージェント型調査(検索・grep・読取・LSP)と根拠限定のクイズ生成、検証・再試行。
+- 学習設計: 予想入力、段階ヒント、トークン正規化採点+任意の意味判定、LSP 構造クイズ、復習カード。
+- 修正: beforeCode の生テキスト化、HTML エスケープ、CSP/DOM 構築、ワークスペース無しでの例外、バンドル構成。

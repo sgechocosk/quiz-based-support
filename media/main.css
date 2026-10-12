@@ -1,0 +1,63 @@
+html, body { height: 100%; margin: 0; padding: 0; overflow: hidden; }
+body { font-family: var(--vscode-font-family); font-size: var(--vscode-font-size); color: var(--vscode-foreground); }
+#app { display: flex; flex-direction: column; height: 100%; padding: 8px; box-sizing: border-box; gap: 6px; }
+.hidden { display: none !important; }
+.muted { color: var(--vscode-descriptionForeground); font-size: 12px; }
+
+#top-actions { display: flex; gap: 6px; flex-shrink: 0; }
+#top-actions button { flex: 1; }
+button { background: var(--vscode-button-background); color: var(--vscode-button-foreground); border: 1px solid transparent; padding: 5px 10px; border-radius: 3px; cursor: pointer; font-family: inherit; font-size: inherit; }
+button:hover:not(:disabled) { background: var(--vscode-button-hoverBackground); }
+button.secondary { background: var(--vscode-button-secondaryBackground); color: var(--vscode-button-secondaryForeground); }
+button.secondary:hover:not(:disabled) { background: var(--vscode-button-secondaryHoverBackground); }
+button.link { background: none; color: var(--vscode-textLink-foreground); padding: 0 2px; text-decoration: underline; }
+button:disabled, input:disabled, select:disabled, textarea:disabled { opacity: 0.55; cursor: not-allowed; }
+
+.card { border: 1px solid var(--vscode-editorWidget-border, var(--vscode-panel-border)); border-radius: 4px; padding: 8px; background: var(--vscode-editorWidget-background); display: flex; flex-direction: column; gap: 6px; flex-shrink: 0; }
+.card .row { display: flex; gap: 6px; flex-wrap: wrap; }
+.card h4 { margin: 0; font-size: 13px; }
+
+#messages { flex: 1 1 auto; overflow-y: auto; display: flex; flex-direction: column; gap: 8px; padding-right: 2px; min-height: 0; }
+.message { padding: 8px; border-radius: 6px; line-height: 1.5; word-wrap: break-word; white-space: pre-wrap; }
+.message.user { align-self: flex-end; max-width: 88%; background: var(--vscode-button-background); color: var(--vscode-button-foreground); }
+.message.bot { background: var(--vscode-editor-inactiveSelectionBackground); }
+.message.status { font-size: 12px; color: var(--vscode-descriptionForeground); padding: 2px 4px; }
+.message.error { color: var(--vscode-errorForeground); border: 1px solid var(--vscode-inputValidation-errorBorder, currentColor); }
+#live { font-size: 12px; color: var(--vscode-descriptionForeground); padding: 2px 4px; flex-shrink: 0; }
+
+.quiz { display: flex; flex-direction: column; gap: 8px; white-space: normal; }
+.quiz-title { font-weight: 600; }
+.goal { margin: 0; }
+textarea.prediction { width: 100%; box-sizing: border-box; resize: vertical; background: var(--vscode-input-background); color: var(--vscode-input-foreground); border: 1px solid var(--vscode-input-border, transparent); border-radius: 3px; padding: 4px 6px; font-family: inherit; }
+.quiz-item { border-left: 3px solid var(--vscode-focusBorder); padding-left: 8px; display: flex; flex-direction: column; gap: 6px; }
+.quiz-head { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+.file-link { color: var(--vscode-textLink-foreground); font-family: var(--vscode-editor-font-family); font-size: 12px; }
+.badge { font-size: 11px; padding: 0 6px; border-radius: 8px; background: var(--vscode-badge-background); color: var(--vscode-badge-foreground); }
+pre.code { margin: 0; padding: 6px 8px; background: var(--vscode-textCodeBlock-background); border-radius: 3px; overflow-x: auto; font-family: var(--vscode-editor-font-family); font-size: var(--vscode-editor-font-size); line-height: 1.5; }
+.code-line { white-space: pre; }
+input.blank { width: 8ch; background: var(--vscode-input-background); color: var(--vscode-input-foreground); border: 1px solid var(--vscode-input-border, var(--vscode-focusBorder)); border-radius: 3px; padding: 0 4px; margin: 0 2px; font-family: var(--vscode-editor-font-family); font-size: inherit; }
+input.blank.correct { border-color: var(--vscode-testing-iconPassed, #3fb950); background: rgba(63, 185, 80, 0.15); }
+input.blank.incorrect { border-color: var(--vscode-testing-iconFailed, #f85149); background: rgba(248, 81, 73, 0.15); }
+.hint-row { display: flex; flex-direction: column; gap: 2px; font-size: 12px; margin-bottom: 4px; }
+.hint-head { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+.hint-label { font-weight: 600; }
+.concept { color: var(--vscode-descriptionForeground); }
+.hint-text { white-space: pre-wrap; color: var(--vscode-descriptionForeground); }
+.result { font-size: 12px; white-space: pre-wrap; }
+.result.ok { color: var(--vscode-testing-iconPassed, #3fb950); }
+.result.ng { color: var(--vscode-testing-iconFailed, #f85149); }
+.result code, .expected code { font-family: var(--vscode-editor-font-family); background: var(--vscode-textCodeBlock-background); padding: 0 4px; border-radius: 3px; }
+.explain { white-space: pre-wrap; border-top: 1px dashed var(--vscode-panel-border); padding-top: 6px; }
+.score { font-weight: 600; }
+fieldset.mcq { border: 1px solid var(--vscode-panel-border); border-radius: 4px; margin: 0; padding: 6px 8px; }
+fieldset.mcq legend { font-size: 12px; padding: 0 4px; }
+.mcq label { display: flex; gap: 6px; align-items: center; padding: 2px 0; font-family: var(--vscode-editor-font-family); font-size: 12px; }
+.mcq label.right { color: var(--vscode-testing-iconPassed, #3fb950); font-weight: 600; }
+.mcq label.wrong { color: var(--vscode-testing-iconFailed, #f85149); text-decoration: line-through; }
+.mcq .why { font-size: 12px; color: var(--vscode-descriptionForeground); margin-top: 4px; white-space: pre-wrap; }
+
+#input-area { flex-shrink: 0; }
+#input-row { display: flex; gap: 4px; }
+#query { flex: 1; min-width: 0; background: var(--vscode-input-background); color: var(--vscode-input-foreground); border: 1px solid var(--vscode-input-border, transparent); border-radius: 3px; padding: 5px 6px; outline: none; font-family: inherit; }
+#query:focus { border-color: var(--vscode-focusBorder); }
+#mode { background: var(--vscode-dropdown-background); color: var(--vscode-dropdown-foreground); border: 1px solid var(--vscode-dropdown-border); border-radius: 3px; max-width: 110px; }

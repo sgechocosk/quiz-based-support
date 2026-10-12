@@ -2,23 +2,34 @@
   "name": "quiz-based-support",
   "displayName": "quiz-based-support",
   "description": "System understanding support in a quiz format.",
-  "version": "0.0.1",
+  "version": "0.1.0",
+  "publisher": "local-dev",
   "engines": {
     "vscode": "^1.120.0"
   },
   "categories": [
+    "Education",
     "Other"
   ],
-  "activationEvents": [
-    "onView:quiz-support-chat",
-    "onCommand:quiz-based-support.setApiKey"
-  ],
+  "activationEvents": [],
   "main": "./dist/extension.js",
   "contributes": {
     "commands": [
       {
         "command": "quiz-based-support.setApiKey",
         "title": "Quiz Support: Set OpenAI API Key"
+      },
+      {
+        "command": "quiz-based-support.rebuildIndex",
+        "title": "Quiz Support: Rebuild Code Index"
+      },
+      {
+        "command": "quiz-based-support.clearIndex",
+        "title": "Quiz Support: Clear Code Index"
+      },
+      {
+        "command": "quiz-based-support.showLearningLog",
+        "title": "Quiz Support: Show Learning Log"
       }
     ],
     "viewsContainers": {
@@ -35,9 +46,63 @@
         {
           "type": "webview",
           "id": "quiz-support-chat",
-          "name": "AI Code Search"
+          "name": "AI Code Quiz"
         }
       ]
+    },
+    "configuration": {
+      "title": "Quiz Support",
+      "properties": {
+        "quizSupport.model": {
+          "type": "string",
+          "default": "gpt-5-mini",
+          "description": "調査・出題・採点補助に使うチャットモデル名。"
+        },
+        "quizSupport.embeddingModel": {
+          "type": "string",
+          "default": "text-embedding-3-small",
+          "description": "意味検索(埋め込み)のモデル名。変更すると既存ベクトルは破棄されます。"
+        },
+        "quizSupport.baseUrl": {
+          "type": "string",
+          "default": "https://api.openai.com/v1",
+          "description": "OpenAI互換APIのベースURL(Azure OpenAI・OpenRouter・Ollama等の互換エンドポイントも指定可)。"
+        },
+        "quizSupport.maxAgentSteps": {
+          "type": "number",
+          "default": 8,
+          "minimum": 1,
+          "maximum": 20,
+          "description": "調査フェーズでLLMが呼べるツールの最大回数。増やすと精度が上がる代わりに時間とトークンが増えます。"
+        },
+        "quizSupport.minSimilarity": {
+          "type": "number",
+          "default": 0.2,
+          "minimum": 0,
+          "maximum": 1,
+          "description": "意味検索のみでヒットしたコードに課すコサイン類似度の下限。"
+        },
+        "quizSupport.semanticGrading": {
+          "type": "boolean",
+          "default": true,
+          "description": "厳密一致しなかった回答を、LLMで『同じ動作か』判定して救済する(不正解の回答ごとにAPIを1回使います)。"
+        },
+        "quizSupport.structureQuestions": {
+          "type": "boolean",
+          "default": true,
+          "description": "言語サーバ(LSP)の事実から、呼び出し関係・定義場所の選択式問題を追加する。"
+        },
+        "quizSupport.autoEmbedMaxTokens": {
+          "type": "number",
+          "default": 100000,
+          "description": "ファイル変更時に自動で埋め込みを更新する上限トークン数。超える場合は手動更新になります。"
+        },
+        "quizSupport.maxFiles": {
+          "type": "number",
+          "default": 3000,
+          "description": "インデックス対象の最大ファイル数。"
+        }
+      }
     }
   },
   "scripts": {
@@ -47,8 +112,10 @@
     "watch:esbuild": "node esbuild.js --watch",
     "watch:tsc": "tsc --noEmit --watch --project tsconfig.json",
     "package": "npm run check-types && npm run lint && node esbuild.js --production",
+    "package:vsix": "vsce package --allow-missing-repository --skip-license",
     "compile-tests": "tsc -p . --outDir out",
     "watch-tests": "tsc -p . -w --outDir out",
+    "test:unit": "npm run compile-tests && node --test \"out/test/unit/*.test.js\"",
     "pretest": "npm run compile-tests && npm run compile && npm run lint",
     "check-types": "tsc --noEmit",
     "lint": "eslint src",
@@ -57,22 +124,15 @@
   "devDependencies": {
     "@types/mocha": "^10.0.10",
     "@types/node": "22.x",
-    "@types/vscode": "^1.125.0",
+    "@types/vscode": "^1.120.0",
     "@vscode/test-cli": "^0.0.12",
     "@vscode/test-electron": "^2.5.2",
+    "@vscode/vsce": "^3.0.0",
     "esbuild": "^0.27.3",
     "eslint": "^9.39.3",
     "npm-run-all": "^4.1.5",
     "typescript": "^5.9.3",
-    "typescript-eslint": "^8.56.1"
-  },
-  "dependencies": {
-    "js-tiktoken": "^1.0.21",
-    "openai": "^6.44.0",
-    "tree-sitter-java": "^0.23.5",
-    "tree-sitter-javascript": "^0.25.0",
-    "tree-sitter-typescript": "^0.23.2",
-    "vectra": "^0.15.0",
+    "typescript-eslint": "^8.56.1",
     "web-tree-sitter": "^0.26.9"
   }
 }
