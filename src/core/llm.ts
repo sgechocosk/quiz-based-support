@@ -15,6 +15,8 @@ export interface OpenAiOptions {
   baseUrl: () => string;
   model: () => string;
   embeddingModel: () => string;
+  /** "auto"(既定): 未指定で送り、ツール+推論の非対応エラー時だけ none で再試行 / "default": 常に未指定 / それ以外: そのまま送る */
+  reasoningEffort?: () => string;
   fetchImpl?: typeof fetch;
   sleep?: (ms: number) => Promise<void>;
   maxRetries?: number;
@@ -49,6 +51,9 @@ const RETRYABLE = new Set([408, 409, 429, 500, 502, 503, 504]);
  * baseUrl を変えれば Azure/OpenRouter/Ollama 等の互換エンドポイントも使える。
  */
 export class OpenAiClient implements ChatLlm, Embedder {
+  /** ツール利用時に reasoning_effort=none が必要と判明したモデル */
+  private readonly needsNoneWithTools = new Set<string>();
+
   constructor(private readonly o: OpenAiOptions) {}
 
   private async post(pathname: string, body: unknown, signal?: AbortSignal): Promise<any> {
@@ -120,7 +125,33 @@ export class OpenAiClient implements ChatLlm, Embedder {
         json_schema: { name: request.jsonSchema.name, strict: true, schema: request.jsonSchema.schema },
       };
     }
-    const json = await this.post("/chat/completions", body, request.signal);
+    const model = this.o.model();
+    const mode = (this.o.reasoningEffort?.() ?? "auto").trim() || "auto";
+    const hasTools = !!body.tools;
+    if (mode !== "auto" && mode !== "default") {
+      body.reasoning_effort = mode;
+    } else if (mode === "auto" && hasTools && this.needsNoneWithTools.has(model)) {
+      body.reasoning_effort = "none";
+    }
+    let json: any;
+    try {
+      json = await this.post("/chat/completions", body, request.signal);
+    } catch (error) {
+      const retriable =
+        mode === "auto" &&
+        hasTools &&
+        body.reasoning_effort === undefined &&
+        error instanceof LlmError &&
+        error.status === 400 &&
+        /reasoning_effort/i.test(error.message) &&
+        /tool/i.test(error.message);
+      if (!retriable) {
+        throw error;
+      }
+      this.needsNoneWithTools.add(model);
+      body.reasoning_effort = "none";
+      json = await this.post("/chat/completions", body, request.signal);
+    }
     const message = json?.choices?.[0]?.message as WireMessage | undefined;
     if (!message) {
       throw new LlmError("APIの応答に choices[0].message がありません。");
