@@ -1,4 +1,4 @@
-import { answerSkeleton, maskAnswers, revealsAnswer } from "./leak";
+import { maskAnswers, revealsAnswer } from "./leak";
 import { levelGuide, levelStyle, type LearnerLevel } from "./level";
 import type { ChatLlm, ChatMessage, LspPort, SyntaxChecker, WorkspacePort } from "./ports";
 import { applyItemToText, compactItem, validateRawItem, type RawItem, type SemanticJudge, type Validation } from "./quiz";
@@ -74,14 +74,22 @@ export const QUIZ_SCHEMA = {
                   concept: STRING,
                   hintConcept: STRING,
                   hintApproach: STRING,
-                  hintSyntax: STRING,
                   why: STRING,
+                  distractors: {
+                    type: "array",
+                    items: {
+                      type: "object",
+                      properties: { code: STRING, whyWrong: STRING },
+                      required: ["code", "whyWrong"],
+                      additionalProperties: false,
+                    },
+                  },
                   cluePath: STRING,
                   clueLine: INTEGER,
                   clueNote: STRING,
                 },
                 required: [
-                  "line", "target", "concept", "hintConcept", "hintApproach", "hintSyntax", "why", "cluePath", "clueLine", "clueNote",
+                  "line", "target", "concept", "hintConcept", "hintApproach", "why", "distractors", "cluePath", "clueLine", "clueNote",
                 ],
                 additionalProperties: false,
               },
@@ -164,6 +172,7 @@ export function quizSystemPrompt(mode: QuizMode, intent: QuizIntent = "read", le
   return [
     "あなたはプログラミング学習アシスタントです。答えを直接教えるのではなく、調査済みのコードだけを根拠に、",
     "学習者が「どのファイルのどのコードが、どういう仕組みで動いているか」を自分で考えて理解できる穴埋めクイズを作ります。",
+    "空欄は手入力ではなく選択式(正解1つ + 誤答3つ)。学習者は選択肢を比べながらコードベースを読み、根拠を持って選びます。",
     "出力は指定のJSONスキーマに厳密に従ってください。",
     "",
     "【問題の種類 kind】",
@@ -184,11 +193,19 @@ export function quizSystemPrompt(mode: QuizMode, intent: QuizIntent = "read", le
     "- target: その行に逐語で含まれる、空欄にする部分の文字列(1行以内・60文字以内)。行全体ではなく、条件式・呼び出し・引数・代入値・型など意味のある単位。",
     "- 個数と難しさは下の【学習者のレベル】に従う。周囲のコードと手がかりから一つに絞れる箇所を選ぶ(同じ意味の書き方が複数ありうる箇所や、根拠なく推測するしかない箇所は避ける)。",
     "",
+    "【選択肢 distractors(誤答を3つ)】",
+    "- 目的は「コードベースを読んで根拠を確かめないと選べない」こと。勘や見た目で消去できる誤答は作らない。",
+    "- 良い誤答: 実在する似た名前の別の関数・変数・フィールド(責務が違う)/ 引数の取り違え・順序違い / 境界条件の違い(< と <=)/ 条件の反転 /",
+    "  同じファイルの別の箇所にある似た式 / 呼ぶ順序や呼ぶ相手を間違えたもの。どれもこのコードベースで実際に書かれうるもの。",
+    "- 誤答には、参照コードに無い名前を使わない(存在しない名前は見ただけで誤りと分かる)。新しく作る名前(newNames)は使ってよい。",
+    "- 正解と書き方が違うだけで同じ動作になるもの(等価な書き換え)は誤答にしない。",
+    "- 正解と長さ・形をそろえる(正解だけが長い・具体的、などで見分けられないように)。各誤答は1行・60文字以内。",
+    "- whyWrong(採点後に表示。ヒントで1つ消すときにも表示): なぜ誤りかを、根拠のファイル名:行と仕組みで1〜2文。正解のコードは書かない。",
+    "",
     "【答えを漏らさない(最重要)】",
-    "解答前に見えるのは goal・task・refs・concept・3段階ヒント・clueNote。これらには、どの空欄の答えのコード片も、答えの識別子の組み合わせも書かない。",
+    "解答前に見えるのは goal・task・refs・concept・2段階ヒント・clueNote。これらには、どの空欄の答えのコード片も、答えの識別子の組み合わせも書かない。",
     "- hintConcept: どんな概念・仕組みが関わるか(例: 「非同期処理の完了を待つ必要がある」)。",
-    "- hintApproach: どこを見て、どう考えれば導けるか(例: 「この関数の戻り値の型と、呼び出し元での使われ方を見比べる」)。",
-    "- hintSyntax: 答えの形を言葉で(例: 「オブジェクトのメソッドを1つ呼ぶ式。引数は1つ」)。コードは書かない。",
+    "- hintApproach: どこを見て、どう考えれば選択肢を絞れるか(例: 「この関数の戻り値の型と、呼び出し元での使われ方を見比べる」)。",
     "- cluePath/clueLine/clueNote: 答えを導く根拠になる「別の場所」(呼び出す関数の定義・型定義・手本になる類似コードなど)。参照コードにある行を指定し、",
     "  その行自体に答えが書かれていてはいけない。適切な場所が無ければ cluePath は空文字、clueLine は0。",
     "",
@@ -227,7 +244,7 @@ function parseJson<T>(content: string | null | undefined): T {
 
 // ---------- 答え漏れの検出と修正 ----------
 
-type LeakField = "goal" | "task" | "refNote" | "concept" | "hint0" | "hint1" | "hint2" | "clueNote";
+type LeakField = "goal" | "task" | "refNote" | "concept" | "hint0" | "hint1" | "clueNote";
 
 interface Leak {
   id: string;
@@ -308,9 +325,6 @@ function fallbackText(leak: Leak, items: QuizItem[]): string {
   if (leak.field === "concept") {
     return "コード理解";
   }
-  if (leak.field === "hint2" && leak.item !== undefined && leak.blank !== undefined) {
-    return answerSkeleton(items[leak.item]!.blanks[leak.blank]!.answer);
-  }
   return maskAnswers(leak.text, leak.answers);
 }
 
@@ -341,7 +355,6 @@ const FIELD_LABEL: Record<LeakField, string> = {
   concept: "概念タグ(短い名詞)",
   hint0: "ヒント1(どんな概念・仕組みが関わるか)",
   hint1: "ヒント2(どこを見てどう考えるか)",
-  hint2: "ヒント3(答えの形を言葉で)",
   clueNote: "手がかりの説明",
 };
 

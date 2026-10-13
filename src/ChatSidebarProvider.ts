@@ -1,7 +1,8 @@
 import * as crypto from "node:crypto";
 import * as path from "node:path";
 import * as vscode from "vscode";
-import { makeSemanticJudge, QuizAgent, type QuizMode } from "./core/agent";
+import { QuizAgent, type QuizMode } from "./core/agent";
+import { buildChoices, eliminationHint, namePool } from "./core/choices";
 import { languageForPath } from "./core/chunker";
 import { IndexManager, type SyncPlan } from "./core/indexer";
 import { coerceLevel, LEARNER_LEVELS, LEVEL_DESCRIPTION, LEVEL_LABEL } from "./core/level";
@@ -21,7 +22,7 @@ import {
   type BlankGrade,
 } from "./core/quiz";
 import { makeRng, sha1 } from "./core/text";
-import type { McqQuestion, QuizItem } from "./core/types";
+import type { Choice, McqQuestion, QuizItem } from "./core/types";
 import { TreeSitterProvider } from "./host/parser";
 import { VscodeLsp, VscodeWorkspace } from "./host/workspaceVscode";
 
@@ -56,12 +57,22 @@ function readConfig() {
     baseUrl: c.get<string>("baseUrl", "https://api.openai.com/v1"),
     maxAgentSteps: c.get<number>("maxAgentSteps", 8),
     minSimilarity: c.get<number>("minSimilarity", 0.2),
-    semanticGrading: c.get<boolean>("semanticGrading", true),
     structureQuestions: c.get<boolean>("structureQuestions", true),
     autoEmbedMaxTokens: c.get<number>("autoEmbedMaxTokens", 100_000),
     maxFiles: c.get<number>("maxFiles", 3000),
     level: coerceLevel(c.get<string>("learnerLevel", "intermediate")),
   };
+}
+
+function reviewChoices(card: ReviewCard): Choice[] {
+  return buildChoices({
+    answer: card.answer,
+    why: card.why ?? "",
+    distractors: [],
+    known: new Set(card.snippet.match(/[A-Za-z_$][\w$]*/g) ?? []),
+    pool: namePool(card.snippet),
+    seed: card.id,
+  }).choices;
 }
 
 function errorMessage(error: unknown, fallback: string): string {
@@ -503,7 +514,14 @@ export class ChatSidebarProvider implements vscode.WebviewViewProvider, vscode.D
         task: item.task ?? "",
         refs: item.refs ?? [],
         newNames: item.newNames ?? [],
-        blanks: item.blanks.map((b) => ({ concept: b.concept, hints: b.hints, clue: b.clue })),
+        // 選択肢は表示順のコードだけを渡す(どれが正解か・解説は採点まで渡さない)
+        blanks: item.blanks.map((b) => ({
+          concept: b.concept,
+          hints: b.hints,
+          clue: b.clue,
+          options: (b.choices ?? []).map((c) => c.code),
+          eliminate: eliminationHint(b.choices ?? [], b.answer),
+        })),
       })),
       questions: session.questions.map((q, index) => ({
         index,
@@ -525,19 +543,16 @@ export class ChatSidebarProvider implements vscode.WebviewViewProvider, vscode.D
     if (session.graded) {
       return;
     }
-    const cfg = readConfig();
-    const services = this.services;
-    const given: string[][] = Array.isArray(m.blanks) ? m.blanks.map((a: unknown) => (Array.isArray(a) ? a.map(String) : [])) : [];
+    // 空欄ごとに選んだ選択肢の番号(未選択は -1)
+    const picked: number[][] = Array.isArray(m.blanks) ? m.blanks.map((a: unknown) => (Array.isArray(a) ? a.map(Number) : [])) : [];
     const hints: number[][] = Array.isArray(m.hints) ? m.hints.map((a: unknown) => (Array.isArray(a) ? a.map(Number) : [])) : [];
     const choices: number[][] = Array.isArray(m.choices) ? m.choices.map((a: unknown) => (Array.isArray(a) ? a.map(Number) : [])) : [];
 
     this.status("採点中...", true);
-    const judge = cfg.semanticGrading && this.apiKey ? makeSemanticJudge(this.client) : undefined;
     const results: BlankResult[] = [];
     const itemResults: Array<{
-      grades: Array<BlankGrade & { why?: string }>;
+      grades: Array<BlankGrade & { why?: string; chosen: number; correctIndex: number; notes: string[] }>;
       explanation: string;
-      syntaxNote?: string;
       canApply: boolean;
       completed?: string;
     }> = [];
@@ -545,28 +560,27 @@ export class ChatSidebarProvider implements vscode.WebviewViewProvider, vscode.D
     let total = 0;
 
     for (const [i, item] of session.items.entries()) {
-      const answers = given[i] ?? [];
-      const grades = await gradeBlanks(item, answers, judge);
+      const chosen = item.blanks.map((_, k) => picked[i]?.[k] ?? -1);
+      const answers = item.blanks.map((b, k) => b.choices?.[chosen[k]!]?.code ?? "");
+      const grades = await gradeBlanks(item, answers);
       const score = scoreOf(grades);
       correct += score.correct;
       total += score.total;
 
-      let syntaxNote: string | undefined;
-      if (item.kind === "change" && !session.review && services && grades.some((g) => !g.correct) && answers.every((a) => a.trim())) {
-        try {
-          const text = await services.ws.readText(item.path);
-          if ((await this.parser.isValid(item.path, applyItemToText(text, item, answers))) === false) {
-            syntaxNote = "入力どおりに埋めると構文エラーになります。括弧・区切り・キーワードを見直してみましょう。";
-          }
-        } catch {
-          // 構文チェックは補助。失敗しても採点は続ける。
-        }
-      }
       const answerList = item.blanks.map((b) => b.answer);
       itemResults.push({
-        grades: grades.map((g, k) => ({ ...g, why: item.blanks[k]?.why })),
+        grades: grades.map((g, k) => {
+          const b = item.blanks[k]!;
+          return {
+            ...g,
+            note: chosen[k]! < 0 ? "未選択" : g.note,
+            why: b.why,
+            chosen: chosen[k]!,
+            correctIndex: (b.choices ?? []).findIndex((c) => c.code === b.answer),
+            notes: (b.choices ?? []).map((c) => c.note),
+          };
+        }),
         explanation: item.explanation,
-        syntaxNote,
         canApply: item.kind === "change" && !session.review,
         // 変更問題は、空欄以外も含めた完成形を見せて「どこがどう変わるか」を確認できるようにする
         completed: item.kind === "change" && !session.review ? compactDiff(item.original, resolveBlanks(item.quizCode, answerList)) : undefined,
@@ -582,6 +596,7 @@ export class ChatSidebarProvider implements vscode.WebviewViewProvider, vscode.D
           answer: b.answer,
           hints: b.hints,
           why: b.why,
+          choices: b.choices,
           correct: grades[k]?.correct ?? false,
           hintsUsed: hints[i]?.[k] ?? 0,
         });
@@ -689,7 +704,8 @@ export class ChatSidebarProvider implements vscode.WebviewViewProvider, vscode.D
       endLine: c.endLine,
       original: "",
       quizCode: c.snippet,
-      blanks: [{ answer: c.answer, concept: c.concept, hints: c.hints, why: c.why }],
+      // 旧データの復習カードには選択肢が無いので、正解を少しずつ変えた誤答で作る
+      blanks: [{ answer: c.answer, concept: c.concept, hints: c.hints, why: c.why, choices: c.choices ?? reviewChoices(c) }],
       explanation: "",
     }));
     const session: QuizSession = {

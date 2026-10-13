@@ -1,4 +1,5 @@
 import type { KeyValueStore } from "./ports";
+import type { Choice } from "./types";
 import { sha1 } from "./text";
 
 /** ライトナー式の復習間隔(日)。box 0 は「すぐ再出題」。 */
@@ -18,6 +19,8 @@ export interface ReviewCard {
   hints: string[];
   /** 採点後の解説(旧データには無い) */
   why?: string;
+  /** 選択肢(旧データには無い) */
+  choices?: Choice[];
   box: number;
   due: number;
   attempts: number;
@@ -47,6 +50,7 @@ export interface BlankResult {
   answer: string;
   hints: string[];
   why?: string;
+  choices?: Choice[];
   correct: boolean;
   hintsUsed: number;
 }
@@ -109,6 +113,7 @@ export class LearnerLog {
           answer: r.answer,
           hints: r.hints,
           why: r.why,
+          choices: r.choices,
           box: 0,
           due: now,
           attempts: 0,
@@ -128,6 +133,7 @@ export class LearnerLog {
         card.lastTs = now;
         card.snippet = r.snippet;
         card.why = r.why ?? card.why;
+        card.choices = r.choices ?? card.choices;
         card.startLine = r.startLine;
         card.endLine = r.endLine;
       }

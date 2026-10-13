@@ -84,8 +84,8 @@ const blank = (line: number, target: string, over: Record<string, unknown> = {})
   concept: "条件式",
   hintConcept: "長さの比較",
   hintApproach: "passwordに注目",
-  hintSyntax: "プロパティと数値の比較",
   why: "src/auth.ts:2 で長さを確かめている",
+  distractors: [] as Array<{ code: string; whyWrong: string }>,
   cluePath: "",
   clueLine: 0,
   clueNote: "",
@@ -106,7 +106,6 @@ const goodItem = {
       concept: "型注釈",
       hintConcept: "戻り値の型を考える",
       hintApproach: "return式の型を見る",
-      hintSyntax: "プリミティブ型の名前",
       cluePath: "src/app.ts",
       clueLine: 3, // handleSubmit の戻り値型にも同じ型が書かれている → 答えを含むので外される
       clueNote: "呼び出し元の型",
@@ -337,13 +336,13 @@ test("実装依頼: 実装問題をどうしても作れなければ、読解の
   assert.match(r.quiz.notice ?? "", /読解問題のみ/);
 });
 
-test("答え漏れ: ヒント・課題文が答えを含むと書き直させ、直らなければ伏せ字・形のヒントにする", async (t) => {
+test("答え漏れ: ヒント・課題文が答えを含むと書き直させ、直らなければ伏せ字にする", async (t) => {
   const leaky = {
     ...goodItem,
     task: "password.length > 3 かどうかを読む",
     blanks: [
-      blank(1, "boolean", { concept: "型注釈", hintConcept: "戻り値の型", hintApproach: "return を見る", hintSyntax: "boolean と書く" }),
-      blank(2, "password.length > 3", { hintApproach: "password の length を 3 と比べる", hintSyntax: "password.length > 3" }),
+      blank(1, "boolean", { concept: "型注釈", hintConcept: "戻り値の型", hintApproach: "boolean と書く" }),
+      blank(2, "password.length > 3", { hintConcept: "password.length > 3 を返す", hintApproach: "password の length を 3 と比べる" }),
     ],
     refs: [],
   };
@@ -364,8 +363,8 @@ test("答え漏れ: ヒント・課題文が答えを含むと書き直させ、
             fixes: [
               { id: "0.task", text: "login がどんな入力を受け入れるか、条件式を読み解く" },
               { id: "0.1.hint1", text: "引数のうち文字列の長さを確かめている方に注目する" },
-              // 書き直しても漏れている → 形だけのヒントに置き換わる
-              { id: "0.1.hint2", text: "password.length > 3 です" },
+              // 書き直しても漏れている → 伏せ字になる
+              { id: "0.1.hint0", text: "password.length > 3 です" },
             ],
           }),
         ),
@@ -376,12 +375,12 @@ test("答え漏れ: ヒント・課題文が答えを含むと書き直させ、
   const agent = new QuizAgent({ llm: client, ws, index, config: { ...CONFIG, maxSteps: 1 } });
   const r = await agent.run("login", "read");
   assert.match(fixRequest, /id: 0\.task/);
-  assert.match(fixRequest, /id: 0\.0\.hint2/);
+  assert.match(fixRequest, /id: 0\.0\.hint1/);
   const item = r.quiz.items[0]!;
   assert.equal(item.task, "login がどんな入力を受け入れるか、条件式を読み解く");
   assert.equal(item.blanks[1]!.hints[1], "引数のうち文字列の長さを確かめている方に注目する");
-  assert.match(item.blanks[1]!.hints[2]!, /___\.___ > \(数値\)/);
-  assert.match(item.blanks[0]!.hints[2]!, /1つの語/, "返ってこなかった修正は、形のヒントで埋める");
+  assert.match(item.blanks[1]!.hints[0]!, /〇〇/);
+  assert.match(item.blanks[0]!.hints[1]!, /〇〇/, "返ってこなかった修正は伏せ字で塞ぐ");
   const visible = [r.quiz.goal, item.task ?? "", ...item.blanks.flatMap((b) => [b.concept, ...b.hints])].join("\n");
   for (const b of item.blanks) {
     assert.ok(!visible.includes(b.answer), `解答前の文章に答え「${b.answer}」が残っている`);

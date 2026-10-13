@@ -50,6 +50,20 @@ pre.code { margin: 0; padding: 6px 8px; background: var(--vscode-textCodeBlock-b
 .code-line.skip, .code-fold { color: var(--vscode-descriptionForeground); font-style: italic; }
 .code-fold { cursor: pointer; }
 .code-fold:hover { color: var(--vscode-textLink-foreground); }
+.slot { display: inline-block; min-width: 4ch; padding: 0 4px; margin: 0 1px; border: 1px dashed var(--vscode-focusBorder); border-radius: 3px; color: var(--vscode-descriptionForeground); cursor: pointer; }
+.slot.filled { border-style: solid; color: var(--vscode-foreground); background: var(--vscode-editor-selectionBackground); }
+.slot.correct { border-color: var(--vscode-testing-iconPassed, #3fb950); background: rgba(63, 185, 80, 0.15); }
+.slot.incorrect { border-color: var(--vscode-testing-iconFailed, #f85149); background: rgba(248, 81, 73, 0.15); }
+.choices { display: flex; flex-direction: column; gap: 3px; margin: 2px 0; }
+.choice-row { display: flex; flex-direction: column; gap: 1px; }
+button.choice { text-align: left; background: var(--vscode-input-background); color: var(--vscode-input-foreground); border: 1px solid var(--vscode-input-border, var(--vscode-panel-border)); padding: 3px 8px; white-space: pre-wrap; word-break: break-all; }
+button.choice:hover:not(:disabled) { background: var(--vscode-list-hoverBackground); }
+button.choice code { font-family: var(--vscode-editor-font-family); font-size: var(--vscode-editor-font-size); }
+button.choice.selected { border-color: var(--vscode-focusBorder); background: var(--vscode-list-activeSelectionBackground); color: var(--vscode-list-activeSelectionForeground); }
+button.choice.eliminated { text-decoration: line-through; }
+button.choice.right { border-color: var(--vscode-testing-iconPassed, #3fb950); background: rgba(63, 185, 80, 0.15); opacity: 1; }
+button.choice.wrong { border-color: var(--vscode-testing-iconFailed, #f85149); background: rgba(248, 81, 73, 0.15); opacity: 1; }
+.choice-note { font-size: 12px; color: var(--vscode-descriptionForeground); padding-left: 8px; white-space: pre-wrap; }
 input.blank { width: 8ch; background: var(--vscode-input-background); color: var(--vscode-input-foreground); border: 1px solid var(--vscode-input-border, var(--vscode-focusBorder)); border-radius: 3px; padding: 0 4px; margin: 0 2px; font-family: var(--vscode-editor-font-family); font-size: inherit; }
 input.blank.correct { border-color: var(--vscode-testing-iconPassed, #3fb950); background: rgba(63, 185, 80, 0.15); }
 input.blank.incorrect { border-color: var(--vscode-testing-iconFailed, #f85149); background: rgba(248, 81, 73, 0.15); }

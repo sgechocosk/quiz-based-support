@@ -24,6 +24,7 @@ import { answerSkeleton, maskAnswers, revealsAnswer } from "../../core/leak";
 import type { KeyValueStore } from "../../core/ports";
 import { detectIntent, quizSystemPrompt, requiresChange } from "../../core/agent";
 import { coerceLevel } from "../../core/level";
+import { buildChoices, eliminationHint, mutateAnswer, namePool } from "../../core/choices";
 import { splitLines } from "../../core/text";
 import type { QuizItem } from "../../core/types";
 
@@ -45,8 +46,8 @@ const blank = (line: number, target: string, over: Partial<RawBlank> = {}): RawB
   concept: "条件式",
   hintConcept: "c",
   hintApproach: "a",
-  hintSyntax: "s",
   why: "w",
+  distractors: [],
   cluePath: "",
   clueLine: 0,
   clueNote: "",
@@ -483,4 +484,80 @@ test("学習レベル: レベルごとに用語・空欄数・解説の方針が
   assert.match(quizSystemPrompt("auto", "change"), /kind="read" を最大2問含めてよい/);
   assert.equal(coerceLevel("advanced"), "advanced");
   assert.equal(coerceLevel("expert"), "intermediate");
+});
+
+// ---------- 選択式 ----------
+
+const KNOWN = new Set(["password", "user", "length", "minLength", "config", "maxLength"]);
+
+test("選択肢: コードベースに無い名前・正解と同じ・長さが極端な誤答は捨て、足りない分は正解の一部を変えて補う", () => {
+  const built = buildChoices({
+    answer: "password.length > 3",
+    why: "3文字より長いときだけ許可",
+    distractors: [
+      { code: "password.length >= 3", whyWrong: "3文字でも通ってしまう" },
+      { code: "password.length>3", whyWrong: "同じ" },
+      { code: "pwd.size > 3", whyWrong: "存在しない名前" },
+      { code: "user", whyWrong: "短すぎる" },
+      { code: "user.length > 3", whyWrong: "src/auth.ts:2 では user は空チェックだけ" },
+    ],
+    known: KNOWN,
+    pool: ["password", "user"],
+    seed: "s1",
+  });
+  const codes = built.choices.map((c) => c.code);
+  assert.equal(built.choices.length, 4);
+  assert.ok(codes.includes("password.length > 3"));
+  assert.ok(codes.includes("password.length >= 3"));
+  assert.ok(codes.includes("user.length > 3"));
+  assert.ok(!codes.includes("pwd.size > 3") && !codes.includes("password.length>3") && !codes.includes("user"));
+  assert.match(built.dropped.join("\n"), /コードベースに無い名前/);
+  assert.match(built.dropped.join("\n"), /同じ/);
+  assert.match(built.dropped.join("\n"), /長さが違いすぎ/);
+  assert.equal(built.choices.find((c) => c.code === "password.length > 3")!.note, "3文字より長いときだけ許可");
+  // 同じ種なら同じ並び(再表示や復習で選択肢の位置が変わらない)
+  const again = buildChoices({ answer: "password.length > 3", why: "", distractors: [], known: KNOWN, pool: ["user"], seed: "s1" });
+  assert.deepEqual(
+    again.choices.map((c) => c.code),
+    buildChoices({ answer: "password.length > 3", why: "", distractors: [], known: KNOWN, pool: ["user"], seed: "s1" }).choices.map((c) => c.code),
+  );
+});
+
+test("選択肢: ありがちな誤り(境界・反転・数値のずれ・名前の取り違え・型)を自動で作る", () => {
+  const m = mutateAnswer("items.length > 0 && ready", ["count", "items", "done"]);
+  assert.ok(m.includes("items.length >= 0 && ready"));
+  assert.ok(m.includes("items.length > 0 || ready"));
+  assert.ok(m.includes("items.length > 1 && ready"));
+  assert.ok(m.includes("count.length > 0 && ready"));
+  assert.ok(mutateAnswer("boolean", []).includes("string"));
+  assert.ok(!namePool('const x = "hidden"; // comment\nfoo(bar)').includes("hidden"), "文字列・コメント中の語は候補にしない");
+});
+
+test("選択肢: 誤りを1つ消すヒントは、理由が答えを漏らすなら理由を出さず、二択になるなら消さない", () => {
+  const choices = [
+    { code: "a < b", note: "正解の理由" },
+    { code: "a <= b", note: "a < b にすべきだから" },
+    { code: "a > b", note: "大小が逆" },
+  ];
+  const e = eliminationHint(choices, "a < b")!;
+  assert.equal(e.index, 1);
+  assert.equal(e.note, "", "理由が答えを含むので出さない");
+  assert.equal(eliminationHint(choices.slice(0, 2), "a < b"), undefined);
+});
+
+test("選択式の問題: 各空欄に正解を含む選択肢が付き、選択肢が作れない空欄は外す", () => {
+  const v = validateRawItem(raw({ blanks: [blank(4, "a < 2 && b > 0", { distractors: [{ code: "a < 2 || b > 0", whyWrong: "どちらか一方では足りない" }] }), blank(5, "a !== b")] }), FILE);
+  assert.ok(v.ok, v.ok ? "" : v.reason);
+  if (!v.ok) {
+    return;
+  }
+  for (const b of v.item.blanks) {
+    assert.ok(b.choices && b.choices.length >= 2, JSON.stringify(b));
+    assert.equal(b.choices.filter((c) => c.code === b.answer).length, 1, "正解はちょうど1つ");
+  }
+  assert.ok(v.item.blanks[0]!.choices!.some((c) => c.code === "a < 2 || b > 0" && c.note === "どちらか一方では足りない"));
+  // 選択肢を作りようがない空欄(変えられる部分が無く、誤答も無い)は外す
+  const none = validateRawItem(raw({ blanks: [blank(5, "return")] }), FILE);
+  assert.ok(!none.ok);
+  assert.match(none.ok ? "" : none.reason, /選択肢を作れない/);
 });

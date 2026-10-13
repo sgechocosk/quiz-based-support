@@ -30,11 +30,19 @@ export interface CodeRef {
   note: string;
 }
 
+/** 選択式の選択肢。note は採点後に見せる「なぜ正しい/誤りか」 */
+export interface Choice {
+  code: string;
+  note: string;
+}
+
 export interface BlankSpec {
   answer: string;
   concept: string;
-  /** [概念, 方針, 形] の3段階 */
+  /** [概念, 考え方] の段階的ヒント */
   hints: string[];
+  /** 選択肢(正解を含む・表示順)。旧データには無い */
+  choices?: Choice[];
   /** 採点後に見せる「なぜこのコードになるか」 */
   why?: string;
   /** 答えを導く手がかりになる別の場所(答えそのものは含まない行) */

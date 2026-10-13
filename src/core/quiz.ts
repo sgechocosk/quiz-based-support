@@ -1,5 +1,6 @@
+import { buildChoices, namePool, type RawDistractor } from "./choices";
 import { detectEol, splitLines } from "./text";
-import { BLANK, type BlankSpec, type NewName, type QuizItem, type QuizKind } from "./types";
+import { BLANK, type BlankSpec, type Choice, type NewName, type QuizItem, type QuizKind } from "./types";
 
 // ---------- ブランク操作 ----------
 
@@ -144,8 +145,9 @@ export interface RawBlank {
   concept: string;
   hintConcept: string;
   hintApproach: string;
-  hintSyntax: string;
   why: string;
+  /** 選択式の誤答(コードベースを見れば誤りと判断できるもの) */
+  distractors: RawDistractor[];
   cluePath: string;
   clueLine: number;
   clueNote: string;
@@ -511,6 +513,30 @@ export function validateRawItem(raw: RawItem, fileText: string, options: Validat
       spans.splice(k, 1);
     }
   }
+
+  // 選択式: 正解 + コードベースを見れば誤りと判断できる誤答。誤答が1つも作れない空欄は外す
+  const choiceKnown = new Set([...known, ...codeWords, ...STANDARD_GLOBALS]);
+  const choicesOf = new Map<Span, Choice[]>();
+  for (let k = spans.length - 1; k >= 0; k--) {
+    const s = spans[k]!;
+    const answer = codeLines[s.line]!.slice(s.start, s.end);
+    const near = codeLines.slice(Math.max(0, s.line - 5), s.line + 6).join("\n");
+    const built = buildChoices({
+      answer,
+      why: (s.blank.why ?? "").trim(),
+      distractors: s.blank.distractors,
+      known: choiceKnown,
+      pool: namePool(near, `${codeLines.join("\n")}\n${fileText}`),
+      seed: `${raw.path}:${range.start}:${s.line}:${s.start}:${answer}`,
+    });
+    warnings.push(...built.dropped.map((d) => `${label} 空欄「${answer}」の${d}`));
+    if (built.choices.length < 2) {
+      warnings.push(`${label} 空欄「${answer}」: 選択肢を作れないため除外しました`);
+      spans.splice(k, 1);
+      continue;
+    }
+    choicesOf.set(s, built.choices);
+  }
   if (spans.length === 0) {
     return { ok: false, reason: `${label} 有効な空欄がありません。${warnings.slice(0, 3).join(" / ")}` };
   }
@@ -531,8 +557,9 @@ export function validateRawItem(raw: RawItem, fileText: string, options: Validat
     const spec: BlankSpec = {
       answer: codeLines[s.line]!.slice(s.start, s.end),
       concept: (b.concept ?? "").trim() || "コード理解",
-      hints: [b.hintConcept, b.hintApproach, b.hintSyntax].map((h) => (h ?? "").trim()),
+      hints: [b.hintConcept, b.hintApproach].map((h) => (h ?? "").trim()),
       why: (b.why ?? "").trim(),
+      choices: choicesOf.get(s),
     };
     if (b.cluePath && Number(b.clueLine) > 0) {
       spec.clue = { path: b.cluePath, line: Number(b.clueLine), note: (b.clueNote ?? "").trim() };

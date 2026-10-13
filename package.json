@@ -99,11 +99,6 @@
           "maximum": 1,
           "description": "意味検索のみでヒットしたコードに課すコサイン類似度の下限。"
         },
-        "quizSupport.semanticGrading": {
-          "type": "boolean",
-          "default": true,
-          "description": "厳密一致しなかった回答を、LLMで『同じ動作か』判定して救済する(不正解の回答ごとにAPIを1回使います)。"
-        },
         "quizSupport.structureQuestions": {
           "type": "boolean",
           "default": true,
