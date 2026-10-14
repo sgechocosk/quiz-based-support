@@ -126,10 +126,10 @@
           "default": 3000,
           "description": "インデックス対象の最大ファイル数。"
         },
-        "quizSupport.confirmApiCalls": {
+        "quizSupport.testMode": {
           "type": "boolean",
           "default": false,
-          "description": "OpenAI API を呼び出す前に、目的と入力トークン数(見積もり)を表示して実行を確認します。オンのときは、ファイル変更時の埋め込みの自動更新も行いません(サイドバーの「API実行前に確認」でも切り替えられます)。"
+          "description": "テストモード(開発・検証向け)。OpenAI API を呼び出す前に目的と入力トークン数(見積もり)を表示して実行を確認し、処理ごとの API 使用量・索引の詳細・生成の内部情報(作り直した問題の数・計画の注意など)も表示します。オンのときは、ファイル変更時の埋め込みの自動更新も行いません(サイドバーの「設定」→「テストモード」でも切り替えられます)。"
         },
         "quizSupport.typeCheck": {
           "type": "boolean",

@@ -1,133 +1,241 @@
-html, body { height: 100%; margin: 0; padding: 0; overflow: hidden; }
-body { font-family: var(--vscode-font-family); font-size: var(--vscode-font-size); color: var(--vscode-foreground); }
-#app { display: flex; flex-direction: column; height: 100%; padding: 8px; box-sizing: border-box; gap: 6px; }
-.hidden { display: none !important; }
-.muted { color: var(--vscode-descriptionForeground); font-size: 12px; }
+/*
+ * 見た目の方針
+ * - 色はすべて VS Code のテーマ変数から取る(明るい/暗い/ハイコントラストのテーマに追従)
+ * - AI の返答は「カード」(見出し → 本文のセクション → 操作ボタン)にまとめ、利用者の発言は右寄せの吹き出しにする
+ * - 補足的な情報は折りたたみ(details)に入れ、最初に目に入る情報を減らす
+ */
+:root {
+  --gap: 8px;
+  --radius: 4px;
+  --border: var(--vscode-editorWidget-border, var(--vscode-panel-border, rgba(128, 128, 128, 0.35)));
+  --subtle-border: var(--vscode-panel-border, rgba(128, 128, 128, 0.25));
+  --card-bg: var(--vscode-editorWidget-background, var(--vscode-sideBar-background));
+  --muted: var(--vscode-descriptionForeground);
+  --ok: var(--vscode-testing-iconPassed, #3fb950);
+  --ng: var(--vscode-testing-iconFailed, #f85149);
+  --warn: var(--vscode-editorWarning-foreground, #cca700);
+  --ok-bg: rgba(63, 185, 80, 0.15);
+  --ng-bg: rgba(248, 81, 73, 0.15);
+  --warn-bg: rgba(204, 167, 0, 0.12);
+  --accent: var(--vscode-focusBorder);
+  --code-font: var(--vscode-editor-font-family);
+}
 
-#top-actions { display: flex; gap: 6px; flex-shrink: 0; }
-#top-actions button { flex: 1; }
-button { background: var(--vscode-button-background); color: var(--vscode-button-foreground); border: 1px solid transparent; padding: 5px 10px; border-radius: 3px; cursor: pointer; font-family: inherit; font-size: inherit; }
+html, body { height: 100%; margin: 0; padding: 0; overflow: hidden; }
+body { font-family: var(--vscode-font-family); font-size: var(--vscode-font-size); color: var(--vscode-foreground); background: var(--vscode-sideBar-background); }
+#app { display: flex; flex-direction: column; height: 100%; padding: 6px 8px 8px; box-sizing: border-box; gap: 6px; }
+.hidden { display: none !important; }
+.muted { color: var(--muted); font-size: 12px; }
+.spacer { flex: 1; }
+
+/* ---------- ボタン・入力 ---------- */
+button { background: var(--vscode-button-background); color: var(--vscode-button-foreground); border: 1px solid var(--vscode-button-border, transparent); padding: 4px 10px; border-radius: 2px; cursor: pointer; font-family: inherit; font-size: inherit; line-height: 1.4; }
 button:hover:not(:disabled) { background: var(--vscode-button-hoverBackground); }
+button:focus-visible, select:focus-visible, input:focus-visible, summary:focus-visible, .slot:focus-visible { outline: 1px solid var(--accent); outline-offset: 1px; }
 button.secondary { background: var(--vscode-button-secondaryBackground); color: var(--vscode-button-secondaryForeground); }
 button.secondary:hover:not(:disabled) { background: var(--vscode-button-secondaryHoverBackground); }
-button.link { background: none; color: var(--vscode-textLink-foreground); padding: 0 2px; text-decoration: underline; }
+button.link { background: none; color: var(--vscode-textLink-foreground); padding: 0 2px; border: none; font-size: 12px; }
+button.link:hover:not(:disabled) { background: none; text-decoration: underline; }
+button.icon-btn { background: none; color: var(--muted); border: none; padding: 0 6px; font-size: 14px; }
+button.icon-btn:hover:not(:disabled) { background: var(--vscode-toolbar-hoverBackground); color: var(--vscode-foreground); }
 button:disabled, input:disabled, select:disabled, textarea:disabled { opacity: 0.55; cursor: not-allowed; }
+select { background: var(--vscode-dropdown-background); color: var(--vscode-dropdown-foreground); border: 1px solid var(--vscode-dropdown-border); border-radius: 2px; padding: 2px 4px; font-family: inherit; font-size: inherit; }
+.row { display: flex; gap: 6px; flex-wrap: wrap; align-items: center; }
 
-.card { border: 1px solid var(--vscode-editorWidget-border, var(--vscode-panel-border)); border-radius: 4px; padding: 8px; background: var(--vscode-editorWidget-background); display: flex; flex-direction: column; gap: 6px; flex-shrink: 0; }
-.card .row { display: flex; gap: 6px; flex-wrap: wrap; }
-.card h4 { margin: 0; font-size: 13px; }
+/* ---------- 上部のツールバー ---------- */
+#toolbar { display: flex; align-items: center; gap: 6px; flex-shrink: 0; min-height: 26px; }
+.toolbar-label { color: var(--muted); font-size: 12px; white-space: nowrap; }
+#level { min-width: 0; max-width: 150px; }
+button.toolbar-btn { background: none; color: var(--vscode-foreground); border: 1px solid transparent; padding: 2px 6px; font-size: 12px; white-space: nowrap; }
+button.toolbar-btn:hover:not(:disabled) { background: var(--vscode-toolbar-hoverBackground); }
+button.toolbar-btn[aria-expanded="true"] { background: var(--vscode-toolbar-activeBackground, var(--vscode-toolbar-hoverBackground)); border-color: var(--subtle-border); }
 
-#messages { flex: 1 1 auto; overflow-y: auto; display: flex; flex-direction: column; gap: 8px; padding-right: 2px; min-height: 0; }
-.message { padding: 8px; border-radius: 6px; line-height: 1.5; word-wrap: break-word; white-space: pre-wrap; }
-.message.user { align-self: flex-end; max-width: 88%; background: var(--vscode-button-background); color: var(--vscode-button-foreground); }
-.message.bot { background: var(--vscode-editor-inactiveSelectionBackground); }
-.message.status { font-size: 12px; color: var(--vscode-descriptionForeground); padding: 2px 4px; }
-.message.error { color: var(--vscode-errorForeground); border: 1px solid var(--vscode-inputValidation-errorBorder, currentColor); }
-#live { font-size: 12px; color: var(--vscode-descriptionForeground); padding: 2px 4px; flex-shrink: 0; }
-
-.quiz { display: flex; flex-direction: column; gap: 8px; white-space: normal; }
-.quiz-title { font-weight: 600; }
-.goal { margin: 0; }
-.task { white-space: pre-wrap; padding: 4px 6px; border-radius: 3px; background: var(--vscode-textBlockQuote-background); border-left: 3px solid var(--vscode-textBlockQuote-border, var(--vscode-focusBorder)); }
-.refs { display: flex; flex-direction: column; gap: 2px; font-size: 12px; }
-.names { display: flex; flex-direction: column; gap: 2px; font-size: 12px; padding: 4px 6px; border: 1px dashed var(--vscode-panel-border); border-radius: 3px; }
-.names code { font-family: var(--vscode-editor-font-family); background: var(--vscode-textCodeBlock-background); padding: 0 4px; border-radius: 3px; }
-#level-row { display: flex; gap: 6px; align-items: center; flex-shrink: 0; }
-#level { background: var(--vscode-dropdown-background); color: var(--vscode-dropdown-foreground); border: 1px solid var(--vscode-dropdown-border); border-radius: 3px; }
+/* ---------- 開閉するパネル(設定・索引・学習記録・初回のレベル選択) ---------- */
+.panel { border: 1px solid var(--border); border-radius: var(--radius); padding: 8px 10px; background: var(--card-bg); display: flex; flex-direction: column; gap: 8px; flex-shrink: 0; max-height: 50vh; overflow-y: auto; }
+.panel h4 { margin: 0; font-size: 13px; }
+.panel-head { display: flex; align-items: center; justify-content: space-between; gap: 6px; }
+.notice-panel { border-left: 3px solid var(--accent); }
+.setting { display: flex; align-items: center; gap: 8px; padding-top: 6px; border-top: 1px solid var(--subtle-border); }
+.panel-head + .setting { border-top: none; padding-top: 0; }
+.setting-text { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 1px; }
+.setting-name { font-weight: 600; }
+.setting-toggle { align-items: flex-start; cursor: pointer; }
+.setting-toggle input { margin-top: 3px; }
+.stat-line { display: flex; gap: 12px; flex-wrap: wrap; }
+.stat { display: flex; flex-direction: column; }
+.stat strong { font-size: 16px; }
+.stat span { font-size: 11px; color: var(--muted); }
 button.level-choice { display: flex; flex-direction: column; align-items: flex-start; gap: 2px; text-align: left; }
 button.level-choice span { font-size: 12px; opacity: 0.9; }
+
+/* ---------- 会話 ---------- */
+#messages-wrap { position: relative; flex: 1 1 auto; min-height: 0; display: flex; }
+#messages { flex: 1; overflow-y: auto; display: flex; flex-direction: column; gap: 10px; padding: 2px 2px 8px 0; min-height: 0; }
+#jump-latest { position: absolute; right: 10px; bottom: 8px; font-size: 12px; padding: 2px 10px; border-radius: 12px; box-shadow: 0 1px 4px var(--vscode-widget-shadow, rgba(0, 0, 0, 0.3)); }
+.empty-hint { margin: auto 4px; display: flex; flex-direction: column; gap: 6px; color: var(--muted); font-size: 12px; line-height: 1.6; }
+.empty-hint strong { color: var(--vscode-foreground); font-size: 13px; }
+.empty-hint ul { margin: 0; padding-left: 18px; }
+
+.message { line-height: 1.55; word-wrap: break-word; }
+.message.user { align-self: flex-end; max-width: 88%; padding: 6px 10px; border-radius: 10px 10px 2px 10px; background: var(--vscode-button-background); color: var(--vscode-button-foreground); white-space: pre-wrap; }
+/* 進行のお知らせ(会話に残る短い1行) */
+.message.status { font-size: 12px; color: var(--muted); padding: 2px 8px; white-space: pre-wrap; border-left: 2px solid var(--subtle-border); }
+.message.status.warn { color: var(--vscode-foreground); border-left-color: var(--warn); background: var(--warn-bg); padding: 4px 8px; border-radius: 0 var(--radius) var(--radius) 0; }
+.message.status.ok { border-left-color: var(--ok); }
+.message.status.usage { font-family: var(--code-font); font-size: 11px; border-left-style: dashed; }
+.message.error { white-space: pre-wrap; font-size: 12px; padding: 6px 8px; border-radius: var(--radius); color: var(--vscode-errorForeground); background: var(--vscode-inputValidation-errorBackground, var(--ng-bg)); border: 1px solid var(--vscode-inputValidation-errorBorder, var(--ng)); }
+#live { font-size: 12px; color: var(--muted); padding: 2px 4px; flex-shrink: 0; display: flex; align-items: center; gap: 6px; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
+#live::before { content: ""; width: 10px; height: 10px; flex-shrink: 0; border-radius: 50%; border: 2px solid var(--subtle-border); border-top-color: var(--accent); animation: spin 0.9s linear infinite; }
+@keyframes spin { to { transform: rotate(360deg); } }
+@media (prefers-reduced-motion: reduce) { #live::before { animation: none; } }
+
+/* ---------- AI の返答カード ---------- */
+.card { border: 1px solid var(--border); border-radius: var(--radius); background: var(--card-bg); display: flex; flex-direction: column; flex-shrink: 0; white-space: normal; overflow: hidden; scroll-margin-top: 4px; }
+.card-head { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; padding: 6px 10px; border-bottom: 1px solid var(--subtle-border); background: var(--vscode-sideBarSectionHeader-background, transparent); }
+.card-title { font-weight: 600; }
+.card-body { display: flex; flex-direction: column; gap: 10px; padding: 8px 10px 10px; }
+.card-foot { display: flex; gap: 6px; align-items: center; flex-wrap: wrap; padding-top: 2px; }
+.goal { margin: 0; font-size: 13px; }
+
+/* セクション: 小さな見出し + 内容 */
+.section { display: flex; flex-direction: column; gap: 4px; }
+.section-label { font-size: 11px; font-weight: 600; color: var(--muted); letter-spacing: 0.02em; }
+.badge { font-size: 11px; padding: 0 6px; border-radius: 8px; background: var(--vscode-badge-background); color: var(--vscode-badge-foreground); white-space: nowrap; line-height: 1.6; }
+.badge.quiet { background: transparent; color: var(--muted); border: 1px solid var(--subtle-border); }
+.badge.score { background: transparent; border: 1px solid currentColor; }
+.badge.score.good { color: var(--ok); }
+.badge.score.fair { color: var(--warn); }
+button.badge.test { border: 1px solid var(--warn); background: var(--warn-bg); color: var(--vscode-foreground); padding: 0 6px; font-size: 11px; cursor: pointer; }
+
+/* 折りたたみ */
+details.fold-box { font-size: 12px; }
+details.fold-box > summary { cursor: pointer; color: var(--vscode-textLink-foreground); padding: 1px 0; }
+details.fold-box > summary:hover { text-decoration: underline; }
+details.fold-box > *:not(summary) { margin-top: 4px; }
+details.section-fold > summary { cursor: pointer; font-size: 11px; font-weight: 600; color: var(--muted); padding: 1px 0; }
+details.section-fold > summary:hover { color: var(--vscode-foreground); }
+details.section-fold > *:not(summary) { margin-top: 4px; }
+
+/* 引用ブロック(課題・読みどころ・なぜ) */
+.task { white-space: pre-wrap; padding: 4px 8px; border-radius: 0 var(--radius) var(--radius) 0; background: var(--vscode-textBlockQuote-background); border-left: 3px solid var(--vscode-textBlockQuote-border, var(--accent)); }
+.task-label { font-weight: 600; margin-right: 6px; }
+
+.refs { display: flex; flex-direction: column; gap: 2px; font-size: 12px; }
 .ref { white-space: pre-wrap; }
-.why-blank { color: var(--vscode-foreground); margin-top: 2px; }
-textarea.prediction { width: 100%; box-sizing: border-box; resize: vertical; background: var(--vscode-input-background); color: var(--vscode-input-foreground); border: 1px solid var(--vscode-input-border, transparent); border-radius: 3px; padding: 4px 6px; font-family: inherit; }
-.quiz-item { border-left: 3px solid var(--vscode-focusBorder); padding-left: 8px; display: flex; flex-direction: column; gap: 6px; }
-.quiz-head { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
-.file-link { color: var(--vscode-textLink-foreground); font-family: var(--vscode-editor-font-family); font-size: 12px; }
-.badge { font-size: 11px; padding: 0 6px; border-radius: 8px; background: var(--vscode-badge-background); color: var(--vscode-badge-foreground); }
-pre.code { margin: 0; padding: 6px 8px; background: var(--vscode-textCodeBlock-background); border-radius: 3px; overflow-x: auto; font-family: var(--vscode-editor-font-family); font-size: var(--vscode-editor-font-size); line-height: 1.5; }
+.names { display: flex; flex-direction: column; gap: 2px; font-size: 12px; padding: 4px 8px; border: 1px dashed var(--subtle-border); border-radius: var(--radius); }
+.names code, .result code, .expected code { font-family: var(--code-font); background: var(--vscode-textCodeBlock-background); padding: 0 4px; border-radius: 3px; }
+.file-link { color: var(--vscode-textLink-foreground); font-family: var(--code-font); font-size: 12px; text-decoration: none; word-break: break-all; }
+.file-link:hover { text-decoration: underline; }
+
+/* ---------- クイズ ---------- */
+textarea.prediction { width: 100%; box-sizing: border-box; resize: vertical; background: var(--vscode-input-background); color: var(--vscode-input-foreground); border: 1px solid var(--vscode-input-border, transparent); border-radius: 2px; padding: 4px 6px; font-family: inherit; }
+.quiz-item { display: flex; flex-direction: column; gap: 8px; padding-top: 10px; border-top: 1px solid var(--subtle-border); }
+.quiz-item:first-of-type { border-top: none; padding-top: 0; }
+.quiz-head { display: flex; gap: 6px; align-items: center; flex-wrap: wrap; }
+.item-no { font-weight: 600; }
+pre.code { margin: 0; padding: 6px 8px; background: var(--vscode-textCodeBlock-background); border-radius: var(--radius); overflow-x: auto; font-family: var(--code-font); font-size: var(--vscode-editor-font-size); line-height: 1.5; }
 .code-line { white-space: pre; }
-.code-line.add { background: rgba(63, 185, 80, 0.15); }
-.code-line.del { background: rgba(248, 81, 73, 0.15); }
-.code-line.skip, .code-fold { color: var(--vscode-descriptionForeground); font-style: italic; }
+.code-line.add { background: var(--ok-bg); }
+.code-line.del { background: var(--ng-bg); }
+.code-line.skip, .code-fold { color: var(--muted); font-style: italic; }
 .code-fold { cursor: pointer; }
 .code-fold:hover { color: var(--vscode-textLink-foreground); }
-.slot { display: inline-block; min-width: 4ch; padding: 0 4px; margin: 0 1px; border: 1px dashed var(--vscode-focusBorder); border-radius: 3px; color: var(--vscode-descriptionForeground); cursor: pointer; }
+.slot { display: inline-block; min-width: 4ch; padding: 0 4px; margin: 0 1px; border: 1px dashed var(--accent); border-radius: 3px; color: var(--muted); cursor: pointer; }
 .slot.filled { border-style: solid; color: var(--vscode-foreground); background: var(--vscode-editor-selectionBackground); }
-.slot.correct { border-color: var(--vscode-testing-iconPassed, #3fb950); background: rgba(63, 185, 80, 0.15); }
-.slot.incorrect { border-color: var(--vscode-testing-iconFailed, #f85149); background: rgba(248, 81, 73, 0.15); }
-.choices { display: flex; flex-direction: column; gap: 3px; margin: 2px 0; }
+.slot.correct { border-color: var(--ok); background: var(--ok-bg); }
+.slot.incorrect { border-color: var(--ng); background: var(--ng-bg); }
+
+/* 空欄ごとの選択肢 */
+.blank-group { display: flex; flex-direction: column; gap: 4px; padding: 6px 8px; border: 1px solid var(--subtle-border); border-radius: var(--radius); scroll-margin: 8px; }
+.hint-head { display: flex; gap: 6px; align-items: center; flex-wrap: wrap; font-size: 12px; }
+.blank-no { font-weight: 600; font-size: 11px; padding: 0 6px; border-radius: 3px; border: 1px solid var(--accent); }
+.concept { color: var(--muted); flex: 1; min-width: 0; }
+.choices { display: flex; flex-direction: column; gap: 3px; }
 .choice-row { display: flex; flex-direction: column; gap: 1px; }
-button.choice { text-align: left; background: var(--vscode-input-background); color: var(--vscode-input-foreground); border: 1px solid var(--vscode-input-border, var(--vscode-panel-border)); padding: 3px 8px; white-space: pre-wrap; word-break: break-all; }
+button.choice { text-align: left; background: var(--vscode-input-background); color: var(--vscode-input-foreground); border: 1px solid var(--vscode-input-border, var(--subtle-border)); padding: 3px 8px; white-space: pre-wrap; word-break: break-all; }
 button.choice:hover:not(:disabled) { background: var(--vscode-list-hoverBackground); }
-button.choice code { font-family: var(--vscode-editor-font-family); font-size: var(--vscode-editor-font-size); }
-button.choice.selected { border-color: var(--vscode-focusBorder); background: var(--vscode-list-activeSelectionBackground); color: var(--vscode-list-activeSelectionForeground); }
+button.choice code { font-family: var(--code-font); font-size: var(--vscode-editor-font-size); }
+button.choice.selected { border-color: var(--accent); background: var(--vscode-list-activeSelectionBackground); color: var(--vscode-list-activeSelectionForeground); }
 button.choice.eliminated { text-decoration: line-through; }
-button.choice.right { border-color: var(--vscode-testing-iconPassed, #3fb950); background: rgba(63, 185, 80, 0.15); opacity: 1; }
-button.choice.wrong { border-color: var(--vscode-testing-iconFailed, #f85149); background: rgba(248, 81, 73, 0.15); opacity: 1; }
-.choice-note { font-size: 12px; color: var(--vscode-descriptionForeground); padding-left: 8px; white-space: pre-wrap; }
-input.blank { width: 8ch; background: var(--vscode-input-background); color: var(--vscode-input-foreground); border: 1px solid var(--vscode-input-border, var(--vscode-focusBorder)); border-radius: 3px; padding: 0 4px; margin: 0 2px; font-family: var(--vscode-editor-font-family); font-size: inherit; }
-input.blank.correct { border-color: var(--vscode-testing-iconPassed, #3fb950); background: rgba(63, 185, 80, 0.15); }
-input.blank.incorrect { border-color: var(--vscode-testing-iconFailed, #f85149); background: rgba(248, 81, 73, 0.15); }
-.hint-row { display: flex; flex-direction: column; gap: 2px; font-size: 12px; margin-bottom: 4px; }
-.hint-head { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
-.hint-label { font-weight: 600; }
-.concept { color: var(--vscode-descriptionForeground); }
-.hint-text { white-space: pre-wrap; color: var(--vscode-descriptionForeground); }
+button.choice.right { border-color: var(--ok); background: var(--ok-bg); color: var(--vscode-foreground); opacity: 1; }
+button.choice.wrong { border-color: var(--ng); background: var(--ng-bg); color: var(--vscode-foreground); opacity: 1; }
+.choice-note { font-size: 12px; color: var(--muted); padding-left: 8px; white-space: pre-wrap; }
+.hint-text { display: flex; flex-direction: column; gap: 2px; font-size: 12px; white-space: pre-wrap; color: var(--muted); }
+.hint-text:empty { display: none; }
 .result { font-size: 12px; white-space: pre-wrap; }
-.result.ok { color: var(--vscode-testing-iconPassed, #3fb950); }
-.result.ng { color: var(--vscode-testing-iconFailed, #f85149); }
-.result code, .expected code { font-family: var(--vscode-editor-font-family); background: var(--vscode-textCodeBlock-background); padding: 0 4px; border-radius: 3px; }
-.explain { white-space: pre-wrap; border-top: 1px dashed var(--vscode-panel-border); padding-top: 6px; }
-.score { font-weight: 600; }
-fieldset.mcq { border: 1px solid var(--vscode-panel-border); border-radius: 4px; margin: 0; padding: 6px 8px; }
-fieldset.mcq legend { font-size: 12px; padding: 0 4px; }
-.mcq label { display: flex; gap: 6px; align-items: center; padding: 2px 0; font-family: var(--vscode-editor-font-family); font-size: 12px; }
-.mcq label.right { color: var(--vscode-testing-iconPassed, #3fb950); font-weight: 600; }
-.mcq label.wrong { color: var(--vscode-testing-iconFailed, #f85149); text-decoration: line-through; }
-.mcq .why { font-size: 12px; color: var(--vscode-descriptionForeground); margin-top: 4px; white-space: pre-wrap; }
+.result:empty { display: none; }
+.result.ok { color: var(--ok); }
+.result.ng { color: var(--ng); }
+.why-blank { color: var(--vscode-foreground); margin-top: 2px; }
+.after { display: flex; flex-direction: column; gap: 6px; }
+.after:empty { display: none; }
+.explain { white-space: pre-wrap; }
+.unanswered { font-size: 12px; color: var(--warn); }
 
-#input-area { flex-shrink: 0; }
-#input-row { display: flex; gap: 4px; }
-#query { flex: 1; min-width: 0; background: var(--vscode-input-background); color: var(--vscode-input-foreground); border: 1px solid var(--vscode-input-border, transparent); border-radius: 3px; padding: 5px 6px; outline: none; font-family: inherit; }
-#query:focus { border-color: var(--vscode-focusBorder); }
-#mode { background: var(--vscode-dropdown-background); color: var(--vscode-dropdown-foreground); border: 1px solid var(--vscode-dropdown-border); border-radius: 3px; max-width: 110px; }
+/* 採点の結果(カードの最後) */
+.summary { display: flex; flex-direction: column; gap: 6px; padding: 8px 10px; border-radius: var(--radius); background: var(--vscode-textBlockQuote-background); border-left: 3px solid var(--accent); white-space: pre-wrap; }
+.score { font-weight: 600; font-size: 13px; }
 
-.clarify { display: flex; flex-direction: column; gap: 8px; white-space: normal; }
-.clarify .row { display: flex; gap: 6px; flex-wrap: wrap; }
-.clarify-q { display: flex; flex-direction: column; gap: 4px; }
+/* 選択式の問題(構造クイズ・次に確認すべき場所・要件の確認) */
+fieldset.mcq { border: 1px solid var(--subtle-border); border-radius: var(--radius); margin: 0; padding: 6px 10px 8px; display: flex; flex-direction: column; gap: 4px; }
+fieldset.mcq legend { font-size: 11px; font-weight: 600; color: var(--muted); padding: 0 4px; }
+.mcq label { display: flex; gap: 6px; align-items: center; padding: 2px 0; font-family: var(--code-font); font-size: 12px; cursor: pointer; }
+.mcq label.right { color: var(--ok); font-weight: 600; }
+.mcq label.wrong { color: var(--ng); text-decoration: line-through; }
+.mcq .why { font-size: 12px; color: var(--muted); white-space: pre-wrap; }
+.mcq .why:empty { display: none; }
+
+/* ---------- 要件の確認 ---------- */
 .clarify-question { font-weight: 600; }
 .clarify-q label { align-items: flex-start; font-family: inherit; font-size: inherit; }
 .clarify-q label input { margin-top: 3px; }
 .clarify-option { display: flex; flex-direction: column; gap: 1px; }
 .clarify-option .badge { align-self: flex-start; }
-input.clarify-note { background: var(--vscode-input-background); color: var(--vscode-input-foreground); border: 1px solid var(--vscode-input-border, transparent); border-radius: 3px; padding: 3px 6px; font-family: inherit; }
+input.clarify-note { background: var(--vscode-input-background); color: var(--vscode-input-foreground); border: 1px solid var(--vscode-input-border, transparent); border-radius: 2px; padding: 3px 6px; font-family: inherit; }
 
-#confirm-api-label { display: flex; align-items: center; gap: 3px; margin-left: auto; cursor: pointer; }
-
-/* 実装の手順 */
-.lesson { display: flex; flex-direction: column; gap: 8px; white-space: normal; }
+/* ---------- 実装の手順 ---------- */
 .lesson ol { margin: 0; padding-left: 20px; }
 .criteria li { margin: 1px 0; }
-.step-map li { margin: 1px 0; color: var(--vscode-descriptionForeground); }
+.step-map li { margin: 1px 0; color: var(--muted); }
 .step-map li.current { color: var(--vscode-foreground); font-weight: 600; }
 .step-map li.done { color: var(--vscode-foreground); }
-.step-map li.done::marker { content: "✓ "; }
-.lesson-steps { display: flex; flex-direction: column; gap: 10px; }
-.lesson-step { border-left: 3px solid var(--vscode-focusBorder); padding-left: 8px; display: flex; flex-direction: column; gap: 6px; }
-.step-head { display: flex; gap: 6px; align-items: center; flex-wrap: wrap; }
-.step-no { font-size: 12px; color: var(--vscode-descriptionForeground); }
-.badge.quiet { background: var(--vscode-editorWidget-background, transparent); color: var(--vscode-descriptionForeground); border: 1px solid var(--vscode-panel-border); }
-.why-box { white-space: pre-wrap; }
-.contract { font-size: 12px; padding: 2px 6px; border: 1px dashed var(--vscode-panel-border); border-radius: 3px; }
-.next-check label { font-family: var(--vscode-editor-font-family); }
-.checks-title { font-weight: 600; margin-top: 4px; }
-.check { border: 1px solid var(--vscode-panel-border); border-radius: 4px; padding: 6px 8px; display: flex; flex-direction: column; gap: 3px; font-size: 12px; }
+.step-map li.done::marker { content: "✓ "; color: var(--ok); }
+.progress { height: 3px; border-radius: 2px; background: var(--subtle-border); overflow: hidden; }
+.progress > div { height: 100%; background: var(--accent); transition: width 0.3s; }
+.lesson-steps { display: flex; flex-direction: column; gap: 8px; }
+details.lesson-step { border: 1px solid var(--subtle-border); border-left: 3px solid var(--accent); border-radius: var(--radius); scroll-margin-top: 4px; }
+details.lesson-step.answered { border-left-color: var(--subtle-border); }
+details.lesson-step > summary { cursor: pointer; list-style: none; padding: 5px 8px; display: flex; gap: 6px; align-items: center; flex-wrap: wrap; }
+details.lesson-step > summary::-webkit-details-marker { display: none; }
+details.lesson-step > summary::before { content: "▸"; color: var(--muted); width: 10px; }
+details.lesson-step[open] > summary::before { content: "▾"; }
+details.lesson-step[open] > summary { border-bottom: 1px solid var(--subtle-border); }
+.step-body { display: flex; flex-direction: column; gap: 8px; padding: 8px; }
+.step-no { font-size: 11px; color: var(--muted); }
+.step-label { font-weight: 600; flex: 1 1 60%; min-width: 0; }
+.contract { font-size: 12px; padding: 3px 8px; border: 1px dashed var(--subtle-border); border-radius: var(--radius); white-space: pre-wrap; }
+.next-check label { font-family: var(--code-font); }
+.reveal { display: flex; flex-direction: column; gap: 6px; padding-top: 8px; border-top: 1px dashed var(--subtle-border); }
+.reveal:empty { display: none; }
+.check { border: 1px solid var(--subtle-border); border-radius: var(--radius); padding: 6px 8px; display: flex; flex-direction: column; gap: 3px; font-size: 12px; }
+.check-head { display: flex; gap: 6px; align-items: baseline; flex-wrap: wrap; }
 .result-line { white-space: pre-wrap; }
-details.fold-box { font-size: 12px; }
-details.fold-box > summary { cursor: pointer; color: var(--vscode-textLink-foreground); }
-details.fold-box > *:not(summary) { margin-top: 3px; }
-.lesson-final { display: flex; flex-direction: column; gap: 6px; }
-.lesson-final .row { display: flex; gap: 6px; flex-wrap: wrap; }
+.lesson-final { display: flex; flex-direction: column; gap: 8px; }
 .overall { white-space: pre-wrap; }
-.warn { white-space: pre-wrap; color: var(--vscode-editorWarning-foreground, #cca700); }
-.ok-line { color: var(--vscode-testing-iconPassed, #3fb950); }
+.warn { white-space: pre-wrap; color: var(--warn); }
+.warn-box { white-space: pre-wrap; font-size: 12px; padding: 4px 8px; border-left: 3px solid var(--warn); background: var(--warn-bg); border-radius: 0 var(--radius) var(--radius) 0; }
+.ok-line { color: var(--ok); font-size: 12px; }
+.test-box { display: flex; flex-direction: column; gap: 6px; }
+.test-box:empty { display: none; }
 .test-output { max-height: 240px; overflow: auto; font-size: 11px; }
+.file-stat { font-family: var(--code-font); font-size: 12px; }
+.file-stat .plus { color: var(--ok); }
+.file-stat .minus { color: var(--ng); }
+
+/* ---------- 入力欄 ---------- */
+#input-area { flex-shrink: 0; display: flex; flex-direction: column; gap: 4px; padding-top: 6px; border-top: 1px solid var(--subtle-border); }
+#query { width: 100%; box-sizing: border-box; background: var(--vscode-input-background); color: var(--vscode-input-foreground); border: 1px solid var(--vscode-input-border, transparent); border-radius: 2px; padding: 5px 6px; outline: none; font-family: inherit; font-size: inherit; }
+#query:focus { border-color: var(--accent); }
+#query::placeholder { color: var(--vscode-input-placeholderForeground); }
+#send-row { display: flex; gap: 6px; align-items: center; }
+#mode { max-width: 130px; font-size: 12px; }
