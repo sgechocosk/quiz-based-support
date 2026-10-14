@@ -38,11 +38,58 @@ export interface AgentResult {
   steps: number;
 }
 
+/** 調査の結果。要件の確認を挟んでも、同じ調査の続きから出題できるように保持する。 */
+export interface Investigation {
+  query: string;
+  mode: QuizMode;
+  /** 調査の会話(回答を受けた追加調査はこの続きで行う) */
+  messages: ChatMessage[];
+  evidence: EvidenceStore;
+  notes: string;
+  steps: number;
+}
+
+export interface ClarifyOption {
+  label: string;
+  /** 選ぶと何がどう変わるか(触るファイル・関数、動作の違い) */
+  detail: string;
+  recommended: boolean;
+}
+
+export interface ClarifyQuestion {
+  question: string;
+  /** なぜ決める必要があるか */
+  why: string;
+  options: ClarifyOption[];
+}
+
+/** 実装に移る前にユーザーへ確認する内容 */
+export interface Clarification {
+  /** 依頼をどう理解したか */
+  understanding: string;
+  /** なぜ確認が必要か */
+  reason: string;
+  estimatedFiles: number;
+  estimatedLines: number;
+  /** 1回のクイズで扱える規模を超える見込みか */
+  large: boolean;
+  questions: ClarifyQuestion[];
+}
+
+export interface ClarifyAnswer {
+  question: string;
+  answer: string;
+}
+
 const STRING = { type: "string" } as const;
 const INTEGER = { type: "integer" } as const;
 const MAX_ITEMS = 3;
 /** 初回 + 不合格だった問題の作り直し(最大2回) */
 const MAX_QUIZ_ATTEMPTS = 3;
+/** 1回のクイズで扱える変更行数の目安(実装問題は最大 MAX_ITEMS か所・各25行程度) */
+export const LARGE_CHANGE_LINES = 60;
+/** 要件の回答を受けて行う追加調査のツール呼び出し上限 */
+const FOLLOW_UP_STEPS = 3;
 
 export const QUIZ_SCHEMA = {
   name: "quiz",
@@ -144,10 +191,161 @@ export function exploreSystemPrompt(maxSteps: number, repoMap: string): string {
   ].join("\n");
 }
 
+// ---------- 要件の確認(大きな変更・複数案がある依頼) ----------
+
+export const SCOPE_SCHEMA = {
+  name: "scope",
+  schema: {
+    type: "object",
+    properties: {
+      decision: { type: "string", enum: ["proceed", "clarify"] },
+      reason: STRING,
+      understanding: STRING,
+      estimatedFiles: INTEGER,
+      estimatedLines: INTEGER,
+      questions: {
+        type: "array",
+        items: {
+          type: "object",
+          properties: {
+            question: STRING,
+            why: STRING,
+            options: {
+              type: "array",
+              items: {
+                type: "object",
+                properties: { label: STRING, detail: STRING, recommended: { type: "boolean" } },
+                required: ["label", "detail", "recommended"],
+                additionalProperties: false,
+              },
+            },
+          },
+          required: ["question", "why", "options"],
+          additionalProperties: false,
+        },
+      },
+    },
+    required: ["decision", "reason", "understanding", "estimatedFiles", "estimatedLines", "questions"],
+    additionalProperties: false,
+  },
+} as const;
+
+export function scopeSystemPrompt(level: LearnerLevel = "intermediate"): string {
+  return [
+    "あなたはプログラミング学習アシスタントの「要件確認担当」です。ユーザーの実装・修正の依頼と調査済みのコードを読み、",
+    "このまま実装問題(学習者が穴埋めで実装を完成させるクイズ)を作ってよいか、先にユーザーへ要件を確認すべきかを判断します。",
+    `1回のクイズで実装できるのは、最大${MAX_ITEMS}か所・各25行程度の変更までです。要件があいまいなまま作ると、ユーザーの意図と違うコードを「正解」として教えてしまいます。`,
+    "出力は指定のJSONスキーマに厳密に従ってください。",
+    "",
+    "【先に確認する(decision=\"clarify\")場合】",
+    `1. 変更が大きい: ${MAX_ITEMS}つより多いファイル・関数にまたがる、新しいファイル・クラス・画面・設定項目が必要、または変更行が合計でおよそ${LARGE_CHANGE_LINES}行を超える。`,
+    "   → 「今回どの段階から実装するか」を必ず1問含める。選択肢は、それだけで動作が完結する小さな段階にし、依存される側(データ・型・中核の処理)から順に並べる。",
+    "2. 解釈や方針が複数ある: 仕様(入力・出力・境界条件・エラー時の扱い・既存の動作を変えるか)や実装の方針(どこに置くか、既存の仕組みを拡張するか新しく作るか)に",
+    "   もっともらしい案が複数あり、どれを選ぶかで完成するコードが大きく変わる。",
+    "   → 案ごとに選択肢を作る。",
+    "",
+    "【確認しない(decision=\"proceed\")場合】",
+    "- 変更が小さく、要求からやるべきことが一つに決まる。",
+    "- 迷う点が、新しい名前や細かな書き方など、既存コードの慣習に合わせて出題側で決められることだけ。",
+    "- 調査済みのコードを読めば答えが決まること(既存の関数・型・手本の実装)は質問しない。",
+    "",
+    "【質問の作り方】",
+    "- questions は clarify のとき1〜3問、proceed のときは空配列。ユーザーが選択肢を選ぶだけで答えられる形にし、重要な順に並べる。",
+    "- options は各質問に2〜4個。label は短い案の名前。detail には、選ぶと何がどう変わるか(触るファイル・関数、動作の違い)を参照コードの名前を使って1〜2文で書く。",
+    "- recommended は、既存コードの設計と最も整合する案1つだけを true にする(決められなければすべて false)。",
+    "- why: その点を決めないと何があいまいなまま実装されるかを1文で。",
+    "- understanding: 依頼をどう理解したかを1〜2文で。reason: 確認が必要な理由(clarify)または不要な理由(proceed)を1文で。",
+    "- estimatedFiles / estimatedLines: 依頼を全部実装した場合に変更するファイル数と変更行数(追加+削除)の見積もり。decision に関わらず正直に書く。",
+    "- " + levelStyle(level),
+  ].join("\n");
+}
+
+interface RawScope {
+  decision?: string;
+  reason?: string;
+  understanding?: string;
+  estimatedFiles?: number;
+  estimatedLines?: number;
+  questions?: Array<{
+    question?: string;
+    why?: string;
+    options?: Array<{ label?: string; detail?: string; recommended?: boolean }>;
+  }>;
+}
+
+/**
+ * 要件確認の結果を判定する。
+ * - 確認が必要(LLM が clarify と判断した、または見積もりが1回のクイズの規模を超える)で、答えられる質問がある → Clarification
+ * - 確認が必要なのに答えられる質問が無い → "missing"(質問を作り直させる)
+ * - 確認は不要 → undefined
+ */
+export function decideClarification(raw: RawScope | undefined): Clarification | "missing" | undefined {
+  const count = (n: unknown) => Math.max(0, Math.round(Number(n) || 0));
+  const estimatedFiles = count(raw?.estimatedFiles);
+  const estimatedLines = count(raw?.estimatedLines);
+  const large = estimatedFiles > MAX_ITEMS || estimatedLines > LARGE_CHANGE_LINES;
+  if (raw?.decision !== "clarify" && !large) {
+    return undefined;
+  }
+  const questions: ClarifyQuestion[] = [];
+  for (const q of raw?.questions ?? []) {
+    const options: ClarifyOption[] = [];
+    for (const o of q?.options ?? []) {
+      const label = o?.label?.trim() ?? "";
+      if (label && options.length < 4) {
+        // おすすめは1つだけにする(複数あると選ぶ手がかりにならない)
+        const recommended = o.recommended === true && !options.some((x) => x.recommended);
+        options.push({ label, detail: o.detail?.trim() ?? "", recommended });
+      }
+    }
+    const question = q?.question?.trim() ?? "";
+    if (question && options.length >= 2 && questions.length < 3) {
+      questions.push({ question, why: q.why?.trim() ?? "", options });
+    }
+  }
+  if (questions.length === 0) {
+    return "missing";
+  }
+  const reason =
+    raw?.decision !== "clarify"
+      ? `変更が大きくなる見込み(約${estimatedFiles}ファイル・約${estimatedLines}行)のため、実装する範囲を先に決めます。`
+      : raw.reason?.trim() ?? "";
+  return { understanding: raw?.understanding?.trim() ?? "", reason, estimatedFiles, estimatedLines, large, questions };
+}
+
+/** 確認画面での選択(選択肢の番号 / 補足の自由記述)を、出題に渡す回答の一覧にする。未回答の質問は含めない。 */
+export function answersFrom(clarification: Clarification, picks: Array<{ option?: number; text?: string } | undefined>): ClarifyAnswer[] {
+  const answers: ClarifyAnswer[] = [];
+  clarification.questions.forEach((q, i) => {
+    const pick = picks[i];
+    const option = typeof pick?.option === "number" ? q.options[pick.option] : undefined;
+    const text = (pick?.text ?? "").trim().slice(0, 300);
+    const chosen = option ? (option.detail ? `${option.label}(${option.detail})` : option.label) : "";
+    const answer = chosen && text ? `${chosen} / 補足: ${text}` : chosen || text;
+    if (answer) {
+      answers.push({ question: q.question, answer });
+    }
+  });
+  return answers;
+}
+
+/** 出題に渡す要求文(確認した要件があれば添える) */
+export function requirementText(query: string, answers: ClarifyAnswer[]): string {
+  if (answers.length === 0) {
+    return query;
+  }
+  return [
+    query,
+    "",
+    "【ユーザーに確認した要件(これに従って、実装する範囲と仕様を決める。範囲を絞った場合は、その範囲だけを実装問題にする)】",
+    ...answers.map((a) => `- ${a.question} → ${a.answer}`),
+  ].join("\n");
+}
+
 export type QuizIntent = "change" | "read";
 
 const CHANGE_WORDS =
-  /追加|実装|作りたい|作って|作成|作る|修正|直し|直す|直せ|変更|変えたい|変えて|対応させ|対応したい|導入|組み込|改善|改修|リファクタ|削除し|消したい|置き換|ようにしたい|ようにする|ようにして|にしたい|にして欲|にしてほし|できるようにし|欲しい|ほしい|書きたい|書いて|加えたい|入れたい|\b(add|implement|fix|create|build|support|refactor|change|remove|replace)\b/i;
+  /追加|実装|作りたい|作って|作成|作る|修正|直し|直す|直せ|変更|変えたい|変えて|対応させ|対応したい|導入|組み込|改善|強化|改修|リファクタ|削除し|消したい|置き換|ようにしたい|ようにする|ようにして|にしたい|にして欲|にしてほし|できるようにし|欲しい|ほしい|書きたい|書いて|加えたい|入れたい|\b(add|implement|fix|create|build|support|refactor|change|remove|replace)\b/i;
 
 /** 質問文が「実装・修正の依頼」か「仕組みの質問」かを判定する。 */
 export function detectIntent(query: string): QuizIntent {
@@ -359,72 +557,155 @@ const FIELD_LABEL: Record<LeakField, string> = {
 };
 
 /**
- * 2段構えのエージェント。
+ * 3段構えのエージェント。
  * 1) 調査: LLMがツール(検索・grep・読み取り・LSP)を自分で呼んで関連コードを探す(エージェント型検索)
- * 2) 出題: 実際に読んだコードだけを根拠に構造化JSONでクイズを作り、実ファイルと突き合わせて検証する
+ * 2) 要件の確認: 実装依頼で、変更が大きい・解釈や方針が複数ある場合は、出題せずにユーザーへ質問する
+ * 3) 出題: 実際に読んだコードだけを根拠に構造化JSONでクイズを作り、実ファイルと突き合わせて検証する
  */
 export class QuizAgent {
   constructor(private readonly deps: AgentDeps) {}
 
+  /** 要件の確認を挟まずに、調査から出題までを行う。 */
   async run(query: string, mode: QuizMode, hooks: RunHooks = {}): Promise<AgentResult> {
-    const { llm, ws, lsp, index, config } = this.deps;
-    const status = hooks.onStatus ?? (() => undefined);
-    const evidence = new EvidenceStore();
-    const ctx = { ws, lsp, index, evidence, minSimilarity: config.minSimilarity };
-
-    const messages: ChatMessage[] = [
-      { role: "system", content: exploreSystemPrompt(config.maxSteps, index.repoMap(config.repoMapChars)) },
-      {
-        role: "user",
-        content: requiresChange(mode, detectIntent(query))
-          ? `${query}\n\n(これは実装・修正の依頼です。変更を入れる場所と、手本にすべき既存の実装を必ず特定してください)`
-          : query,
-      },
-    ];
-
-    let notes = "";
-    let steps = 0;
-    status("関連コードを調査中...");
-    for (let turn = 0; turn <= config.maxSteps; turn++) {
-      const exhausted = steps >= config.maxSteps;
-      const res = await llm.chat({ messages, tools: exhausted ? undefined : TOOL_DEFS, signal: hooks.signal });
-      if (res.toolCalls.length === 0 || exhausted) {
-        notes = res.content ?? "";
-        break;
-      }
-      messages.push({ role: "assistant", content: res.content, toolCalls: res.toolCalls });
-      for (const call of res.toolCalls) {
-        steps++;
-        status(`調査 ${steps}: ${call.name}(${summarizeArgs(call.arguments)})`);
-        const result = await executeTool(call.name, call.arguments, ctx);
-        messages.push({ role: "tool", toolCallId: call.id, content: result });
-      }
-    }
-
-    if (evidence.isEmpty()) {
-      // 何も読まずに終えた場合の保険: 質問そのもので検索して上位を読ませる
-      await executeTool("search_code", JSON.stringify({ query, k: 4 }), ctx);
-    }
-    if (evidence.isEmpty()) {
-      throw new Error("関連するコードが見つかりませんでした。キーワードや関数名を含めて質問し直してください。");
-    }
-
-    status("クイズを作成中...");
-    const quiz = await this.generateQuiz(query, mode, notes, evidence, hooks);
-    status("ヒントが答えを漏らしていないか確認中...");
-    await this.removeLeaks(quiz, hooks);
-    return { quiz, evidencePaths: evidence.paths(), notes, steps };
+    const inv = await this.investigate(query, mode, hooks);
+    return this.compose(inv, [], hooks);
   }
 
-  private async generateQuiz(
-    query: string,
-    mode: QuizMode,
-    notes: string,
-    evidence: EvidenceStore,
-    hooks: RunHooks,
-  ): Promise<GeneratedQuiz> {
+  async investigate(query: string, mode: QuizMode, hooks: RunHooks = {}): Promise<Investigation> {
+    const { index, config } = this.deps;
+    const inv: Investigation = {
+      query,
+      mode,
+      messages: [
+        { role: "system", content: exploreSystemPrompt(config.maxSteps, index.repoMap(config.repoMapChars)) },
+        {
+          role: "user",
+          content: requiresChange(mode, detectIntent(query))
+            ? `${query}\n\n(これは実装・修正の依頼です。変更を入れる場所と、手本にすべき既存の実装を必ず特定してください)`
+            : query,
+        },
+      ],
+      evidence: new EvidenceStore(),
+      notes: "",
+      steps: 0,
+    };
+    hooks.onStatus?.("関連コードを調査中...");
+    await this.explore(inv, config.maxSteps, hooks);
+
+    if (inv.evidence.isEmpty()) {
+      // 何も読まずに終えた場合の保険: 質問そのもので検索して上位を読ませる
+      await executeTool("search_code", JSON.stringify({ query, k: 4 }), this.toolContext(inv.evidence));
+    }
+    if (inv.evidence.isEmpty()) {
+      throw new Error("関連するコードが見つかりませんでした。キーワードや関数名を含めて質問し直してください。");
+    }
+    return inv;
+  }
+
+  /**
+   * 実装依頼のとき、変更が大きい、または解釈・方針が複数あるなら、ユーザーへの質問を返す(出題には進まない)。
+   * 確認が不要なとき・確認できなかったときは undefined(そのまま出題してよい)。
+   */
+  async clarify(inv: Investigation, hooks: RunHooks = {}): Promise<Clarification | undefined> {
     const { llm, config } = this.deps;
-    const intent = detectIntent(query);
+    if (!requiresChange(inv.mode, detectIntent(inv.query))) {
+      return undefined;
+    }
+    hooks.onStatus?.("変更の規模と、仕様の決め方が複数ないかを確認中...");
+    const messages: ChatMessage[] = [
+      { role: "system", content: scopeSystemPrompt(config.level) },
+      {
+        role: "user",
+        content: [
+          `【ユーザーの要求】\n${inv.query}`,
+          inv.notes ? `\n【調査メモ】\n${inv.notes}` : "",
+          `\n【参照コード(行番号 L数字| は表示用で、コードの一部ではない)】\n${inv.evidence.render(config.evidenceChars)}`,
+        ].join("\n"),
+      },
+    ];
+    try {
+      for (let attempt = 0; attempt < 2; attempt++) {
+        const res = await llm.chat({ messages, jsonSchema: SCOPE_SCHEMA, signal: hooks.signal });
+        const verdict = decideClarification(parseJson<RawScope>(res.content));
+        if (verdict !== "missing") {
+          return verdict;
+        }
+        messages.push(
+          { role: "assistant", content: res.content ?? "" },
+          {
+            role: "user",
+            content:
+              "確認が必要な依頼(変更が大きい、または案が複数ある)ですが、選択肢が2つ以上ある質問がありません。" +
+              "decision=\"clarify\" とし、ユーザーが選ぶだけで答えられる質問(各2〜4個の選択肢)を1〜3問作って、JSON全体を出し直してください。",
+          },
+        );
+      }
+    } catch (error) {
+      if (hooks.signal?.aborted) {
+        throw error;
+      }
+      // 確認の判定に失敗しても、出題そのものは止めない
+    }
+    return undefined;
+  }
+
+  /** 調査結果(と確認した要件)からクイズを作る。 */
+  async compose(inv: Investigation, answers: ClarifyAnswer[] = [], hooks: RunHooks = {}): Promise<AgentResult> {
+    const status = hooks.onStatus ?? (() => undefined);
+    if (answers.length > 0) {
+      // 選んだ案によっては、まだ読んでいない場所に変更が入るので、調査の続きで確かめさせる
+      status("回答した要件をもとに、関連コードを追加で調査中...");
+      inv.messages.push({
+        role: "user",
+        content: [
+          "ユーザーに要件を確認し、次の回答を得ました。",
+          ...answers.map((a) => `- ${a.question} → ${a.answer}`),
+          "この要件で変更が入る場所と手本になる実装のうち、まだ読んでいないものがあれば追加で調べてください。",
+          "最後に、この要件に関係する重要な場所を、前回と同じ形式の箇条書きでまとめ直してください。",
+        ].join("\n"),
+      });
+      await this.explore(inv, FOLLOW_UP_STEPS, hooks);
+    }
+    status("クイズを作成中...");
+    const quiz = await this.generateQuiz(inv, requirementText(inv.query, answers), hooks);
+    status("ヒントが答えを漏らしていないか確認中...");
+    await this.removeLeaks(quiz, hooks);
+    return { quiz, evidencePaths: inv.evidence.paths(), notes: inv.notes, steps: inv.steps };
+  }
+
+  private toolContext(evidence: EvidenceStore) {
+    const { ws, lsp, index, config } = this.deps;
+    return { ws, lsp, index, evidence, minSimilarity: config.minSimilarity };
+  }
+
+  /** 調査の会話を続け、ツール呼び出しが budget 回に達するか LLM がまとめを返したら終える。 */
+  private async explore(inv: Investigation, budget: number, hooks: RunHooks): Promise<void> {
+    const { llm } = this.deps;
+    const status = hooks.onStatus ?? (() => undefined);
+    const ctx = this.toolContext(inv.evidence);
+    const limit = inv.steps + budget;
+    for (let turn = 0; turn <= budget; turn++) {
+      const exhausted = inv.steps >= limit;
+      const res = await llm.chat({ messages: inv.messages, tools: exhausted ? undefined : TOOL_DEFS, signal: hooks.signal });
+      if (res.toolCalls.length === 0 || exhausted) {
+        inv.notes = res.content?.trim() ? res.content : inv.notes;
+        inv.messages.push({ role: "assistant", content: res.content ?? "" });
+        return;
+      }
+      inv.messages.push({ role: "assistant", content: res.content, toolCalls: res.toolCalls });
+      for (const call of res.toolCalls) {
+        inv.steps++;
+        status(`調査 ${inv.steps}: ${call.name}(${summarizeArgs(call.arguments)})`);
+        const result = await executeTool(call.name, call.arguments, ctx);
+        inv.messages.push({ role: "tool", toolCallId: call.id, content: result });
+      }
+    }
+  }
+
+  private async generateQuiz(inv: Investigation, requirement: string, hooks: RunHooks): Promise<GeneratedQuiz> {
+    const { llm, config } = this.deps;
+    const { mode, notes, evidence } = inv;
+    const intent = detectIntent(inv.query);
     const knownText = evidence.allText();
     const needChange = requiresChange(mode, intent);
     const messages: ChatMessage[] = [
@@ -432,7 +713,7 @@ export class QuizAgent {
       {
         role: "user",
         content: [
-          `【ユーザーの要求】\n${query}`,
+          `【ユーザーの要求】\n${requirement}`,
           notes ? `\n【調査メモ】\n${notes}` : "",
           `\n【参照コード(行番号 L数字| は表示用で、コードの一部ではない)】\n${evidence.render(config.evidenceChars)}`,
         ].join("\n"),

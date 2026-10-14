@@ -22,7 +22,15 @@ import {
 } from "../../core/quiz";
 import { answerSkeleton, maskAnswers, revealsAnswer } from "../../core/leak";
 import type { KeyValueStore } from "../../core/ports";
-import { detectIntent, quizSystemPrompt, requiresChange } from "../../core/agent";
+import {
+  answersFrom,
+  decideClarification,
+  detectIntent,
+  LARGE_CHANGE_LINES,
+  quizSystemPrompt,
+  requirementText,
+  requiresChange,
+} from "../../core/agent";
 import { coerceLevel } from "../../core/level";
 import { buildChoices, eliminationHint, mutateAnswer, namePool } from "../../core/choices";
 import { splitLines } from "../../core/text";
@@ -363,12 +371,74 @@ test("意図判定: 実装・修正の依頼か、仕組みの質問か", () => 
   assert.equal(detectIntent("ログアウト機能を追加したい"), "change");
   assert.equal(detectIntent("パスワードが短いときエラーを出すようにしたい"), "change");
   assert.equal(detectIntent("implement retry for fetch"), "change");
+  assert.equal(detectIntent("パスワードのチェックを強化したい"), "change");
   assert.equal(detectIntent("ログイン処理はどう動く?"), "read");
   assert.equal(detectIntent("検索のインデックスはどこで作られる?"), "read");
   assert.ok(requiresChange("auto", "change"));
   assert.ok(!requiresChange("auto", "read"));
   assert.ok(!requiresChange("read", "change"));
   assert.ok(requiresChange("change", "read"));
+});
+
+// ---------- 要件の確認 ----------
+
+const option = (label: string, recommended = false) => ({ label, detail: `${label}の詳細`, recommended });
+const scopeQuestion = (options = [option("A案", true), option("B案", true)]) => ({ question: "どちらの方式にしますか?", why: "完成形が変わる", options });
+
+test("要件の確認: 小さく一つに決まる依頼は確認しない", () => {
+  assert.equal(
+    decideClarification({ decision: "proceed", reason: "小さい", understanding: "u", estimatedFiles: 1, estimatedLines: 8, questions: [] }),
+    undefined,
+  );
+  // proceed と判断したのに質問を付けてきても、規模が小さければ確認しない
+  assert.equal(decideClarification({ decision: "proceed", estimatedFiles: 2, estimatedLines: 30, questions: [scopeQuestion()] }), undefined);
+  assert.equal(decideClarification(undefined), undefined);
+});
+
+test("要件の確認: 複数案があれば質問し、選択肢が2つ未満の質問は捨て、おすすめは1つにする", () => {
+  const c = decideClarification({
+    decision: "clarify",
+    reason: "方式が2通りある",
+    understanding: "ログアウトを追加する",
+    estimatedFiles: 2,
+    estimatedLines: 20,
+    questions: [scopeQuestion(), { question: "選択肢が1つ", why: "", options: [option("唯一")] }, { question: "  ", why: "", options: [option("X"), option("Y")] }],
+  });
+  assert.ok(c && c !== "missing");
+  assert.equal(c.large, false);
+  assert.equal(c.reason, "方式が2通りある");
+  assert.deepEqual(
+    c.questions.map((q) => q.question),
+    ["どちらの方式にしますか?"],
+  );
+  assert.deepEqual(
+    c.questions[0]!.options.map((o) => o.recommended),
+    [true, false],
+  );
+  // 確認が必要なのに答えられる質問が無ければ、作り直させる
+  assert.equal(decideClarification({ decision: "clarify", estimatedFiles: 1, estimatedLines: 5, questions: [{ question: "q", why: "", options: [option("唯一")] }] }), "missing");
+});
+
+test("要件の確認: LLM が proceed と判断しても、見積もりが1回のクイズの規模を超えれば質問する", () => {
+  const byLines = decideClarification({ decision: "proceed", reason: "", understanding: "", estimatedFiles: 2, estimatedLines: LARGE_CHANGE_LINES + 1, questions: [scopeQuestion()] });
+  assert.ok(byLines && byLines !== "missing");
+  assert.equal(byLines.large, true);
+  assert.match(byLines.reason, /約2ファイル・約61行/);
+  const byFiles = decideClarification({ decision: "proceed", estimatedFiles: 5, estimatedLines: 40, questions: [] });
+  assert.equal(byFiles, "missing", "大きいのに質問が無ければ、範囲を選ぶ質問を作らせる");
+});
+
+test("要件の確認: 選んだ案と補足を回答にまとめ、出題の要求文に添える", () => {
+  const c = decideClarification({ decision: "clarify", estimatedFiles: 1, estimatedLines: 5, questions: [scopeQuestion(), scopeQuestion([option("C案"), option("D案")])] });
+  assert.ok(c && c !== "missing");
+  const answers = answersFrom(c, [{ option: 1, text: " 既存の関数を使う " }, { option: 9, text: "" }]);
+  assert.deepEqual(answers, [{ question: "どちらの方式にしますか?", answer: "B案(B案の詳細) / 補足: 既存の関数を使う" }], "範囲外の選択肢・未回答は含めない");
+  assert.deepEqual(answersFrom(c, [undefined, { text: "自由記述だけ" }]), [{ question: "どちらの方式にしますか?", answer: "自由記述だけ" }]);
+  assert.equal(requirementText("ログアウトを追加したい", []), "ログアウトを追加したい");
+  const text = requirementText("ログアウトを追加したい", answers);
+  assert.match(text, /^ログアウトを追加したい\n/);
+  assert.match(text, /【ユーザーに確認した要件/);
+  assert.match(text, /- どちらの方式にしますか\? → B案/);
 });
 
 // ---------- 新しい名前・学習レベル ----------

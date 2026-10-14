@@ -1,7 +1,7 @@
 import * as crypto from "node:crypto";
 import * as path from "node:path";
 import * as vscode from "vscode";
-import { QuizAgent, type QuizMode } from "./core/agent";
+import { answersFrom, QuizAgent, type AgentResult, type Clarification, type Investigation, type QuizMode, type RunHooks } from "./core/agent";
 import { buildChoices, eliminationHint, namePool } from "./core/choices";
 import { languageForPath } from "./core/chunker";
 import { IndexManager, type SyncPlan } from "./core/indexer";
@@ -89,6 +89,8 @@ export class ChatSidebarProvider implements vscode.WebviewViewProvider, vscode.D
   private readonly log: LearnerLog;
   private readonly sessions = new Map<string, QuizSession>();
   private pendingPlan?: SyncPlan;
+  /** 回答待ちの要件確認(最新の1件だけ。新しい質問をすると無効になる) */
+  private pendingClarify?: { id: string; query: string; inv: Investigation; clarification: Clarification };
   private abort?: AbortController;
   private busy = false;
   private syncing = false;
@@ -373,6 +375,9 @@ export class ChatSidebarProvider implements vscode.WebviewViewProvider, vscode.D
         case "ask":
           await this.handleAsk(String(m.query ?? ""), this.coerceMode(m.mode));
           break;
+        case "clarifyAnswer":
+          await this.handleClarifyAnswer(m);
+          break;
         case "cancel":
           this.abort?.abort();
           break;
@@ -426,20 +431,66 @@ export class ChatSidebarProvider implements vscode.WebviewViewProvider, vscode.D
     if (!text) {
       return;
     }
+    const services = await this.readyServices();
+    if (!services) {
+      return;
+    }
+    // 新しい質問をしたら、答えていない要件の確認は無効にする
+    this.pendingClarify = undefined;
+    await this.withAgent(services, async (agent, hooks) => {
+      const inv = await agent.investigate(text, mode, hooks);
+      const clarification = await agent.clarify(inv, hooks);
+      if (clarification) {
+        // 大きな変更・複数案がある依頼は、実装問題を作る前に要件を質問する(調査結果は回答後の出題に使う)
+        const id = crypto.randomUUID();
+        this.pendingClarify = { id, query: text, inv, clarification };
+        this.post({ type: "clarify", id, clarification });
+        return;
+      }
+      await this.presentQuiz(services, await agent.compose(inv, [], hooks), text);
+    });
+  }
+
+  /** 要件の確認への回答(skip=true は「確認せずに進める」) */
+  private async handleClarifyAnswer(m: Record<string, any>): Promise<void> {
+    const pending = this.pendingClarify;
+    if (!pending || pending.id !== String(m.id ?? "")) {
+      this.fail(new Error("この確認は失効しました。もう一度質問してください。"), "");
+      return;
+    }
+    const services = await this.readyServices();
+    if (!services) {
+      return;
+    }
+    this.pendingClarify = undefined;
+    const picks = Array.isArray(m.answers)
+      ? m.answers.map((a: any) => ({ option: Number.isInteger(a?.option) ? Number(a.option) : undefined, text: String(a?.text ?? "") }))
+      : [];
+    const answers = m.skip ? [] : answersFrom(pending.clarification, picks);
+    await this.withAgent(services, async (agent, hooks) =>
+      this.presentQuiz(services, await agent.compose(pending.inv, answers, hooks), pending.query),
+    );
+  }
+
+  /** 出題を始められる状態か確かめる(できなければ理由を表示して undefined) */
+  private async readyServices(): Promise<Services | undefined> {
     if (this.busy) {
       this.status("前の処理が終わるまでお待ちください。");
-      return;
+      return undefined;
     }
     if (!this.apiKey) {
       this.fail(new Error("OpenAI APIキーが未設定です。「APIキー」から設定してください。"), "");
-      return;
+      return undefined;
     }
     const services = await this.ensureServices();
     if (!services) {
       this.fail(new Error("フォルダを開いてから使ってください。"), "");
-      return;
     }
+    return services;
+  }
 
+  /** 処理中の表示・中止ボタンを有効にして、エージェントを使う処理を行う。 */
+  private async withAgent(services: Services, work: (agent: QuizAgent, hooks: RunHooks) => Promise<void>): Promise<void> {
     const cfg = readConfig();
     this.busy = true;
     this.abort = new AbortController();
@@ -459,40 +510,39 @@ export class ChatSidebarProvider implements vscode.WebviewViewProvider, vscode.D
           level: cfg.level,
         },
       });
-      const result = await agent.run(text, mode, {
-        onStatus: (s) => this.status(s, true),
-        signal: this.abort.signal,
-      });
-
-      let questions: McqQuestion[] = [];
-      const first = result.quiz.items[0];
-      if (cfg.structureQuestions && first) {
-        this.status("構造クイズ(呼び出し関係)を作成中...", true);
-        questions = (
-          await buildStructureQuestions({ ws: services.ws, lsp: services.lsp }, first, makeRng(Date.now()))
-        ).slice(0, 2);
-      }
-
-      const session: QuizSession = {
-        id: crypto.randomUUID(),
-        review: false,
-        items: result.quiz.items,
-        questions,
-        overall: result.quiz.overallExplanation,
-        graded: false,
-      };
-      this.sessions.set(session.id, session);
-      this.post({ type: "quiz", quiz: this.payloadOf(session, text, result.quiz.goal) });
-      if (result.quiz.notice) {
-        this.status(`⚠ ${result.quiz.notice}`);
-      }
-      if (result.quiz.rejected.length > 0) {
-        this.status(`検証で不合格だった${result.quiz.rejected.length}件は作り直し、直らなかったものは除外しました。`);
-      }
+      await work(agent, { onStatus: (s) => this.status(s, true), signal: this.abort.signal });
     } finally {
       this.busy = false;
       this.abort = undefined;
       await this.pushState();
+    }
+  }
+
+  private async presentQuiz(services: Services, result: AgentResult, query: string): Promise<void> {
+    let questions: McqQuestion[] = [];
+    const first = result.quiz.items[0];
+    if (readConfig().structureQuestions && first) {
+      this.status("構造クイズ(呼び出し関係)を作成中...", true);
+      questions = (
+        await buildStructureQuestions({ ws: services.ws, lsp: services.lsp }, first, makeRng(Date.now()))
+      ).slice(0, 2);
+    }
+
+    const session: QuizSession = {
+      id: crypto.randomUUID(),
+      review: false,
+      items: result.quiz.items,
+      questions,
+      overall: result.quiz.overallExplanation,
+      graded: false,
+    };
+    this.sessions.set(session.id, session);
+    this.post({ type: "quiz", quiz: this.payloadOf(session, query, result.quiz.goal) });
+    if (result.quiz.notice) {
+      this.status(`⚠ ${result.quiz.notice}`);
+    }
+    if (result.quiz.rejected.length > 0) {
+      this.status(`検証で不合格だった${result.quiz.rejected.length}件は作り直し、直らなかったものは除外しました。`);
     }
   }
 

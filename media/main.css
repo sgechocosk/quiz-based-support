@@ -90,3 +90,13 @@ fieldset.mcq legend { font-size: 12px; padding: 0 4px; }
 #query { flex: 1; min-width: 0; background: var(--vscode-input-background); color: var(--vscode-input-foreground); border: 1px solid var(--vscode-input-border, transparent); border-radius: 3px; padding: 5px 6px; outline: none; font-family: inherit; }
 #query:focus { border-color: var(--vscode-focusBorder); }
 #mode { background: var(--vscode-dropdown-background); color: var(--vscode-dropdown-foreground); border: 1px solid var(--vscode-dropdown-border); border-radius: 3px; max-width: 110px; }
+
+.clarify { display: flex; flex-direction: column; gap: 8px; white-space: normal; }
+.clarify .row { display: flex; gap: 6px; flex-wrap: wrap; }
+.clarify-q { display: flex; flex-direction: column; gap: 4px; }
+.clarify-question { font-weight: 600; }
+.clarify-q label { align-items: flex-start; font-family: inherit; font-size: inherit; }
+.clarify-q label input { margin-top: 3px; }
+.clarify-option { display: flex; flex-direction: column; gap: 1px; }
+.clarify-option .badge { align-self: flex-start; }
+input.clarify-note { background: var(--vscode-input-background); color: var(--vscode-input-foreground); border: 1px solid var(--vscode-input-border, transparent); border-radius: 3px; padding: 3px 6px; font-family: inherit; }

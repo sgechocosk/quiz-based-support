@@ -518,6 +518,102 @@
     scrollDown();
   }
 
+  // ---------- 要件の確認 ----------
+
+  /** 回答待ちの確認カード(新しい質問をしたら無効にする) */
+  let openClarify = null;
+
+  function closeClarify(note) {
+    if (!openClarify) {
+      return;
+    }
+    openClarify.disable(note);
+    openClarify = null;
+  }
+
+  /** 大きな変更・複数案がある実装依頼で、出題の前に要件を選んでもらうカード */
+  function renderClarify(id, c) {
+    closeClarify("(新しい確認が届いたため無効になりました)");
+    const root = el("div", { class: "message bot clarify" });
+    root.append(el("div", { class: "quiz-title", text: "実装の前に確認させてください" }));
+    if (c.understanding) {
+      root.append(el("p", { class: "goal", text: `依頼の理解: ${c.understanding}` }));
+    }
+    const scale = c.estimatedFiles || c.estimatedLines ? `(見込み: 約${c.estimatedFiles}ファイル・約${c.estimatedLines}行の変更)` : "";
+    if (c.reason || scale) {
+      root.append(el("div", { class: "muted", text: `${c.reason}${scale}` }));
+    }
+
+    const inputs = c.questions.map((q, qi) => {
+      const set = el("fieldset", { class: "mcq clarify-q" }, el("legend", { text: `質問${qi + 1}` }), el("div", { class: "clarify-question", text: q.question }));
+      if (q.why) {
+        set.append(el("div", { class: "muted", text: q.why }));
+      }
+      const name = `clarify-${id}-${qi}`;
+      const radios = q.options.map((o, oi) => {
+        const input = el("input", { type: "radio", name, value: String(oi) });
+        const body = el("span", { class: "clarify-option" }, el("strong", { text: o.label }), o.recommended ? el("span", { class: "badge", text: "おすすめ" }) : null);
+        if (o.detail) {
+          body.append(el("span", { class: "muted", text: o.detail }));
+        }
+        set.append(el("label", {}, input, body));
+        return input;
+      });
+      const note = el("input", { type: "text", class: "clarify-note", placeholder: "補足・その他の案(任意)" });
+      set.append(note);
+      root.append(set);
+      return { radios, note };
+    });
+
+    const submit = el("button", { text: "この内容で出題する" });
+    const skip = el("button", { class: "secondary", text: "確認せずに進める", title: "出題側の判断で、依頼のまま実装問題を作ります" });
+    const footer = el("div", { class: "muted" });
+    const disable = (note) => {
+      inputs.forEach((q) => {
+        q.radios.forEach((r) => (r.disabled = true));
+        q.note.disabled = true;
+      });
+      submit.disabled = true;
+      skip.disabled = true;
+      footer.textContent = note;
+    };
+    const answer = (skipped) => {
+      if (state.busy) {
+        footer.textContent = "前の処理が終わってから押してください";
+        return;
+      }
+      const answers = inputs.map((q) => {
+        const option = q.radios.findIndex((r) => r.checked);
+        return { option: option >= 0 ? option : undefined, text: q.note.value.trim() };
+      });
+      if (!skipped && answers.every((a) => a.option === undefined && !a.text)) {
+        footer.textContent = "どれかの質問に答えてください(答えずに進めるなら「確認せずに進める」)";
+        return;
+      }
+      openClarify = null;
+      disable(skipped ? "確認せずに進めました" : "回答しました");
+      const summary = skipped
+        ? "確認せずに進める"
+        : c.questions
+            .map((q, qi) => {
+              const a = answers[qi];
+              const picked = a.option !== undefined ? q.options[a.option].label : "";
+              const text = [picked, a.text].filter(Boolean).join(" / ");
+              return text ? `${q.question} → ${text}` : "";
+            })
+            .filter(Boolean)
+            .join("\n");
+      addMessage("user", summary);
+      vscode.postMessage({ type: "clarifyAnswer", id, answers, skip: skipped });
+    };
+    submit.onclick = () => answer(false);
+    skip.onclick = () => answer(true);
+    root.append(el("div", { class: "row" }, submit, skip), footer);
+    openClarify = { disable };
+    messages.append(root);
+    scrollDown();
+  }
+
   // ---------- 入出力 ----------
 
   function send() {
@@ -525,6 +621,7 @@
     if (!text || queryInput.disabled) {
       return;
     }
+    closeClarify("(新しい質問をしたため無効になりました)");
     addMessage("user", text);
     queryInput.value = "";
     vscode.postMessage({ type: "ask", query: text, mode: modeSelect.value });
@@ -573,6 +670,10 @@
       case "graded":
         setLive("");
         onGraded(m);
+        break;
+      case "clarify":
+        setLive("");
+        renderClarify(m.id, m.clarification);
         break;
       case "plan":
         setLive("");
