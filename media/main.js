@@ -328,7 +328,7 @@
       if (l.weak.length > 0) {
         const list = el("div", { class: "refs" });
         for (const w of l.weak) {
-          list.append(el("div", { text: `・${w.concept}: ${Math.round(w.accuracy * 100)}%(${w.attempts}問)` }));
+          list.append(el("div", { text: `・${w.concept}: ${Math.round(w.accuracy * 100)}%(${w.attempts}回)` }));
         }
         box.append(section("見直したい観点(一致率の低い順)", list));
       }

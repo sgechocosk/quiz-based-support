@@ -14,7 +14,8 @@ import { locateBlock } from "../../core/editMatch";
 import { applyEdits, applyRawEdit, VirtualWorkspace } from "../../core/overlay";
 import { matchingRules, parseProjectRules } from "../../core/patterns";
 import { ChangePlanner, newDiagnostics, orderSteps, PlanError } from "../../core/planner";
-import type { PlanStep, RequirementSpec } from "../../core/planTypes";
+import type { ChangePlan, PlanStep, RequirementSpec } from "../../core/planTypes";
+import type { ChatLlm, WorkspacePort } from "../../core/ports";
 import { makeRng } from "../../core/text";
 import { parseGitLog } from "../../host/gitHistory";
 import { TsTypeChecker } from "../../host/typeChecker";
@@ -1070,4 +1071,50 @@ test("変更計画: oldCode を写し間違えたら、最も近い箇所を示�
   assert.equal(plan.steps.length, 1);
   assert.deepEqual(plan.warnings.filter((w) => w.startsWith("適用できなかった")), []);
   assert.match(plan.files[0]!.final, /length > 8/);
+});
+
+test("手順: 目標の文章に答えが出ていれば、書き直し(直らなければ伏せ字)の結果を画面に出す", async () => {
+  const fileBefore = "export function check(v: number): boolean {\n  return v > 0;\n}\n";
+  const step: PlanStep = {
+    id: "s1",
+    number: 1,
+    label: "境界を含める",
+    kind: "core",
+    why: "",
+    contract: "",
+    mechanical: false,
+    requirements: [1],
+    dependsOn: [],
+    edits: [{ path: "src/a.ts", created: false, startLine: 2, endLine: 2, before: "  return v > 0;", after: "  return v >= 0;", fileBefore }],
+    obligations: [],
+  };
+  const plan: ChangePlan = {
+    // 要件の理解に、空欄の答えのコードがそのまま書かれている
+    spec: { query: "0 も受け付けたい", understanding: "check は v >= 0 のときに true を返す", criteria: ["0 のとき true になる"], contracts: [], answers: [] },
+    steps: [step],
+    obligations: [],
+    files: [{ path: "src/a.ts", original: fileBefore, final: fileBefore.replace("v > 0", "v >= 0") }],
+    typecheck: { available: false, remaining: [] },
+    warnings: [],
+  };
+  const llm: ChatLlm = {
+    chat: async (req) => {
+      const name = req.jsonSchema?.name;
+      if (name === "step_quiz") {
+        return {
+          content: JSON.stringify({
+            items: [{ step: "s1", edit: 0, task: "0 も通す", explanation: "", newNames: [], refs: [], blanks: [blankOf(1, "v >= 0")] }],
+          }),
+          toolCalls: [],
+        };
+      }
+      // 書き直しは返さない(伏せ字で塞ぐ)
+      return { content: JSON.stringify({ fixes: [] }), toolCalls: [] };
+    },
+  };
+  const ws: WorkspacePort = { id: "w", listFiles: async () => [], stat: async () => undefined, readText: async () => fileBefore };
+  const evidence = { render: () => "", allText: () => fileBefore, paths: () => ["src/a.ts"] };
+  const lesson = await buildLesson(plan, { llm, ws, level: "intermediate", evidence, evidenceChars: 8000 });
+  assert.equal(lesson.steps[0]!.item?.blanks[0]?.answer, "v >= 0");
+  assert.ok(!lesson.goal.includes("v >= 0"), `目標に答えが残っている: ${lesson.goal}`);
 });

@@ -101,6 +101,8 @@ interface LessonSession {
   finished: boolean;
   applied: boolean;
   score: { correct: number; total: number };
+  /** 学習記録に「取り組んだ回数」として数えたか(1つの手順は、最初に記録したときに1回だけ数える) */
+  logged: boolean;
 }
 
 function readConfig() {
@@ -775,6 +777,7 @@ export class ChatSidebarProvider
       finished: false,
       applied: false,
       score: { correct: 0, total: 0 },
+      logged: false,
     };
     this.lessons.set(session.id, session);
     this.post({
@@ -827,7 +830,8 @@ export class ChatSidebarProvider
       grades = graded.grades;
       session.score.correct += graded.grades.filter((g) => g.correct).length;
       session.score.total += graded.grades.length;
-      await this.log.record(graded.records, Date.now(), index === 0);
+      await this.log.record(graded.records, Date.now(), !session.logged);
+      session.logged = true;
     }
     let question: ReturnType<typeof gradeQuestion> | undefined;
     if (ls.question) {
@@ -836,9 +840,11 @@ export class ChatSidebarProvider
       if (question.correct) {
         session.score.correct++;
       }
-      await this.log.recordConceptOnly([
-        { concept: ls.question.concept, correct: question.correct },
-      ]);
+      await this.log.recordConceptOnly(
+        [{ concept: ls.question.concept, correct: question.correct }],
+        !session.logged,
+      );
+      session.logged = true;
     }
     session.current++;
     const hasNext = session.current < session.lesson.steps.length;

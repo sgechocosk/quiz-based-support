@@ -684,3 +684,12 @@ test("選択式の問題: 各空欄に正解を含む選択肢が付き、選択
   assert.ok(!none.ok);
   assert.match(none.ok ? "" : none.reason, /選択肢を作れない/);
 });
+
+test("学習記録: 選択式だけの記録でも、1回の取り組みとして数えられる", async () => {
+  const log = new LearnerLog(new MemStore());
+  await log.recordConceptOnly([{ concept: "呼び出し関係", correct: true }], true);
+  await log.recordConceptOnly([{ concept: "呼び出し関係", correct: false }]);
+  const s = log.summary();
+  assert.equal(s.sessions, 1, "最初の記録だけを1回と数える");
+  assert.equal(s.blanks, 2);
+});

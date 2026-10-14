@@ -399,12 +399,13 @@ export async function buildLesson(plan: ChangePlan, deps: LessonDeps, hooks: Run
     }
   }
 
-  const goal = lessonGoal(plan);
-  const quizItems = [...items.values()].map((v) => v.item);
-  if (quizItems.length > 0) {
+  // 目標の文章も解答前に見えるので、答え漏れを直した結果(書き直し・伏せ字)を使う
+  const visible = { goal: lessonGoal(plan), items: [...items.values()].map((v) => v.item) };
+  if (visible.items.length > 0) {
     hooks.onStatus?.("手がかりの文章を点検中...");
-    await removeAnswerLeaks(deps.llm, deps.level, { goal, items: quizItems }, hooks);
+    await removeAnswerLeaks(deps.llm, deps.level, visible, hooks);
   }
+  const { goal } = visible;
 
   const pool = await placePool(plan, deps);
   const rng = makeRng(parseInt(sha1(plan.spec.query + plan.steps.map((s) => s.id).join()).slice(0, 8), 16));

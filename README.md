@@ -5,7 +5,7 @@
 
 ## 動作の流れ
 
-1. サイドバー「Quiz Support」で質問・要望を入力(例: 「認証のフローを理解したい」「ログアウト機能を追加したい」)。
+1. サイドバー「コード思考」で質問・要望を入力(例: 「認証のフローを理解したい」「ログアウト機能を追加したい」)。
 2. エージェントがワークスペースを調査(ハイブリッド検索 BM25+ベクトル / grep / read_file / outline / LSP の定義・参照)。
 3. 質問の種類で分かれる。
    - **仕組みの質問**(「〜はどう動く?」)→ 読解のクイズ([読解のクイズ](#読解のクイズ))
@@ -104,7 +104,7 @@
 
 ## セットアップ
 
-- コマンド「Quiz Support: Set OpenAI API Key」またはサイドバーの「設定」→「OpenAI APIキー」で設定(SecretStorage に保存)。
+- コマンド「コード思考: OpenAI APIキーを設定」またはサイドバーの「設定」→「OpenAI APIキー」で設定(SecretStorage に保存)。
 - キー無しでもキーワード索引(BM25)は自動作成されます。意味検索(埋め込み)は「設定」→「索引」から有効化。
 
 ## 設定
@@ -117,10 +117,10 @@
 | quizSupport.embeddingModel     | text-embedding-3-small | 埋め込みモデル                                                                                                                                                                                               |
 | quizSupport.baseUrl            | OpenAI                 | OpenAI互換エンドポイント                                                                                                                                                                                     |
 | quizSupport.maxAgentSteps      | 8                      | 調査の最大ステップ                                                                                                                                                                                           |
-| quizSupport.minSimilarity      | –                      | ベクトルのみ一致の下限                                                                                                                                                                                       |
-| quizSupport.structureQuestions | –                      | LSP 構造クイズ                                                                                                                                                                                               |
-| quizSupport.autoEmbedMaxTokens | –                      | 自動埋め込みの上限                                                                                                                                                                                           |
-| quizSupport.maxFiles           | –                      | 索引対象の最大ファイル数                                                                                                                                                                                     |
+| quizSupport.minSimilarity      | 0.2                    | ベクトルのみ一致の下限                                                                                                                                                                                       |
+| quizSupport.structureQuestions | true                   | LSP 構造クイズ                                                                                                                                                                                               |
+| quizSupport.autoEmbedMaxTokens | 100000                 | 自動埋め込みの上限                                                                                                                                                                                           |
+| quizSupport.maxFiles           | 3000                   | 索引対象の最大ファイル数                                                                                                                                                                                     |
 | quizSupport.testMode           | false                  | テストモード。API 実行前に目的と入力トークン数を表示して確認し、使用量・内部の情報も表示する                                                                                                                 |
 | quizSupport.typeCheck          | true                   | 実装の手順で TypeScript の型検査を使う(tsconfig.json / jsconfig.json がワークスペース直下にあるとき。信頼済みのワークスペースはその TypeScript、それ以外は VS Code 同梱の TypeScript)                        |
 | quizSupport.testCommand        | (空)                   | 反映後に実行できるテストコマンド(例: `npm test`)                                                                                                                                                             |
