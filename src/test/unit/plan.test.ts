@@ -12,7 +12,7 @@ import { buildLesson, gradeItem, gradeQuestion, nextCheckQuestion, revealPayload
 import { OpenAiClient, estimateChatTokens, type ApiRequestInfo, type ApiUsageInfo } from "../../core/llm";
 import { applyRawEdit, VirtualWorkspace } from "../../core/overlay";
 import { matchingRules, parseProjectRules } from "../../core/patterns";
-import { ChangePlanner, newDiagnostics, orderSteps } from "../../core/planner";
+import { ChangePlanner, newDiagnostics, orderSteps, PlanError } from "../../core/planner";
 import type { PlanStep, RequirementSpec } from "../../core/planTypes";
 import { makeRng } from "../../core/text";
 import { parseGitLog } from "../../host/gitHistory";
@@ -796,4 +796,119 @@ test("変更計画: 起点の変更が既に呼び出し元も直していれば
   assert.equal(rewritten.resolvePrompts.length, 1);
   assert.match(rewritten.resolvePrompts[0]!, /src\/app\.ts:4\(handleSubmit の中\) — 計画内の別の変更で書き換わった行/);
   assert.match(rewritten.resolvePrompts[0]!, /L4\|\s+return true;/);
+});
+
+test("変更計画: 出力が途中で切れた・ステップが空でも、理由と今のコードを添えて作り直させて完成させる", async (t) => {
+  const prompts: string[] = [];
+  let calls = 0;
+  const good = {
+    id: "a1",
+    dependsOn: [],
+    requirements: [1],
+    label: "最低文字数を厳しくする",
+    kind: "core",
+    why: "",
+    contract: "外から見た約束は変わらない",
+    mechanical: false,
+    edits: [
+      {
+        path: "src/auth.ts",
+        create: false,
+        startLine: 2,
+        endLine: 2,
+        firstLine: '  return password.length > 3 && user !== "";',
+        lastLine: '  return password.length > 3 && user !== "";',
+        newCode: '  return password.length > 8 && user !== "";',
+      },
+    ],
+  };
+  const { ws, client } = await setup(t, (req) => {
+    const name = req.body.response_format?.json_schema?.name;
+    if (name !== "change_plan") {
+      throw new Error(`想定外: ${name}`);
+    }
+    calls++;
+    prompts.push(req.body.messages[req.body.messages.length - 1].content);
+    if (calls === 1) {
+      // 出力の上限で切れた JSON
+      return { json: { choices: [{ message: { role: "assistant", content: '{"steps":[{"id":"a1","label":"最低' }, finish_reason: "length" }] } };
+    }
+    if (calls === 2) {
+      return { json: msg(JSON.stringify({ steps: [] })) };
+    }
+    return { json: msg(JSON.stringify({ steps: [good] })) };
+  });
+  const inv = { query: "q", mode: "auto" as const, messages: [], evidence: { render: () => "", allText: () => "", paths: () => ["src/auth.ts"] } as any, notes: "", steps: 0 };
+  const plan = await new ChangePlanner({ llm: client, ws, config: { evidenceChars: 8000 } }).plan(inv, { query: "q", understanding: "", criteria: ["c"], contracts: [], answers: [] });
+  assert.equal(calls, 3);
+  assert.match(prompts[1]!, /出力が長すぎて途中で切れた/);
+  assert.match(prompts[1]!, /ステップは3つまで/);
+  assert.match(prompts[2]!, /steps が空でした/);
+  assert.equal(plan.steps.length, 1);
+  assert.match(plan.files[0]!.final, /length > 8/);
+});
+
+test("変更計画: 行を写し間違えたら、そのファイル全体を見せて作り直させる。3回とも作れなければ理由つきで失敗する", async (t) => {
+  const prompts: string[] = [];
+  const wrong = {
+    id: "a1",
+    dependsOn: [],
+    requirements: [1],
+    label: "判定を変える",
+    kind: "core",
+    why: "",
+    contract: "",
+    mechanical: false,
+    edits: [{ path: "src/auth.ts", create: false, startLine: 2, endLine: 2, firstLine: "  return isValid(password);", lastLine: "  return isValid(password);", newCode: "  return check(password);" }],
+  };
+  const { ws, client } = await setup(t, (req) => {
+    prompts.push(req.body.messages[req.body.messages.length - 1].content);
+    return { json: msg(JSON.stringify({ steps: [wrong] })) };
+  });
+  const inv = { query: "q", mode: "auto" as const, messages: [], evidence: { render: () => "", allText: () => "", paths: () => ["src/auth.ts"] } as any, notes: "", steps: 0 };
+  const planner = new ChangePlanner({ llm: client, ws, config: { evidenceChars: 8000 } });
+  await assert.rejects(planner.plan(inv, { query: "q", understanding: "", criteria: ["c"], contracts: [], answers: [] }), (error: unknown) => {
+    assert.ok(error instanceof PlanError);
+    assert.match(error.message, /要件を満たす変更計画を作れませんでした/);
+    assert.match(error.message, /範囲を特定できません/, "なぜ作れなかったのかを示す");
+    return true;
+  });
+  assert.equal(prompts.length, 3, "初回 + 作り直し2回");
+  assert.match(prompts[1]!, /L1\| export function login/, "短いファイルは全体を見せる");
+  assert.match(prompts[1]!, /L5\| export function logout/);
+});
+
+test("編集の適用: 絶対パス・先頭の / を受け付け、firstLine に変更後の行を写していても境界の行から範囲を見つける", async () => {
+  const root = await makeTempDir();
+  await writeFiles(root, { "src/auth.ts": AUTH });
+  const vws = new VirtualWorkspace(new NodeWorkspace(root));
+  const abs = await applyRawEdit(vws, {
+    path: path.join(root, "src", "auth.ts"),
+    create: false,
+    startLine: 9, // 大きくずれている
+    endLine: 11,
+    // 変更後の行を写してしまった
+    firstLine: "export function login(user: string, password: string, min: number): boolean {",
+    lastLine: "}",
+    newCode: [
+      "export function login(user: string, password: string): boolean {",
+      '  return password.length > 8 && user !== "";',
+      "}",
+    ].join("\n"),
+  });
+  assert.ok(abs.ok, abs.ok ? "" : abs.reason);
+  assert.equal(abs.edit.path, "src/auth.ts");
+  assert.equal(abs.edit.startLine, 1);
+  assert.match(await vws.readText("src/auth.ts"), /length > 8/);
+  const slash = await applyRawEdit(vws, {
+    path: "/src/auth.ts",
+    create: false,
+    startLine: 6,
+    endLine: 6,
+    firstLine: '  console.log("bye", user);',
+    lastLine: '  console.log("bye", user);',
+    newCode: '  console.info("bye", user);',
+  });
+  assert.ok(slash.ok);
+  assert.equal((await applyRawEdit(vws, { path: "C:/other/x.ts", create: true, startLine: 1, endLine: 1, firstLine: "", lastLine: "", newCode: "x" })).ok, false, "ワークスペースの外は拒否");
 });

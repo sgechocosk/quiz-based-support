@@ -1,7 +1,7 @@
 import { lineMapper, type LineMapper } from "./diff";
 import type { FileInfo, SyntaxChecker, WorkspacePort } from "./ports";
 import { cleanCodeLines, isSameCode, locateRange } from "./quiz";
-import { detectEol, splitLines } from "./text";
+import { detectEol, splitLines, toPosix } from "./text";
 import { normalizeRelPath } from "./tools";
 
 /**
@@ -155,11 +155,33 @@ export type EditResult = { ok: true; edit: PlanEdit } | { ok: false; reason: str
 const MAX_EDIT_GROWTH = 80;
 
 /**
+ * LLM が書いたパスをワークスペース相対にする。
+ * 絶対パス(ワークスペースの中)・先頭の "/"・バックスラッシュも受け付ける。ワークスペースの外は undefined。
+ */
+export function toWorkspacePath(input: string, root: string): string | undefined {
+  const p = toPosix(String(input ?? "")).trim();
+  const r = toPosix(root ?? "").replace(/\/+$/, "");
+  if (r && p.toLowerCase().startsWith(`${r.toLowerCase()}/`)) {
+    return normalizeRelPath(p.slice(r.length + 1));
+  }
+  if (/^[A-Za-z]:/.test(p)) {
+    return undefined;
+  }
+  return normalizeRelPath(p.replace(/^\/+/, ""));
+}
+
+/** 範囲を探す手がかりにできる行か(空白を除いて10文字以上あり、ファイル内で1か所だけ) */
+function isUniqueAnchor(lines: string[], anchor: string): boolean {
+  const a = anchor.replace(/\s+/g, "");
+  return a.length >= 10 && lines.filter((l) => l.replace(/\s+/g, "") === a).length === 1;
+}
+
+/**
  * 編集を仮想ワークスペースに適用する。範囲は firstLine/lastLine の逐語一致で探し直す(行番号のずれを吸収)。
  * 適用前は構文として正しかったファイルが、適用後に構文エラーになる編集は拒否する。
  */
 export async function applyRawEdit(vws: VirtualWorkspace, raw: RawEdit, syntax?: SyntaxChecker): Promise<EditResult> {
-  const path = normalizeRelPath(raw?.path ?? "");
+  const path = toWorkspacePath(raw?.path ?? "", vws.id);
   if (!path) {
     return { ok: false, reason: `${raw?.path} はワークスペース相対パスではありません` };
   }
@@ -192,7 +214,21 @@ export async function applyRawEdit(vws: VirtualWorkspace, raw: RawEdit, syntax?:
     return { ok: false, reason: `${label} を読めません(存在しないか、対象外のファイルです)。新しく作るなら create を true にしてください` };
   }
   const lines = splitLines(fileText);
-  const range = locateRange(lines, Number(raw.startLine) || 1, Number(raw.endLine) || 1, raw.firstLine ?? "", raw.lastLine ?? "");
+  let start = Number(raw.startLine) || 1;
+  let end = Number(raw.endLine) || start;
+  if (end < start) {
+    [start, end] = [end, start];
+  }
+  let range = locateRange(lines, start, end, raw.firstLine ?? "", raw.lastLine ?? "");
+  if (!range && newLines.length > 0) {
+    // firstLine に変更後の行を写してしまうことがある。変更後のコードの先頭・末尾(変えていない境界の行)が
+    // ファイル内で一意に見つかるなら、それを手がかりに範囲を決める
+    const first = newLines[0]!;
+    const last = newLines[newLines.length - 1]!;
+    if (isUniqueAnchor(lines, first)) {
+      range = locateRange(lines, start, end, first, isUniqueAnchor(lines, last) ? last : (raw.lastLine ?? ""));
+    }
+  }
   if (!range) {
     const actual = lines[(Number(raw.startLine) || 1) - 1];
     return {

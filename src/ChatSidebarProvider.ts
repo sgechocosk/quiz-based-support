@@ -5,6 +5,7 @@ import {
   answersFrom,
   detectIntent,
   QuizAgent,
+  requirementText,
   requiresChange,
   type AgentResult,
   type Clarification,
@@ -25,18 +26,41 @@ import {
   stepPayload,
   type Lesson,
 } from "./core/lesson";
-import { coerceLevel, LEARNER_LEVELS, LEVEL_DESCRIPTION, LEVEL_LABEL } from "./core/level";
-import { LearnerLog, type BlankResult, type ReviewCard } from "./core/learnerLog";
-import { LlmError, OpenAiClient, type ApiRequestInfo, type ApiUsageInfo } from "./core/llm";
-import { parseProjectRules, PROJECT_RULES_PATH, type ProjectRule } from "./core/patterns";
-import { ChangePlanner } from "./core/planner";
+import {
+  coerceLevel,
+  LEARNER_LEVELS,
+  LEVEL_DESCRIPTION,
+  LEVEL_LABEL,
+} from "./core/level";
+import {
+  LearnerLog,
+  type BlankResult,
+  type ReviewCard,
+} from "./core/learnerLog";
+import {
+  LlmError,
+  OpenAiClient,
+  type ApiRequestInfo,
+  type ApiUsageInfo,
+} from "./core/llm";
+import {
+  parseProjectRules,
+  PROJECT_RULES_PATH,
+  type ProjectRule,
+} from "./core/patterns";
+import { ChangePlanner, PlanError } from "./core/planner";
 import type { RequirementSpec } from "./core/planTypes";
 import type { KeyValueStore, TypeChecker } from "./core/ports";
 import { buildStructureQuestions } from "./core/questions";
 import { applyItemToText, compactDiff, resolveBlanks } from "./core/quiz";
 import { makeRng, sha1, splitLines } from "./core/text";
 import type { Choice, McqQuestion, QuizItem } from "./core/types";
-import { applyPlanFiles, changedSince, runTestCommand, savePlanFiles } from "./host/applier";
+import {
+  applyPlanFiles,
+  changedSince,
+  runTestCommand,
+  savePlanFiles,
+} from "./host/applier";
 import { GitHistory } from "./host/gitHistory";
 import { TreeSitterProvider } from "./host/parser";
 import { loadTypeScript, TsTypeChecker } from "./host/typeChecker";
@@ -82,7 +106,7 @@ interface LessonSession {
 function readConfig() {
   const c = vscode.workspace.getConfiguration("quizSupport");
   return {
-    model: c.get<string>("model", "gpt-5-mini"),
+    model: c.get<string>("model", "gpt-6-luna"),
     embeddingModel: c.get<string>("embeddingModel", "text-embedding-3-small"),
     reasoningEffort: c.get<string>("reasoningEffort", "auto"),
     baseUrl: c.get<string>("baseUrl", "https://api.openai.com/v1"),
@@ -113,7 +137,9 @@ function errorMessage(error: unknown, fallback: string): string {
   return error instanceof Error ? error.message : fallback;
 }
 
-export class ChatSidebarProvider implements vscode.WebviewViewProvider, vscode.Disposable {
+export class ChatSidebarProvider
+  implements vscode.WebviewViewProvider, vscode.Disposable
+{
   private view?: vscode.WebviewView;
   private services?: Services;
   private servicesPromise?: Promise<Services | undefined>;
@@ -125,7 +151,13 @@ export class ChatSidebarProvider implements vscode.WebviewViewProvider, vscode.D
   private readonly lessons = new Map<string, LessonSession>();
   private pendingPlan?: SyncPlan;
   /** 回答待ちの要件確認(最新の1件だけ。新しい質問をすると無効になる) */
-  private pendingClarify?: { id: string; query: string; inv: Investigation; clarification: Clarification; spec: RequirementSpec };
+  private pendingClarify?: {
+    id: string;
+    query: string;
+    inv: Investigation;
+    clarification: Clarification;
+    spec: RequirementSpec;
+  };
   /** API 実行前の確認で「この処理では以降確認しない」が選ばれた(処理の始めに戻す) */
   private approveRest = false;
   /** 1つの処理での API 使用量(処理の終わりに表示する) */
@@ -141,7 +173,8 @@ export class ChatSidebarProvider implements vscode.WebviewViewProvider, vscode.D
   constructor(private readonly context: vscode.ExtensionContext) {
     this.parser = new TreeSitterProvider(context.extensionUri.fsPath);
     this.client = new OpenAiClient({
-      apiKey: async () => this.apiKey ?? (await context.secrets.get(SECRET_KEY)),
+      apiKey: async () =>
+        this.apiKey ?? (await context.secrets.get(SECRET_KEY)),
       baseUrl: () => readConfig().baseUrl,
       model: () => readConfig().model,
       embeddingModel: () => readConfig().embeddingModel,
@@ -185,7 +218,10 @@ export class ChatSidebarProvider implements vscode.WebviewViewProvider, vscode.D
   resolveWebviewView(webviewView: vscode.WebviewView): void {
     this.view = webviewView;
     const mediaRoot = vscode.Uri.joinPath(this.context.extensionUri, "media");
-    webviewView.webview.options = { enableScripts: true, localResourceRoots: [mediaRoot] };
+    webviewView.webview.options = {
+      enableScripts: true,
+      localResourceRoots: [mediaRoot],
+    };
     webviewView.webview.html = this.html(webviewView.webview, mediaRoot);
     webviewView.webview.onDidReceiveMessage((message: unknown) => {
       void this.onMessage(message);
@@ -195,7 +231,9 @@ export class ChatSidebarProvider implements vscode.WebviewViewProvider, vscode.D
 
   private html(webview: vscode.Webview, mediaRoot: vscode.Uri): string {
     const nonce = crypto.randomBytes(16).toString("base64");
-    const css = webview.asWebviewUri(vscode.Uri.joinPath(mediaRoot, "main.css"));
+    const css = webview.asWebviewUri(
+      vscode.Uri.joinPath(mediaRoot, "main.css"),
+    );
     const js = webview.asWebviewUri(vscode.Uri.joinPath(mediaRoot, "main.js"));
     const csp = [
       "default-src 'none'",
@@ -289,7 +327,11 @@ export class ChatSidebarProvider implements vscode.WebviewViewProvider, vscode.D
     }
     const ws = new VscodeWorkspace(folder);
     await ws.refreshIgnore();
-    const dir = path.join(this.context.globalStorageUri.fsPath, "index-v2", sha1(ws.id).slice(0, 12));
+    const dir = path.join(
+      this.context.globalStorageUri.fsPath,
+      "index-v2",
+      sha1(ws.id).slice(0, 12),
+    );
     const index = new IndexManager({
       dir,
       workspace: ws,
@@ -300,7 +342,9 @@ export class ChatSidebarProvider implements vscode.WebviewViewProvider, vscode.D
     });
     await index.load();
 
-    const watcher = vscode.workspace.createFileSystemWatcher(new vscode.RelativePattern(folder, "**/*"));
+    const watcher = vscode.workspace.createFileSystemWatcher(
+      new vscode.RelativePattern(folder, "**/*"),
+    );
     const mark = (uri: vscode.Uri, deleted: boolean): void => {
       const rel = ws.relativeOf(uri);
       if (!rel) {
@@ -357,7 +401,10 @@ export class ChatSidebarProvider implements vscode.WebviewViewProvider, vscode.D
         return;
       }
       if (first) {
-        this.status("コードを解析しています(初回のみ・APIは使いません)...", true);
+        this.status(
+          "コードを解析しています(初回のみ・APIは使いません)...",
+          true,
+        );
       }
       const plan = await services.index.prepare(paths);
       if (plan.updates.size === 0) {
@@ -366,12 +413,17 @@ export class ChatSidebarProvider implements vscode.WebviewViewProvider, vscode.D
       const cfg = readConfig();
       const wantEmbed = services.index.isSemanticEnabled() && !!this.apiKey;
       // API 実行前の確認がオンのときは、裏で勝手に API を呼ばない(「インデックス」から確認して更新する)
-      const embed = wantEmbed && !cfg.confirmApiCalls && plan.pendingTokens <= cfg.autoEmbedMaxTokens;
+      const embed =
+        wantEmbed &&
+        !cfg.confirmApiCalls &&
+        plan.pendingTokens <= cfg.autoEmbedMaxTokens;
       await services.index.commit(plan, { embed });
       if (wantEmbed && !embed && plan.pendingEmbeds.length > 0) {
         this.status(
           `セマンティック検索に未反映の差分が約${plan.pendingTokens.toLocaleString()}トークンあります。「インデックス」から更新できます。` +
-            (cfg.confirmApiCalls ? "(API実行前の確認がオンのため、自動では更新しません)" : ""),
+            (cfg.confirmApiCalls
+              ? "(API実行前の確認がオンのため、自動では更新しません)"
+              : ""),
         );
       }
     } catch (error) {
@@ -390,7 +442,11 @@ export class ChatSidebarProvider implements vscode.WebviewViewProvider, vscode.D
       hasWorkspace: !!vscode.workspace.workspaceFolders?.[0],
       level: readConfig().level,
       levelChosen: this.levelChosen(),
-      levels: LEARNER_LEVELS.map((id) => ({ id, label: LEVEL_LABEL[id], description: LEVEL_DESCRIPTION[id] })),
+      levels: LEARNER_LEVELS.map((id) => ({
+        id,
+        label: LEVEL_LABEL[id],
+        description: LEVEL_DESCRIPTION[id],
+      })),
       busy: this.busy,
       index: stats,
       learning: this.log.summary(),
@@ -400,8 +456,14 @@ export class ChatSidebarProvider implements vscode.WebviewViewProvider, vscode.D
 
   /** 利用者が学習レベルを一度でも選んだか(未選択なら初回に選んでもらう) */
   private levelChosen(): boolean {
-    const i = vscode.workspace.getConfiguration("quizSupport").inspect<string>("learnerLevel");
-    return i?.globalValue !== undefined || i?.workspaceValue !== undefined || i?.workspaceFolderValue !== undefined;
+    const i = vscode.workspace
+      .getConfiguration("quizSupport")
+      .inspect<string>("learnerLevel");
+    return (
+      i?.globalValue !== undefined ||
+      i?.workspaceValue !== undefined ||
+      i?.workspaceFolderValue !== undefined
+    );
   }
 
   // ---------- メッセージ処理 ----------
@@ -440,7 +502,11 @@ export class ChatSidebarProvider implements vscode.WebviewViewProvider, vscode.D
         case "setConfirmApi":
           await vscode.workspace
             .getConfiguration("quizSupport")
-            .update("confirmApiCalls", m.value === true, vscode.ConfigurationTarget.Global);
+            .update(
+              "confirmApiCalls",
+              m.value === true,
+              vscode.ConfigurationTarget.Global,
+            );
           await this.pushState();
           break;
         case "cancel":
@@ -453,7 +519,11 @@ export class ChatSidebarProvider implements vscode.WebviewViewProvider, vscode.D
           await this.handleApply(String(m.quizId ?? ""), Number(m.itemIndex));
           break;
         case "open":
-          await this.handleOpen(String(m.path ?? ""), Number(m.line) || 1, typeof m.text === "string" ? m.text : undefined);
+          await this.handleOpen(
+            String(m.path ?? ""),
+            Number(m.line) || 1,
+            typeof m.text === "string" ? m.text : undefined,
+          );
           break;
         case "planIndex":
           await this.handlePlan();
@@ -470,7 +540,11 @@ export class ChatSidebarProvider implements vscode.WebviewViewProvider, vscode.D
         case "setLevel":
           await vscode.workspace
             .getConfiguration("quizSupport")
-            .update("learnerLevel", coerceLevel(m.level), vscode.ConfigurationTarget.Global);
+            .update(
+              "learnerLevel",
+              coerceLevel(m.level),
+              vscode.ConfigurationTarget.Global,
+            );
           await this.pushState();
           break;
         case "resetLog":
@@ -506,7 +580,11 @@ export class ChatSidebarProvider implements vscode.WebviewViewProvider, vscode.D
       const inv = await agent.investigate(text, mode, hooks);
       if (!requiresChange(mode, detectIntent(text))) {
         // 仕組みの質問: 読解のクイズ
-        await this.presentQuiz(services, await agent.compose(inv, [], hooks), text);
+        await this.presentQuiz(
+          services,
+          await agent.compose(inv, [], hooks),
+          text,
+        );
         return;
       }
       // 実装・修正の依頼: 要件を整理し、大きい・案が複数あるなら先に質問する(調査結果は回答後の計画に使う)
@@ -517,7 +595,7 @@ export class ChatSidebarProvider implements vscode.WebviewViewProvider, vscode.D
         this.post({ type: "clarify", id, clarification });
         return;
       }
-      await this.presentLesson(services, inv, spec, text, hooks);
+      await this.presentLesson(services, agent, inv, spec, text, hooks);
     });
   }
 
@@ -525,7 +603,10 @@ export class ChatSidebarProvider implements vscode.WebviewViewProvider, vscode.D
   private async handleClarifyAnswer(m: Record<string, any>): Promise<void> {
     const pending = this.pendingClarify;
     if (!pending || pending.id !== String(m.id ?? "")) {
-      this.fail(new Error("この確認は失効しました。もう一度質問してください。"), "");
+      this.fail(
+        new Error("この確認は失効しました。もう一度質問してください。"),
+        "",
+      );
       return;
     }
     const services = await this.readyServices();
@@ -534,7 +615,10 @@ export class ChatSidebarProvider implements vscode.WebviewViewProvider, vscode.D
     }
     this.pendingClarify = undefined;
     const picks = Array.isArray(m.answers)
-      ? m.answers.map((a: any) => ({ option: Number.isInteger(a?.option) ? Number(a.option) : undefined, text: String(a?.text ?? "") }))
+      ? m.answers.map((a: any) => ({
+          option: Number.isInteger(a?.option) ? Number(a.option) : undefined,
+          text: String(a?.text ?? ""),
+        }))
       : [];
     const answers = m.skip ? [] : answersFrom(pending.clarification, picks);
     await this.withAgent(services, async (agent, hooks) => {
@@ -542,9 +626,21 @@ export class ChatSidebarProvider implements vscode.WebviewViewProvider, vscode.D
       if (answers.length > 0) {
         // 選んだ案に関係するコードを調べてから、受け入れ条件を確定する
         await agent.followUp(pending.inv, answers, hooks);
-        spec = await agent.finalizeSpec(pending.inv, pending.spec, answers, hooks);
+        spec = await agent.finalizeSpec(
+          pending.inv,
+          pending.spec,
+          answers,
+          hooks,
+        );
       }
-      await this.presentLesson(services, pending.inv, spec, pending.query, hooks);
+      await this.presentLesson(
+        services,
+        agent,
+        pending.inv,
+        spec,
+        pending.query,
+        hooks,
+      );
     });
   }
 
@@ -557,7 +653,11 @@ export class ChatSidebarProvider implements vscode.WebviewViewProvider, vscode.D
     }
     if (services.typeChecker === undefined) {
       const root = services.ws.folder.uri.fsPath;
-      const ts = loadTypeScript(root, vscode.env.appRoot, vscode.workspace.isTrusted);
+      const ts = loadTypeScript(
+        root,
+        vscode.env.appRoot,
+        vscode.workspace.isTrusted,
+      );
       services.typeChecker = ts ? new TsTypeChecker(ts, root) : null;
     }
     return services.typeChecker ?? undefined;
@@ -578,7 +678,40 @@ export class ChatSidebarProvider implements vscode.WebviewViewProvider, vscode.D
     return rules;
   }
 
-  private async presentLesson(services: Services, inv: Investigation, spec: RequirementSpec, query: string, hooks: RunHooks): Promise<void> {
+  private async presentLesson(
+    services: Services,
+    agent: QuizAgent,
+    inv: Investigation,
+    spec: RequirementSpec,
+    query: string,
+    hooks: RunHooks,
+  ): Promise<void> {
+    let lesson: Lesson;
+    try {
+      lesson = await this.buildPlanLesson(services, inv, spec, hooks);
+    } catch (error) {
+      if (hooks.signal?.aborted || !(error instanceof PlanError)) {
+        throw error;
+      }
+      // 変更計画を作れなくても止めない: 理由を示して、調査済みのコードから実装のクイズを作る
+      this.status(`⚠ ${error.message}\n実装の手順の代わりに、実装のクイズで出題します。`);
+      await this.presentQuiz(
+        services,
+        await agent.composeQuiz(inv, requirementText(inv.query, spec.answers), hooks),
+        query,
+      );
+      return;
+    }
+    this.showLesson(lesson, query);
+  }
+
+  /** 変更計画を作り、手順(ステップごとの問題)にする */
+  private async buildPlanLesson(
+    services: Services,
+    inv: Investigation,
+    spec: RequirementSpec,
+    hooks: RunHooks,
+  ): Promise<Lesson> {
     const cfg = readConfig();
     if (vscode.workspace.isTrusted) {
       services.history ??= new GitHistory(services.ws.folder.uri.fsPath);
@@ -596,9 +729,20 @@ export class ChatSidebarProvider implements vscode.WebviewViewProvider, vscode.D
     const plan = await planner.plan(inv, spec, hooks);
     const lesson = await buildLesson(
       plan,
-      { llm: this.client, ws: services.ws, level: cfg.level, evidence: inv.evidence, evidenceChars: 16_000 },
+      {
+        llm: this.client,
+        ws: services.ws,
+        level: cfg.level,
+        evidence: inv.evidence,
+        evidenceChars: 16_000,
+      },
       hooks,
     );
+    return lesson;
+  }
+
+  private showLesson(lesson: Lesson, query: string): void {
+    const { plan } = lesson;
     const session: LessonSession = {
       id: crypto.randomUUID(),
       query,
@@ -617,7 +761,10 @@ export class ChatSidebarProvider implements vscode.WebviewViewProvider, vscode.D
         goal: lesson.goal,
         understanding: plan.spec.understanding,
         criteria: plan.spec.criteria,
-        steps: lesson.steps.map((ls) => ({ number: ls.step.number, label: ls.display.label })),
+        steps: lesson.steps.map((ls) => ({
+          number: ls.step.number,
+          label: ls.display.label,
+        })),
         step: stepPayload(lesson, 0),
       },
     });
@@ -630,7 +777,10 @@ export class ChatSidebarProvider implements vscode.WebviewViewProvider, vscode.D
   private async handleLessonAnswer(m: Record<string, any>): Promise<void> {
     const session = this.lessons.get(String(m.lessonId ?? ""));
     if (!session) {
-      this.fail(new Error("この手順は失効しました。もう一度依頼してください。"), "");
+      this.fail(
+        new Error("この手順は失効しました。もう一度依頼してください。"),
+        "",
+      );
       return;
     }
     const index = Number(m.index);
@@ -640,7 +790,9 @@ export class ChatSidebarProvider implements vscode.WebviewViewProvider, vscode.D
     const ls = session.lesson.steps[index]!;
     const picks: number[] = Array.isArray(m.blanks) ? m.blanks.map(Number) : [];
     const hints: number[] = Array.isArray(m.hints) ? m.hints.map(Number) : [];
-    const chosen: number[] = Array.isArray(m.choices) ? m.choices.map(Number) : [];
+    const chosen: number[] = Array.isArray(m.choices)
+      ? m.choices.map(Number)
+      : [];
 
     let grades: unknown[] = [];
     if (ls.item) {
@@ -657,7 +809,9 @@ export class ChatSidebarProvider implements vscode.WebviewViewProvider, vscode.D
       if (question.correct) {
         session.score.correct++;
       }
-      await this.log.recordConceptOnly([{ concept: ls.question.concept, correct: question.correct }]);
+      await this.log.recordConceptOnly([
+        { concept: ls.question.concept, correct: question.correct },
+      ]);
     }
     session.current++;
     const hasNext = session.current < session.lesson.steps.length;
@@ -667,11 +821,20 @@ export class ChatSidebarProvider implements vscode.WebviewViewProvider, vscode.D
       type: "lessonStep",
       lessonId: session.id,
       index,
-      result: { grades, question, reveal: revealPayload(session.lesson, index) },
+      result: {
+        grades,
+        question,
+        reveal: revealPayload(session.lesson, index),
+      },
       next: hasNext ? stepPayload(session.lesson, session.current) : undefined,
       final: hasNext
         ? undefined
-        : { ...finalPayload(session.lesson), score: session.score, canTest: !!cfg.testCommand, testCommand: cfg.testCommand },
+        : {
+            ...finalPayload(session.lesson),
+            score: session.score,
+            canTest: !!cfg.testCommand,
+            testCommand: cfg.testCommand,
+          },
     });
     await this.pushState();
   }
@@ -681,7 +844,10 @@ export class ChatSidebarProvider implements vscode.WebviewViewProvider, vscode.D
     const session = this.lessons.get(lessonId);
     const services = this.services;
     if (!session || !services) {
-      this.fail(new Error("反映対象が見つかりません(手順が失効した可能性があります)。"), "");
+      this.fail(
+        new Error("反映対象が見つかりません(手順が失効した可能性があります)。"),
+        "",
+      );
       return;
     }
     if (!session.finished) {
@@ -696,7 +862,9 @@ export class ChatSidebarProvider implements vscode.WebviewViewProvider, vscode.D
     const moved = await changedSince(services.ws, plan.files, "original");
     if (moved.length > 0) {
       this.fail(
-        new Error(`計画を作ったあとに次のファイルが変更されたため、反映を中止しました: ${moved.join(", ")}\nもう一度依頼すると、今の内容で計画し直します。`),
+        new Error(
+          `計画を作ったあとに次のファイルが変更されたため、反映を中止しました: ${moved.join(", ")}\nもう一度依頼すると、今の内容で計画し直します。`,
+        ),
         "",
       );
       return;
@@ -704,11 +872,19 @@ export class ChatSidebarProvider implements vscode.WebviewViewProvider, vscode.D
     const created = plan.files.filter((f) => f.original === null).length;
     const notes = [
       `${plan.files.length}ファイルを変更します${created > 0 ? `(うち新規作成 ${created})` : ""}: ${plan.files.map((f) => f.path).join(", ")}`,
-      plan.typecheck.remaining.length > 0 ? `⚠ 解消できなかった型エラーが${plan.typecheck.remaining.length}件あります。` : "",
-      plan.obligations.some((o) => o.status !== "done") ? "⚠ 判断しきれなかった確認事項があります(まとめを確認してください)。" : "",
+      plan.typecheck.remaining.length > 0
+        ? `⚠ 解消できなかった型エラーが${plan.typecheck.remaining.length}件あります。`
+        : "",
+      plan.obligations.some((o) => o.status !== "done")
+        ? "⚠ 判断しきれなかった確認事項があります(まとめを確認してください)。"
+        : "",
       "反映後は「反映を取り消す」で元に戻せます(各ファイルの元に戻す操作でも戻せます)。",
     ].filter(Boolean);
-    const choice = await vscode.window.showWarningMessage("実装の手順をファイルに反映します。", { modal: true, detail: notes.join("\n") }, "反映する");
+    const choice = await vscode.window.showWarningMessage(
+      "実装の手順をファイルに反映します。",
+      { modal: true, detail: notes.join("\n") },
+      "反映する",
+    );
     if (choice !== "反映する") {
       return;
     }
@@ -718,10 +894,18 @@ export class ChatSidebarProvider implements vscode.WebviewViewProvider, vscode.D
     session.applied = true;
     const first = plan.files.find((f) => f.original !== null) ?? plan.files[0];
     if (first) {
-      await vscode.window.showTextDocument(services.ws.uriOf(first.path), { preview: false });
+      await vscode.window.showTextDocument(services.ws.uriOf(first.path), {
+        preview: false,
+      });
     }
-    this.post({ type: "lessonApplied", lessonId, canTest: !!readConfig().testCommand });
-    this.status(`✅ ${plan.files.length}ファイルに反映しました(保存はまだしていません)。`);
+    this.post({
+      type: "lessonApplied",
+      lessonId,
+      canTest: !!readConfig().testCommand,
+    });
+    this.status(
+      `✅ ${plan.files.length}ファイルに反映しました(保存はまだしていません)。`,
+    );
   }
 
   private async handleLessonRevert(lessonId: string): Promise<void> {
@@ -734,7 +918,9 @@ export class ChatSidebarProvider implements vscode.WebviewViewProvider, vscode.D
     const moved = await changedSince(services.ws, plan.files, "final");
     if (moved.length > 0) {
       this.fail(
-        new Error(`反映したあとに次のファイルが編集されたため、自動では取り消せません: ${moved.join(", ")}\n各ファイルで元に戻す操作をしてください。`),
+        new Error(
+          `反映したあとに次のファイルが編集されたため、自動では取り消せません: ${moved.join(", ")}\n各ファイルで元に戻す操作をしてください。`,
+        ),
         "",
       );
       return;
@@ -760,12 +946,20 @@ export class ChatSidebarProvider implements vscode.WebviewViewProvider, vscode.D
       return;
     }
     if (!vscode.workspace.isTrusted) {
-      this.fail(new Error("信頼されていないワークスペースでは、テストコマンドを実行しません。"), "");
+      this.fail(
+        new Error(
+          "信頼されていないワークスペースでは、テストコマンドを実行しません。",
+        ),
+        "",
+      );
       return;
     }
     const choice = await vscode.window.showWarningMessage(
       `テストを実行します: ${command}`,
-      { modal: true, detail: `反映したファイルを保存してから、${services.ws.folder.uri.fsPath} で実行します。` },
+      {
+        modal: true,
+        detail: `反映したファイルを保存してから、${services.ws.folder.uri.fsPath} で実行します。`,
+      },
       "保存して実行",
     );
     if (choice !== "保存して実行") {
@@ -777,8 +971,19 @@ export class ChatSidebarProvider implements vscode.WebviewViewProvider, vscode.D
     await this.pushState();
     try {
       this.status(`テストを実行中: ${command}`, true);
-      const result = await runTestCommand(command, services.ws.folder.uri.fsPath, this.abort.signal);
-      this.post({ type: "lessonTest", lessonId, ok: result.ok, code: result.code, output: result.output, command });
+      const result = await runTestCommand(
+        command,
+        services.ws.folder.uri.fsPath,
+        this.abort.signal,
+      );
+      this.post({
+        type: "lessonTest",
+        lessonId,
+        ok: result.ok,
+        code: result.code,
+        output: result.output,
+        command,
+      });
     } finally {
       this.busy = false;
       this.abort = undefined;
@@ -833,8 +1038,13 @@ export class ChatSidebarProvider implements vscode.WebviewViewProvider, vscode.D
     if (u.calls === 0) {
       return;
     }
-    const input = u.actual > 0 ? `${u.actual.toLocaleString()}(実測)` : `約${u.estimated.toLocaleString()}(見積もり)`;
-    this.status(`API 使用量: ${u.calls}回 / 入力 ${input}${u.output > 0 ? ` / 出力 ${u.output.toLocaleString()}` : ""} トークン`);
+    const input =
+      u.actual > 0
+        ? `${u.actual.toLocaleString()}(実測)`
+        : `約${u.estimated.toLocaleString()}(見積もり)`;
+    this.status(
+      `API 使用量: ${u.calls}回 / 入力 ${input}${u.output > 0 ? ` / 出力 ${u.output.toLocaleString()}` : ""} トークン`,
+    );
   }
 
   /** 出題を始められる状態か確かめる(できなければ理由を表示して undefined) */
@@ -844,7 +1054,12 @@ export class ChatSidebarProvider implements vscode.WebviewViewProvider, vscode.D
       return undefined;
     }
     if (!this.apiKey) {
-      this.fail(new Error("OpenAI APIキーが未設定です。「APIキー」から設定してください。"), "");
+      this.fail(
+        new Error(
+          "OpenAI APIキーが未設定です。「APIキー」から設定してください。",
+        ),
+        "",
+      );
       return undefined;
     }
     const services = await this.ensureServices();
@@ -855,7 +1070,10 @@ export class ChatSidebarProvider implements vscode.WebviewViewProvider, vscode.D
   }
 
   /** 処理中の表示・中止ボタンを有効にして、エージェントを使う処理を行う。 */
-  private async withAgent(services: Services, work: (agent: QuizAgent, hooks: RunHooks) => Promise<void>): Promise<void> {
+  private async withAgent(
+    services: Services,
+    work: (agent: QuizAgent, hooks: RunHooks) => Promise<void>,
+  ): Promise<void> {
     const cfg = readConfig();
     this.busy = true;
     this.abort = new AbortController();
@@ -876,7 +1094,10 @@ export class ChatSidebarProvider implements vscode.WebviewViewProvider, vscode.D
           level: cfg.level,
         },
       });
-      await work(agent, { onStatus: (s) => this.status(s, true), signal: this.abort.signal });
+      await work(agent, {
+        onStatus: (s) => this.status(s, true),
+        signal: this.abort.signal,
+      });
     } finally {
       this.busy = false;
       this.abort = undefined;
@@ -885,13 +1106,21 @@ export class ChatSidebarProvider implements vscode.WebviewViewProvider, vscode.D
     }
   }
 
-  private async presentQuiz(services: Services, result: AgentResult, query: string): Promise<void> {
+  private async presentQuiz(
+    services: Services,
+    result: AgentResult,
+    query: string,
+  ): Promise<void> {
     let questions: McqQuestion[] = [];
     const first = result.quiz.items[0];
     if (readConfig().structureQuestions && first) {
       this.status("構造クイズ(呼び出し関係)を作成中...", true);
       questions = (
-        await buildStructureQuestions({ ws: services.ws, lsp: services.lsp }, first, makeRng(Date.now()))
+        await buildStructureQuestions(
+          { ws: services.ws, lsp: services.lsp },
+          first,
+          makeRng(Date.now()),
+        )
       ).slice(0, 2);
     }
 
@@ -904,16 +1133,25 @@ export class ChatSidebarProvider implements vscode.WebviewViewProvider, vscode.D
       graded: false,
     };
     this.sessions.set(session.id, session);
-    this.post({ type: "quiz", quiz: this.payloadOf(session, query, result.quiz.goal) });
+    this.post({
+      type: "quiz",
+      quiz: this.payloadOf(session, query, result.quiz.goal),
+    });
     if (result.quiz.notice) {
       this.status(`⚠ ${result.quiz.notice}`);
     }
     if (result.quiz.rejected.length > 0) {
-      this.status(`検証で不合格だった${result.quiz.rejected.length}件は作り直し、直らなかったものは除外しました。`);
+      this.status(
+        `検証で不合格だった${result.quiz.rejected.length}件は作り直し、直らなかったものは除外しました。`,
+      );
     }
   }
 
-  private payloadOf(session: QuizSession, query: string, goal: string): Record<string, unknown> {
+  private payloadOf(
+    session: QuizSession,
+    query: string,
+    goal: string,
+  ): Record<string, unknown> {
     return {
       id: session.id,
       query,
@@ -934,16 +1172,25 @@ export class ChatSidebarProvider implements vscode.WebviewViewProvider, vscode.D
   private async handleGrade(m: Record<string, any>): Promise<void> {
     const session = this.sessions.get(String(m.quizId ?? ""));
     if (!session) {
-      this.fail(new Error("このクイズは失効しました。もう一度質問してください。"), "");
+      this.fail(
+        new Error("このクイズは失効しました。もう一度質問してください。"),
+        "",
+      );
       return;
     }
     if (session.graded) {
       return;
     }
     // 空欄ごとに選んだ選択肢の番号(未選択は -1)
-    const picked: number[][] = Array.isArray(m.blanks) ? m.blanks.map((a: unknown) => (Array.isArray(a) ? a.map(Number) : [])) : [];
-    const hints: number[][] = Array.isArray(m.hints) ? m.hints.map((a: unknown) => (Array.isArray(a) ? a.map(Number) : [])) : [];
-    const choices: number[][] = Array.isArray(m.choices) ? m.choices.map((a: unknown) => (Array.isArray(a) ? a.map(Number) : [])) : [];
+    const picked: number[][] = Array.isArray(m.blanks)
+      ? m.blanks.map((a: unknown) => (Array.isArray(a) ? a.map(Number) : []))
+      : [];
+    const hints: number[][] = Array.isArray(m.hints)
+      ? m.hints.map((a: unknown) => (Array.isArray(a) ? a.map(Number) : []))
+      : [];
+    const choices: number[][] = Array.isArray(m.choices)
+      ? m.choices.map((a: unknown) => (Array.isArray(a) ? a.map(Number) : []))
+      : [];
 
     this.status("採点中...", true);
     const results: BlankResult[] = [];
@@ -966,7 +1213,13 @@ export class ChatSidebarProvider implements vscode.WebviewViewProvider, vscode.D
         explanation: item.explanation,
         canApply: item.kind === "change" && !session.review,
         // 変更問題は、空欄以外も含めた完成形を見せて「どこがどう変わるか」を確認できるようにする
-        completed: item.kind === "change" && !session.review ? compactDiff(item.original, resolveBlanks(item.quizCode, answerList)) : undefined,
+        completed:
+          item.kind === "change" && !session.review
+            ? compactDiff(
+                item.original,
+                resolveBlanks(item.quizCode, answerList),
+              )
+            : undefined,
       });
       results.push(...graded.records);
     }
@@ -982,7 +1235,9 @@ export class ChatSidebarProvider implements vscode.WebviewViewProvider, vscode.D
 
     session.graded = true;
     await this.log.record(results);
-    await this.log.recordConceptOnly(questionResults.map((q) => ({ concept: q.concept, correct: q.correct })));
+    await this.log.recordConceptOnly(
+      questionResults.map((q) => ({ concept: q.concept, correct: q.correct })),
+    );
     this.post({
       type: "graded",
       quizId: session.id,
@@ -999,11 +1254,21 @@ export class ChatSidebarProvider implements vscode.WebviewViewProvider, vscode.D
     const item = session?.items[itemIndex];
     const services = this.services;
     if (!session || !item || !services) {
-      this.fail(new Error("反映対象が見つかりません(クイズが失効した可能性があります)。"), "");
+      this.fail(
+        new Error(
+          "反映対象が見つかりません(クイズが失効した可能性があります)。",
+        ),
+        "",
+      );
       return;
     }
     if (item.kind !== "change" || session.review) {
-      this.fail(new Error("この問題は既存コードの理解問題なので、反映対象ではありません。"), "");
+      this.fail(
+        new Error(
+          "この問題は既存コードの理解問題なので、反映対象ではありません。",
+        ),
+        "",
+      );
       return;
     }
     if (!session.graded) {
@@ -1017,7 +1282,10 @@ export class ChatSidebarProvider implements vscode.WebviewViewProvider, vscode.D
 
     const choice = await vscode.window.showWarningMessage(
       `${item.path} の ${item.startLine}〜${item.endLine} 行目を、正解コードで書き換えます。`,
-      { modal: true, detail: "反映後は通常の編集と同じく、元に戻す(Undo)で取り消せます。" },
+      {
+        modal: true,
+        detail: "反映後は通常の編集と同じく、元に戻す(Undo)で取り消せます。",
+      },
       "反映する",
     );
     if (choice !== "反映する") {
@@ -1030,21 +1298,35 @@ export class ChatSidebarProvider implements vscode.WebviewViewProvider, vscode.D
     )
       .split(/\r?\n/)
       .join(eol);
-    const range = new vscode.Range(item.startLine - 1, 0, item.endLine - 1, doc.lineAt(item.endLine - 1).text.length);
+    const range = new vscode.Range(
+      item.startLine - 1,
+      0,
+      item.endLine - 1,
+      doc.lineAt(item.endLine - 1).text.length,
+    );
     const edit = new vscode.WorkspaceEdit();
     edit.replace(uri, range, resolved);
     if (!(await vscode.workspace.applyEdit(edit))) {
       throw new Error("編集を適用できませんでした。");
     }
-    await vscode.window.showTextDocument(doc, { preview: false, selection: new vscode.Range(item.startLine - 1, 0, item.startLine - 1, 0) });
-    this.status(`✅ ${item.path} の ${item.startLine}〜${item.endLine} 行目に反映しました(Undoで元に戻せます)。`);
+    await vscode.window.showTextDocument(doc, {
+      preview: false,
+      selection: new vscode.Range(item.startLine - 1, 0, item.startLine - 1, 0),
+    });
+    this.status(
+      `✅ ${item.path} の ${item.startLine}〜${item.endLine} 行目に反映しました(Undoで元に戻せます)。`,
+    );
   }
 
   /**
    * ワークスペース内の場所を開く。text があれば、その内容の行を line の近くから探し直す
    * (手順の行番号は計画の途中の位置なので、反映前・反映後どちらでも正しい行を開くため)。
    */
-  private async handleOpen(relPath: string, line: number, text?: string): Promise<void> {
+  private async handleOpen(
+    relPath: string,
+    line: number,
+    text?: string,
+  ): Promise<void> {
     const services = this.services;
     if (!services || !relPath) {
       return;
@@ -1059,7 +1341,10 @@ export class ChatSidebarProvider implements vscode.WebviewViewProvider, vscode.D
       const lines = splitLines(await services.ws.readText(rel).catch(() => ""));
       let best = -1;
       lines.forEach((l, i) => {
-        if (l.trim() === wanted && (best < 0 || Math.abs(i + 1 - line) < Math.abs(best + 1 - line))) {
+        if (
+          l.trim() === wanted &&
+          (best < 0 || Math.abs(i + 1 - line) < Math.abs(best + 1 - line))
+        ) {
           best = i;
         }
       });
@@ -1068,7 +1353,10 @@ export class ChatSidebarProvider implements vscode.WebviewViewProvider, vscode.D
       }
     }
     const pos = new vscode.Position(target - 1, 0);
-    await vscode.window.showTextDocument(services.ws.uriOf(rel), { selection: new vscode.Range(pos, pos), preview: true });
+    await vscode.window.showTextDocument(services.ws.uriOf(rel), {
+      selection: new vscode.Range(pos, pos),
+      preview: true,
+    });
   }
 
   // ---------- 復習 ----------
@@ -1090,7 +1378,15 @@ export class ChatSidebarProvider implements vscode.WebviewViewProvider, vscode.D
       original: "",
       quizCode: c.snippet,
       // 旧データの復習カードには選択肢が無いので、正解を少しずつ変えた誤答で作る
-      blanks: [{ answer: c.answer, concept: c.concept, hints: c.hints, why: c.why, choices: c.choices ?? reviewChoices(c) }],
+      blanks: [
+        {
+          answer: c.answer,
+          concept: c.concept,
+          hints: c.hints,
+          why: c.why,
+          choices: c.choices ?? reviewChoices(c),
+        },
+      ],
       explanation: "",
     }));
     const session: QuizSession = {
@@ -1098,13 +1394,18 @@ export class ChatSidebarProvider implements vscode.WebviewViewProvider, vscode.D
       review: true,
       items,
       questions: [],
-      overall: "復習おつかれさまです。間違えた箇所は間隔を空けてまた出題されます。",
+      overall:
+        "復習おつかれさまです。間違えた箇所は間隔を空けてまた出題されます。",
       graded: false,
     };
     this.sessions.set(session.id, session);
     this.post({
       type: "quiz",
-      quiz: this.payloadOf(session, "復習", "前に間違えた・ヒントを使った箇所をもう一度。"),
+      quiz: this.payloadOf(
+        session,
+        "復習",
+        "前に間違えた・ヒントを使った箇所をもう一度。",
+      ),
     });
   }
 
@@ -1117,7 +1418,9 @@ export class ChatSidebarProvider implements vscode.WebviewViewProvider, vscode.D
       return;
     }
     this.status("差分を計算しています...", true);
-    const plan = await services.index.prepare(undefined, (s) => this.status(s, true));
+    const plan = await services.index.prepare(undefined, (s) =>
+      this.status(s, true),
+    );
     this.pendingPlan = plan;
     this.post({
       type: "plan",
@@ -1151,7 +1454,12 @@ export class ChatSidebarProvider implements vscode.WebviewViewProvider, vscode.D
     this.approveRest = true;
     await this.pushState();
     try {
-      const stats = await services.index.commit(plan, { embed: embed && !!this.apiKey }, (s) => this.status(s, true), this.abort.signal);
+      const stats = await services.index.commit(
+        plan,
+        { embed: embed && !!this.apiKey },
+        (s) => this.status(s, true),
+        this.abort.signal,
+      );
       this.status(
         `インデックスを更新しました(${stats.files}ファイル / ${stats.chunks}チャンク / ベクトル${stats.vectors}件${embed ? "" : "・キーワード検索のみ"})。`,
       );
@@ -1171,7 +1479,9 @@ export class ChatSidebarProvider implements vscode.WebviewViewProvider, vscode.D
     }
     await services.index.clear();
     this.pendingPlan = undefined;
-    this.status("インデックスを削除しました。再作成するには「インデックス」を押してください。");
+    this.status(
+      "インデックスを削除しました。再作成するには「インデックス」を押してください。",
+    );
     await this.pushState();
     this.needFullSync = true;
     this.scheduleSync();

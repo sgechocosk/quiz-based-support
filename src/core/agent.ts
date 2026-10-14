@@ -804,10 +804,18 @@ export class QuizAgent {
 
   /** 調査結果(と確認した要件)からクイズを作る。 */
   async compose(inv: Investigation, answers: ClarifyAnswer[] = [], hooks: RunHooks = {}): Promise<AgentResult> {
-    const status = hooks.onStatus ?? (() => undefined);
     await this.followUp(inv, answers, hooks);
+    return this.composeQuiz(inv, requirementText(inv.query, answers), hooks);
+  }
+
+  /**
+   * 調査結果からクイズを作る(追加の調査はしない)。
+   * 実装の手順(変更計画)を作れなかったときの代わりにも使う。実装依頼なら実装問題を作り、作れなければ読解問題で出題する。
+   */
+  async composeQuiz(inv: Investigation, requirement: string, hooks: RunHooks = {}): Promise<AgentResult> {
+    const status = hooks.onStatus ?? (() => undefined);
     status("クイズを作成中...");
-    const quiz = await this.generateQuiz(inv, requirementText(inv.query, answers), hooks);
+    const quiz = await this.generateQuiz(inv, requirement, hooks);
     status("ヒントが答えを漏らしていないか確認中...");
     await this.removeLeaks(quiz, hooks);
     return { quiz, evidencePaths: inv.evidence.paths(), notes: inv.notes, steps: inv.steps };

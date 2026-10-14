@@ -4,7 +4,7 @@ import { declarationsOf } from "./declarations";
 import { diffStat, lineMapper } from "./diff";
 import { impactOfStep, MAX_SITES, siteAt, type ImpactContext } from "./impact";
 import { levelStyle, type LearnerLevel } from "./level";
-import { applyRawEdit, VirtualWorkspace, type RawEdit } from "./overlay";
+import { applyRawEdit, toWorkspacePath, VirtualWorkspace, type RawEdit } from "./overlay";
 import { describeRules, PATTERNS, type PatternId, type ProjectRule } from "./patterns";
 import {
   STEP_KINDS,
@@ -18,7 +18,6 @@ import {
 import type { ChatLlm, ChatMessage, HistoryPort, LspPort, SyntaxChecker, TypeChecker, TypeDiagnostic, WorkspacePort } from "./ports";
 import { compactDiff } from "./quiz";
 import { numberLines, splitLines, truncate } from "./text";
-import { normalizeRelPath } from "./tools";
 
 /**
  * 変更計画を作る。
@@ -155,6 +154,7 @@ const EDIT_RULES = [
   "- 行を足すだけのときも、前後の既存の行を1行以上範囲に含めて置き換える(空の範囲は指定できない)。",
   "- 新しいファイル: create を true、startLine と endLine を 1、firstLine と lastLine を空文字にし、newCode にファイル全体を書く。",
   "- 1つの編集で変える行は40行以内。1つのステップの中で同じ行を2つの編集で触らない。",
+  "- 出力が長くなりすぎないよう、範囲は変える行とその前後数行だけにする(関数全体やファイル全体を書き直さない)。",
   "- 示したコードに無い関数・フィールド・ファイルを想像で使わない。新しく作る名前は同じ計画の中で定義し、既存の命名規則に合わせる。",
   "- インデント・引用符・セミコロンなどの書き方は周りのコードに合わせる。",
 ];
@@ -215,6 +215,30 @@ const PRIORITY: Record<PatternId, number> = {
   "test-follow": 4,
   "co-change": 5,
 };
+
+/** 起点の変更を作らせる回数(初回 + 作り直し2回) */
+const PLAN_ATTEMPTS = 3;
+/** 作り直しのとき、ファイル全体を見せる行数の上限(これより長ければ失敗した場所の前後だけ) */
+const RETRY_FULL_FILE_LINES = 300;
+
+interface PlanFailure {
+  reason: string;
+  path?: string;
+  line?: number;
+}
+
+/** 起点の変更を1つも作れなかった(reasons: 各回の失敗の理由) */
+export class PlanError extends Error {
+  constructor(readonly reasons: string[]) {
+    super(
+      [
+        "要件を満たす変更計画を作れませんでした。",
+        ...reasons.slice(-4).map((r) => `- ${r}`),
+      ].join("\n"),
+    );
+    this.name = "PlanError";
+  }
+}
 
 function escapeRegExp(s: string): string {
   return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
@@ -297,6 +321,8 @@ export class ChangePlanner {
   private readonly coChanged = new Set<string>();
   /** いま判断している確認事項(途中で場所を書き換えない) */
   private resolving = new Set<string>();
+  /** 起点の変更を作るときに起きた問題(作れなかったときの説明に使う) */
+  private readonly planProblems: string[] = [];
   private typecheck: ChangePlan["typecheck"] = { available: false, remaining: [] };
   /** 前回の型検査より後に作ったステップ(型エラーの原因の推定に使う) */
   private recent: PlanStep[] = [];
@@ -319,9 +345,7 @@ export class ChangePlanner {
     status("変更計画(起点の変更)を作成中...");
     await this.initialSteps(inv, spec, hooks);
     if (this.steps.length === 0) {
-      throw new Error(
-        `要件を満たす変更計画を作れませんでした。${this.warnings.slice(0, 2).join(" / ")}\n変更したい場所(ファイル名・関数名)を含めて依頼し直してください。`,
-      );
+      throw new PlanError([...new Set(this.planProblems)]);
     }
     await this.addCoChanges(hooks);
     await this.typeCheck(hooks);
@@ -361,21 +385,32 @@ export class ChangePlanner {
       { role: "user", content: await this.planUserPrompt(inv, spec) },
     ];
     const rawIds = new Map<string, string>();
-    for (let attempt = 0; attempt < 2; attempt++) {
+    for (let attempt = 0; attempt < PLAN_ATTEMPTS; attempt++) {
       const res = await llm.chat({
         messages,
         jsonSchema: PLAN_SCHEMA,
         signal: hooks.signal,
-        purpose: attempt === 0 ? "変更計画の作成" : "変更計画の作り直し",
+        purpose: attempt === 0 ? "変更計画の作成" : `変更計画の作り直し(${attempt}回目)`,
       });
-      let parsed: { steps?: RawStep[] };
+      // 出力を読めない・ステップが無い・編集を適用できない、のどれでも理由を添えて作り直させる
+      let raws: RawStep[] | undefined;
       try {
-        parsed = parseJson(res.content);
+        raws = parseJson<{ steps?: RawStep[] }>(res.content).steps ?? [];
       } catch {
-        parsed = { steps: [] };
+        raws = undefined;
       }
-      const failures: Array<{ reason: string; path?: string; line?: number }> = [];
-      for (const raw of (parsed.steps ?? []).slice(0, PLAN_LIMITS.initialSteps)) {
+      const problems: string[] = [];
+      const failures: PlanFailure[] = [];
+      if (raws === undefined) {
+        problems.push(
+          res.finishReason === "length"
+            ? "出力が長すぎて途中で切れたため、JSONとして読めませんでした"
+            : `出力をJSONとして読めませんでした(${res.content ? `先頭: ${truncate(res.content.trim(), 80)}` : "空の応答"})`,
+        );
+      } else if (raws.length === 0) {
+        problems.push("steps が空でした");
+      }
+      for (const raw of (raws ?? []).slice(0, PLAN_LIMITS.initialSteps)) {
         if (this.steps.some((s) => s.label === (raw.label ?? "").trim())) {
           continue; // 作り直しで、適用済みのステップがもう一度返ってきた
         }
@@ -389,11 +424,17 @@ export class ChangePlanner {
           failures.push({ reason: `ステップ「${raw.label ?? ""}」: ${result.reason}`, path: result.path, line: result.line });
         }
       }
-      if (failures.length === 0 || attempt === 1) {
+      this.planProblems.push(...problems, ...failures.map((f) => f.reason));
+      const done = this.steps.length > 0 && failures.length === 0;
+      if (done || attempt === PLAN_ATTEMPTS - 1) {
         this.warnings.push(...failures.map((f) => `適用できなかった変更: ${f.reason}`));
         break;
       }
-      messages.push({ role: "assistant", content: res.content ?? "" }, { role: "user", content: await this.retryPrompt(failures) });
+      messages.push(
+        // 途中で切れた長い出力をそのまま戻すと次も切れやすいので、短くして戻す
+        { role: "assistant", content: truncate(res.content ?? "", 6000) },
+        { role: "user", content: await this.retryPrompt(failures, problems, inv) },
+      );
     }
     // LLM が付けた id を、このシステムの id に読み替える
     for (const step of this.steps) {
@@ -418,23 +459,60 @@ export class ChangePlanner {
     ].join("\n");
   }
 
-  private async retryPrompt(failures: Array<{ reason: string; path?: string; line?: number }>): Promise<string> {
+  /**
+   * 作り直しの依頼。失敗の理由に加えて、失敗した編集の対象ファイルの今のコードを(短いファイルは全体を)見せる。
+   * 行番号が大きくずれていても、正しい行を写せるようにするため。
+   */
+  private async retryPrompt(failures: PlanFailure[], problems: string[], inv: Investigation): Promise<string> {
+    const budget = this.deps.config.evidenceChars;
     const excerpts: string[] = [];
+    let used = 0;
+    const missing: string[] = [];
     for (const f of failures) {
-      if (!f.path || excerpts.some((e) => e.startsWith(`### ${f.path}\n`))) {
+      if (!f.path || excerpts.some((e) => e.startsWith(`### ${f.path}\n`)) || missing.includes(f.path)) {
         continue;
       }
-      const lines = splitLines(await this.vws.readText(f.path).catch(() => ""));
-      const center = Math.min(Math.max((f.line ?? 1) - 1, 0), Math.max(lines.length - 1, 0));
-      const from = Math.max(0, center - 15);
-      excerpts.push(`### ${f.path}\n${numberLines(lines.slice(from, center + 16), from + 1)}`);
+      let text: string;
+      try {
+        text = await this.vws.readText(f.path);
+      } catch {
+        missing.push(f.path);
+        continue;
+      }
+      const lines = splitLines(text);
+      let block: string;
+      if (lines.length <= RETRY_FULL_FILE_LINES) {
+        block = numberLines(lines, 1);
+      } else {
+        const center = Math.min(Math.max((f.line ?? 1) - 1, 0), lines.length - 1);
+        const from = Math.max(0, center - 60);
+        block = numberLines(lines.slice(from, center + 61), from + 1);
+      }
+      const section = `### ${f.path}\n${block}`;
+      if (used + section.length > budget && excerpts.length > 0) {
+        break;
+      }
+      excerpts.push(truncate(section, Math.max(budget - used, 3000)));
+      used += section.length;
     }
+    const known = inv.evidence.paths();
     return [
-      "次のステップは適用できませんでした。適用できたステップは出し直さず、失敗したステップの修正版だけを steps に入れて、JSON全体を出し直してください。",
+      problems.length > 0 || this.steps.length === 0
+        ? "変更計画を出し直してください。適用できたステップがあればそれは出し直さず、残りのステップだけを steps に入れて、JSON全体を出し直してください。"
+        : "次のステップは適用できませんでした。適用できたステップは出し直さず、失敗したステップの修正版だけを steps に入れて、JSON全体を出し直してください。",
+      ...problems.map((p) => `- ${p}`),
       ...failures.map((f) => `- ${f.reason}`),
-      "firstLine / lastLine は、下の現在のコードの行を逐語で写してください(先に適用したステップで行番号がずれている場合があります)。",
-      excerpts.length > 0 ? `\n【現在のコード】\n${excerpts.join("\n\n")}` : "",
-    ].join("\n");
+      problems.length > 0
+        ? "要件を満たす最小限の変更を、少なくとも1ステップ書いてください。出力が長くならないよう、ステップは3つまで、各編集の範囲は変える行とその前後数行だけにしてください。"
+        : "",
+      "firstLine / lastLine は、下の今のコードの行を、行番号(L数字|)を付けずに逐語で写してください(先に適用したステップで行番号がずれている場合があります)。",
+      missing.length > 0
+        ? `次のファイルはありません: ${missing.join(", ")}。既存のファイルを書き換えるなら参照コードにあるパスを使い、新しく作るなら create を true にしてください。参照コードにあるファイル: ${known.join(", ")}`
+        : "",
+      excerpts.length > 0 ? `\n【今のコード(行番号 L数字| は表示用で、コードの一部ではない)】\n${excerpts.join("\n\n")}` : "",
+    ]
+      .filter(Boolean)
+      .join("\n");
   }
 
   /** ステップの編集をすべて適用する(1つでも失敗したら、そのステップの編集はすべて巻き戻す) */
@@ -450,7 +528,7 @@ export class ChangePlanner {
     const pre = new Map<string, string | null>();
     const applied: PlanStep["edits"] = [];
     for (const edit of edits) {
-      const path = normalizeRelPath(edit.path ?? "");
+      const path = toWorkspacePath(edit.path ?? "", this.vws.id);
       if (path && !written.has(path)) {
         written.set(path, this.vws.writtenText(path));
         pre.set(path, await this.vws.readText(path).catch(() => null));

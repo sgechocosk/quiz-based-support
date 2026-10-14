@@ -242,7 +242,8 @@ export class OpenAiClient implements ChatLlm, Embedder {
       name: c.function.name,
       arguments: c.function.arguments,
     }));
-    return { content: message.content ?? null, toolCalls };
+    const finishReason = typeof json?.choices?.[0]?.finish_reason === "string" ? (json.choices[0].finish_reason as string) : undefined;
+    return { content: message.content ?? null, toolCalls, finishReason };
   }
 
   async embed(texts: string[], signal?: AbortSignal, purpose?: string): Promise<number[][]> {

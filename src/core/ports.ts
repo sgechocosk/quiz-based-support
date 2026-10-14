@@ -84,6 +84,8 @@ export interface ChatRequest {
 export interface ChatResult {
   content: string | null;
   toolCalls: ToolCall[];
+  /** 応答が終わった理由("length" は出力の上限で途中で切れた) */
+  finishReason?: string;
 }
 
 export interface ChatLlm {
