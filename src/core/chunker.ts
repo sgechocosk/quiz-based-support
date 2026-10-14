@@ -46,6 +46,8 @@ export const DEFAULT_CHUNK_OPTIONS: ChunkOptions = {
 export interface LanguageInfo {
   language: string;
   ast?: AstLanguage;
+  /** false: 検索(grep)の対象にはするが、索引(チャンク・埋め込み)には入れない */
+  index?: boolean;
 }
 
 const EXTENSIONS: Record<string, LanguageInfo> = {
@@ -79,6 +81,8 @@ const EXTENSIONS: Record<string, LanguageInfo> = {
   ".sql": { language: "sql" },
   ".sh": { language: "shell" },
   ".md": { language: "markdown" },
+  // 設定ファイル(package.json の設定キー登録など、文字列でつながる結合を見つけるため)。索引には入れない
+  ".json": { language: "json", index: false },
 };
 
 export function languageForPath(filePath: string): LanguageInfo | undefined {
@@ -88,6 +92,12 @@ export function languageForPath(filePath: string): LanguageInfo | undefined {
     return undefined;
   }
   return EXTENSIONS[posix.slice(dot).toLowerCase()];
+}
+
+/** 索引(チャンク・埋め込み)の対象か */
+export function isIndexable(filePath: string): boolean {
+  const info = languageForPath(filePath);
+  return !!info && info.index !== false;
 }
 
 export function supportedExtensions(): string[] {

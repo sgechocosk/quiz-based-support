@@ -113,6 +113,21 @@
           "type": "number",
           "default": 3000,
           "description": "インデックス対象の最大ファイル数。"
+        },
+        "quizSupport.confirmApiCalls": {
+          "type": "boolean",
+          "default": false,
+          "description": "OpenAI API を呼び出す前に、目的と入力トークン数(見積もり)を表示して実行を確認します。オンのときは、ファイル変更時の埋め込みの自動更新も行いません(サイドバーの「API実行前に確認」でも切り替えられます)。"
+        },
+        "quizSupport.typeCheck": {
+          "type": "boolean",
+          "default": true,
+          "description": "実装の手順を作るとき、ワークスペースの tsconfig.json / jsconfig.json を使って型検査し、変更で新しく生じた型エラーも確認事項にする(信頼済みのワークスペースではその TypeScript、それ以外は VS Code 同梱の TypeScript を使用)。"
+        },
+        "quizSupport.testCommand": {
+          "type": "string",
+          "default": "",
+          "description": "実装の手順をファイルに反映したあとに実行できるテストコマンド(例: npm test)。空なら実行ボタンを出しません。実行前にコマンドを表示して確認します。"
         }
       }
     }

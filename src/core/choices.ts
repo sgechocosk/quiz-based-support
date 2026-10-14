@@ -28,6 +28,8 @@ const LANGUAGE_WORDS = new Set([
   "throw", "try", "catch", "finally", "yield", "as", "is", "keyof", "readonly", "string", "number", "boolean",
   "any", "unknown", "never", "object", "bigint", "symbol", "int", "long", "double", "float", "char", "byte",
   "short", "final", "static", "public", "private", "protected", "None", "True", "False", "self", "not", "and", "or",
+  "export", "import", "from", "default", "extends", "implements", "interface", "type", "enum", "switch", "case", "do",
+  "delete", "abstract", "package", "throws", "declare", "namespace", "module", "require",
 ]);
 
 /** 正解の一部を入れ替えて「ありがちな誤り」を作るための対応表 */

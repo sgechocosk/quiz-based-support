@@ -48,7 +48,8 @@ export interface LspPort {
 }
 
 export interface Embedder {
-  embed(texts: string[], signal?: AbortSignal): Promise<number[][]>;
+  /** purpose: 何のための呼び出しか(API 実行前の確認画面に表示する) */
+  embed(texts: string[], signal?: AbortSignal, purpose?: string): Promise<number[][]>;
 }
 
 export interface ToolCall {
@@ -76,6 +77,8 @@ export interface ChatRequest {
   tools?: ToolDefinition[];
   jsonSchema?: { name: string; schema: Record<string, unknown> };
   signal?: AbortSignal;
+  /** 何のための呼び出しか(API 実行前の確認画面に表示する) */
+  purpose?: string;
 }
 
 export interface ChatResult {
@@ -91,6 +94,31 @@ export interface ChatLlm {
 export interface SyntaxChecker {
   /** true: エラー無し / false: 構文エラーあり / undefined: 判定不能 */
   isValid(path: string, text: string): Promise<boolean | undefined>;
+}
+
+export interface TypeDiagnostic {
+  /** ワークスペース相対パス */
+  path: string;
+  /** 1始まり */
+  line: number;
+  code: string;
+  message: string;
+}
+
+/** 型検査(TypeScript 等)。変更計画を仮想的に重ねた状態で、新しく生じたエラーを見つけるのに使う。 */
+export interface TypeChecker {
+  /**
+   * overlay(変更後の内容。新規ファイルを含む。キーはワークスペース相対パス)を重ねた状態(after)と、
+   * 重ねない状態(before)の型エラーを、変更したファイルとそれを読み込むファイルについて返す。
+   * 型検査できない(設定が無い・対応言語でない等)なら undefined。
+   */
+  check(overlay: ReadonlyMap<string, string>, signal?: AbortSignal): Promise<{ before: TypeDiagnostic[]; after: TypeDiagnostic[] } | undefined>;
+}
+
+/** 変更履歴(git 等) */
+export interface HistoryPort {
+  /** 最近のコミットごとの、変更されたファイル(ワークスペース相対パス)の一覧。取得できなければ空配列 */
+  commits(): Promise<string[][]>;
 }
 
 export interface KeyValueStore {

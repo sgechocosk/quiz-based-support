@@ -4,6 +4,7 @@ import {
   chunkFile,
   DEFAULT_CHUNK_OPTIONS,
   embeddingTextOf,
+  isIndexable,
   languageForPath,
   type ChunkOptions,
   type ParserProvider,
@@ -168,7 +169,7 @@ export class IndexManager {
       targets = [];
       for (const p of paths) {
         const info = await this.opts.workspace.stat(p);
-        if (info && languageForPath(p) && info.size <= maxBytes) {
+        if (info && isIndexable(p) && info.size <= maxBytes) {
           targets.push(info);
         } else if (this.manifest.files[p]) {
           removed.push(p);
@@ -176,7 +177,7 @@ export class IndexManager {
       }
     } else {
       const all = (await this.opts.workspace.listFiles())
-        .filter((f) => languageForPath(f.path) && f.size <= maxBytes)
+        .filter((f) => isIndexable(f.path) && f.size <= maxBytes)
         .sort((a, b) => a.path.localeCompare(b.path));
       truncated = all.length > maxFiles;
       targets = all.slice(0, maxFiles);
@@ -297,6 +298,7 @@ export class IndexManager {
             const result = await embedder.embed(
               slice.map((s) => s.text),
               signal,
+              `索引の埋め込み作成(${Math.min(i + slice.length, plan.pendingEmbeds.length)}/${plan.pendingEmbeds.length}件)`,
             );
             slice.forEach((s, j) => {
               const v = result[j];
@@ -372,7 +374,7 @@ export class IndexManager {
     const embedder = this.opts.embedder();
     if (embedder && hybrid.hasVectors()) {
       try {
-        const [v] = await embedder.embed([query]);
+        const [v] = await embedder.embed([query], undefined, "検索クエリの埋め込み");
         if (v && v.length > 0) {
           queryVector = normalizeVector(v);
         }

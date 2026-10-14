@@ -4,6 +4,7 @@ import type { ChatLlm, ChatMessage, LspPort, SyntaxChecker, WorkspacePort } from
 import { applyItemToText, compactItem, validateRawItem, type RawItem, type SemanticJudge, type Validation } from "./quiz";
 import { splitLines } from "./text";
 import { EvidenceStore, executeTool, normalizeRelPath, TOOL_DEFS, type CodeIndex } from "./tools";
+import type { ContractChange, ContractKind, RequirementSpec } from "./planTypes";
 import type { CodeRef, GeneratedQuiz, QuizItem } from "./types";
 
 export type QuizMode = "auto" | "change" | "read";
@@ -74,6 +75,9 @@ export interface Clarification {
   /** 1回のクイズで扱える規模を超える見込みか */
   large: boolean;
   questions: ClarifyQuestion[];
+  /** 確認前の時点の受け入れ条件(「確認せずに進める」ときはこれを使う) */
+  criteria: string[];
+  contracts: ContractChange[];
 }
 
 export interface ClarifyAnswer {
@@ -203,6 +207,20 @@ export const SCOPE_SCHEMA = {
       understanding: STRING,
       estimatedFiles: INTEGER,
       estimatedLines: INTEGER,
+      acceptanceCriteria: { type: "array", items: STRING },
+      contractChanges: {
+        type: "array",
+        items: {
+          type: "object",
+          properties: {
+            kind: { type: "string", enum: ["behavior", "signature", "variant", "data", "dependency", "none"] },
+            subject: STRING,
+            description: STRING,
+          },
+          required: ["kind", "subject", "description"],
+          additionalProperties: false,
+        },
+      },
       questions: {
         type: "array",
         items: {
@@ -225,16 +243,16 @@ export const SCOPE_SCHEMA = {
         },
       },
     },
-    required: ["decision", "reason", "understanding", "estimatedFiles", "estimatedLines", "questions"],
+    required: ["decision", "reason", "understanding", "estimatedFiles", "estimatedLines", "acceptanceCriteria", "contractChanges", "questions"],
     additionalProperties: false,
   },
 } as const;
 
 export function scopeSystemPrompt(level: LearnerLevel = "intermediate"): string {
   return [
-    "あなたはプログラミング学習アシスタントの「要件確認担当」です。ユーザーの実装・修正の依頼と調査済みのコードを読み、",
-    "このまま実装問題(学習者が穴埋めで実装を完成させるクイズ)を作ってよいか、先にユーザーへ要件を確認すべきかを判断します。",
-    `1回のクイズで実装できるのは、最大${MAX_ITEMS}か所・各25行程度の変更までです。要件があいまいなまま作ると、ユーザーの意図と違うコードを「正解」として教えてしまいます。`,
+    "あなたはプログラミング学習アシスタントの「要件確認担当」です。ユーザーの実装・修正の依頼と調査済みのコードを読み、要件を整理したうえで、",
+    "このまま実装の計画に進んでよいか、先にユーザーへ要件を確認すべきかを判断します。",
+    `学習者が1回で手順を追いながら理解できるのは、${MAX_ITEMS}か所・約${LARGE_CHANGE_LINES}行程度の変更までです。要件があいまいなまま進めると、ユーザーの意図と違うコードを「正解」として教えてしまいます。`,
     "出力は指定のJSONスキーマに厳密に従ってください。",
     "",
     "【先に確認する(decision=\"clarify\")場合】",
@@ -256,6 +274,12 @@ export function scopeSystemPrompt(level: LearnerLevel = "intermediate"): string 
     "- why: その点を決めないと何があいまいなまま実装されるかを1文で。",
     "- understanding: 依頼をどう理解したかを1〜2文で。reason: 確認が必要な理由(clarify)または不要な理由(proceed)を1文で。",
     "- estimatedFiles / estimatedLines: 依頼を全部実装した場合に変更するファイル数と変更行数(追加+削除)の見積もり。decision に関わらず正直に書く。",
+    "",
+    "【要件の整理(decision に関わらず書く)】",
+    "- acceptanceCriteria: 受け入れ条件を1〜5件。「〜のとき〜になる」のように、実装できたかを確かめられる振る舞いで書く(実装方法は書かない)。",
+    "  clarify のときは、確認が必要な点を除いた、現時点で確かな条件だけを書く。",
+    "- contractChanges: この依頼で変わる「約束」の見込み。kind は signature(関数の引数・戻り値)/ variant(種類の値・メッセージの種類の追加)/",
+    "  data(型・保存するデータの形)/ behavior(振る舞い)/ dependency(新しい依存・設定)/ none。subject に対象(関数名・型名・キーなど)、description に変化を1文で。",
     "- " + levelStyle(level),
   ].join("\n");
 }
@@ -266,6 +290,8 @@ interface RawScope {
   understanding?: string;
   estimatedFiles?: number;
   estimatedLines?: number;
+  acceptanceCriteria?: string[];
+  contractChanges?: Array<{ kind?: string; subject?: string; description?: string }>;
   questions?: Array<{
     question?: string;
     why?: string;
@@ -310,7 +336,39 @@ export function decideClarification(raw: RawScope | undefined): Clarification | 
     raw?.decision !== "clarify"
       ? `変更が大きくなる見込み(約${estimatedFiles}ファイル・約${estimatedLines}行)のため、実装する範囲を先に決めます。`
       : raw.reason?.trim() ?? "";
-  return { understanding: raw?.understanding?.trim() ?? "", reason, estimatedFiles, estimatedLines, large, questions };
+  const { criteria, contracts } = specParts(raw);
+  return { understanding: raw?.understanding?.trim() ?? "", reason, estimatedFiles, estimatedLines, large, questions, criteria, contracts };
+}
+
+const CONTRACT_KINDS: ContractKind[] = ["behavior", "signature", "variant", "data", "dependency", "none"];
+
+/** LLM の出力から、受け入れ条件と「変わる約束」を取り出す */
+function specParts(raw: Pick<RawScope, "acceptanceCriteria" | "contractChanges"> | undefined): { criteria: string[]; contracts: ContractChange[] } {
+  const criteria = (raw?.acceptanceCriteria ?? [])
+    .map((c) => (typeof c === "string" ? c.trim() : ""))
+    .filter(Boolean)
+    .slice(0, 6);
+  const contracts: ContractChange[] = (raw?.contractChanges ?? [])
+    .filter((c) => c && typeof c.subject === "string" && c.subject.trim())
+    .slice(0, 8)
+    .map((c) => ({
+      kind: CONTRACT_KINDS.includes(c.kind as ContractKind) ? (c.kind as ContractKind) : "behavior",
+      subject: c.subject!.trim(),
+      description: (c.description ?? "").trim(),
+    }));
+  return { criteria, contracts };
+}
+
+/** 要件の整理の結果を、確定した要件の形にする(受け入れ条件が無ければ依頼文そのものを条件にする) */
+export function specFrom(query: string, raw: Pick<RawScope, "understanding" | "acceptanceCriteria" | "contractChanges"> | undefined, answers: ClarifyAnswer[] = []): RequirementSpec {
+  const { criteria, contracts } = specParts(raw);
+  return {
+    query,
+    understanding: raw?.understanding?.trim() ?? "",
+    criteria: criteria.length > 0 ? criteria : [query],
+    contracts,
+    answers,
+  };
 }
 
 /** 確認画面での選択(選択肢の番号 / 補足の自由記述)を、出題に渡す回答の一覧にする。未回答の質問は含めない。 */
@@ -342,6 +400,21 @@ export function requirementText(query: string, answers: ClarifyAnswer[]): string
   ].join("\n");
 }
 
+/** 回答を受けて要件を確定するときの出力 */
+export const SPEC_SCHEMA = {
+  name: "spec",
+  schema: {
+    type: "object",
+    properties: {
+      understanding: STRING,
+      acceptanceCriteria: SCOPE_SCHEMA.schema.properties.acceptanceCriteria,
+      contractChanges: SCOPE_SCHEMA.schema.properties.contractChanges,
+    },
+    required: ["understanding", "acceptanceCriteria", "contractChanges"],
+    additionalProperties: false,
+  },
+} as const;
+
 export type QuizIntent = "change" | "read";
 
 const CHANGE_WORDS =
@@ -355,6 +428,32 @@ export function detectIntent(query: string): QuizIntent {
 /** 実装問題(change)を最低1問必須にするか */
 export function requiresChange(mode: QuizMode, intent: QuizIntent): boolean {
   return mode === "change" || (mode === "auto" && intent === "change");
+}
+
+/** 選択肢(誤答)の作り方。読解・実装・手順の問題で共通 */
+export function distractorRules(): string[] {
+  return [
+    "【選択肢 distractors(誤答を3つ)】",
+    "- 目的は「コードベースを読んで根拠を確かめないと選べない」こと。勘や見た目で消去できる誤答は作らない。",
+    "- 良い誤答: 実在する似た名前の別の関数・変数・フィールド(責務が違う)/ 引数の取り違え・順序違い / 境界条件の違い(< と <=)/ 条件の反転 /",
+    "  同じファイルの別の箇所にある似た式 / 呼ぶ順序や呼ぶ相手を間違えたもの。どれもこのコードベースで実際に書かれうるもの。",
+    "- 誤答には、参照コードに無い名前を使わない(存在しない名前は見ただけで誤りと分かる)。新しく作る名前(newNames)は使ってよい。",
+    "- 正解と書き方が違うだけで同じ動作になるもの(等価な書き換え)は誤答にしない。",
+    "- 正解と長さ・形をそろえる(正解だけが長い・具体的、などで見分けられないように)。各誤答は1行・60文字以内。",
+    "- whyWrong(採点後に表示。ヒントで1つ消すときにも表示): なぜ誤りかを、根拠のファイル名:行と仕組みで1〜2文。正解のコードは書かない。",
+  ];
+}
+
+/** 答え漏れを防ぐ決まり。visible は解答前に学習者に見える項目 */
+export function leakRules(visible: string): string[] {
+  return [
+    "【答えを漏らさない(最重要)】",
+    `解答前に見えるのは ${visible}。これらには、どの空欄の答えのコード片も、答えの識別子の組み合わせも書かない。`,
+    "- hintConcept: どんな概念・仕組みが関わるか(例: 「非同期処理の完了を待つ必要がある」)。",
+    "- hintApproach: どこを見て、どう考えれば選択肢を絞れるか(例: 「この関数の戻り値の型と、呼び出し元での使われ方を見比べる」)。",
+    "- cluePath/clueLine/clueNote: 答えを導く根拠になる「別の場所」(呼び出す関数の定義・型定義・手本になる類似コードなど)。参照コードにある行を指定し、",
+    "  その行自体に答えが書かれていてはいけない。適切な場所が無ければ cluePath は空文字、clueLine は0。",
+  ];
 }
 
 export function quizSystemPrompt(mode: QuizMode, intent: QuizIntent = "read", level: LearnerLevel = "intermediate"): string {
@@ -391,21 +490,9 @@ export function quizSystemPrompt(mode: QuizMode, intent: QuizIntent = "read", le
     "- target: その行に逐語で含まれる、空欄にする部分の文字列(1行以内・60文字以内)。行全体ではなく、条件式・呼び出し・引数・代入値・型など意味のある単位。",
     "- 個数と難しさは下の【学習者のレベル】に従う。周囲のコードと手がかりから一つに絞れる箇所を選ぶ(同じ意味の書き方が複数ありうる箇所や、根拠なく推測するしかない箇所は避ける)。",
     "",
-    "【選択肢 distractors(誤答を3つ)】",
-    "- 目的は「コードベースを読んで根拠を確かめないと選べない」こと。勘や見た目で消去できる誤答は作らない。",
-    "- 良い誤答: 実在する似た名前の別の関数・変数・フィールド(責務が違う)/ 引数の取り違え・順序違い / 境界条件の違い(< と <=)/ 条件の反転 /",
-    "  同じファイルの別の箇所にある似た式 / 呼ぶ順序や呼ぶ相手を間違えたもの。どれもこのコードベースで実際に書かれうるもの。",
-    "- 誤答には、参照コードに無い名前を使わない(存在しない名前は見ただけで誤りと分かる)。新しく作る名前(newNames)は使ってよい。",
-    "- 正解と書き方が違うだけで同じ動作になるもの(等価な書き換え)は誤答にしない。",
-    "- 正解と長さ・形をそろえる(正解だけが長い・具体的、などで見分けられないように)。各誤答は1行・60文字以内。",
-    "- whyWrong(採点後に表示。ヒントで1つ消すときにも表示): なぜ誤りかを、根拠のファイル名:行と仕組みで1〜2文。正解のコードは書かない。",
+    ...distractorRules(),
     "",
-    "【答えを漏らさない(最重要)】",
-    "解答前に見えるのは goal・task・refs・concept・2段階ヒント・clueNote。これらには、どの空欄の答えのコード片も、答えの識別子の組み合わせも書かない。",
-    "- hintConcept: どんな概念・仕組みが関わるか(例: 「非同期処理の完了を待つ必要がある」)。",
-    "- hintApproach: どこを見て、どう考えれば選択肢を絞れるか(例: 「この関数の戻り値の型と、呼び出し元での使われ方を見比べる」)。",
-    "- cluePath/clueLine/clueNote: 答えを導く根拠になる「別の場所」(呼び出す関数の定義・型定義・手本になる類似コードなど)。参照コードにある行を指定し、",
-    "  その行自体に答えが書かれていてはいけない。適切な場所が無ければ cluePath は空文字、clueLine は0。",
+    ...leakRules("goal・task・refs・concept・2段階ヒント・clueNote"),
     "",
     "【学習者が導けるための説明】",
     "- task(解答前に表示): read なら「この範囲がシステムの中で何を担い、どこから呼ばれ、何を読み取ってほしいか」。",
@@ -436,7 +523,7 @@ function summarizeArgs(raw: string): string {
   }
 }
 
-function parseJson<T>(content: string | null | undefined): T {
+export function parseJson<T>(content: string | null | undefined): T {
   return JSON.parse((content ?? "").replace(/^```json\s*|```\s*$/g, "").trim()) as T;
 }
 
@@ -603,15 +690,16 @@ export class QuizAgent {
   }
 
   /**
-   * 実装依頼のとき、変更が大きい、または解釈・方針が複数あるなら、ユーザーへの質問を返す(出題には進まない)。
-   * 確認が不要なとき・確認できなかったときは undefined(そのまま出題してよい)。
+   * 実装依頼の要件を整理する(受け入れ条件・変わる約束)。
+   * 変更が大きい、または解釈・方針が複数あるなら、ユーザーへの質問(clarification)も返す(計画には進まない)。
+   * 判定に失敗したときは、依頼文そのものを受け入れ条件として進める。
    */
-  async clarify(inv: Investigation, hooks: RunHooks = {}): Promise<Clarification | undefined> {
+  async organize(inv: Investigation, hooks: RunHooks = {}): Promise<{ spec: RequirementSpec; clarification?: Clarification }> {
     const { llm, config } = this.deps;
     if (!requiresChange(inv.mode, detectIntent(inv.query))) {
-      return undefined;
+      return { spec: specFrom(inv.query, undefined) };
     }
-    hooks.onStatus?.("変更の規模と、仕様の決め方が複数ないかを確認中...");
+    hooks.onStatus?.("要件を整理し、変更の規模と仕様の決め方が複数ないかを確認中...");
     const messages: ChatMessage[] = [
       { role: "system", content: scopeSystemPrompt(config.level) },
       {
@@ -623,12 +711,15 @@ export class QuizAgent {
         ].join("\n"),
       },
     ];
+    let spec = specFrom(inv.query, undefined);
     try {
       for (let attempt = 0; attempt < 2; attempt++) {
-        const res = await llm.chat({ messages, jsonSchema: SCOPE_SCHEMA, signal: hooks.signal });
-        const verdict = decideClarification(parseJson<RawScope>(res.content));
+        const res = await llm.chat({ messages, jsonSchema: SCOPE_SCHEMA, signal: hooks.signal, purpose: "要件の整理" });
+        const raw = parseJson<RawScope>(res.content);
+        spec = specFrom(inv.query, raw);
+        const verdict = decideClarification(raw);
         if (verdict !== "missing") {
-          return verdict;
+          return { spec, clarification: verdict };
         }
         messages.push(
           { role: "assistant", content: res.content ?? "" },
@@ -644,28 +735,77 @@ export class QuizAgent {
       if (hooks.signal?.aborted) {
         throw error;
       }
-      // 確認の判定に失敗しても、出題そのものは止めない
+      // 判定に失敗しても、計画そのものは止めない
     }
-    return undefined;
+    return { spec };
+  }
+
+  /** 選んだ案に関係する、まだ読んでいないコードを調査の続きで確かめる */
+  async followUp(inv: Investigation, answers: ClarifyAnswer[], hooks: RunHooks = {}): Promise<void> {
+    if (answers.length === 0) {
+      return;
+    }
+    hooks.onStatus?.("回答した要件をもとに、関連コードを追加で調査中...");
+    inv.messages.push({
+      role: "user",
+      content: [
+        "ユーザーに要件を確認し、次の回答を得ました。",
+        ...answers.map((a) => `- ${a.question} → ${a.answer}`),
+        "この要件で変更が入る場所と手本になる実装のうち、まだ読んでいないものがあれば追加で調べてください。",
+        "最後に、この要件に関係する重要な場所を、前回と同じ形式の箇条書きでまとめ直してください。",
+      ].join("\n"),
+    });
+    await this.explore(inv, FOLLOW_UP_STEPS, hooks);
+  }
+
+  /** 確認した内容で、受け入れ条件と変わる約束を確定する(失敗したら確認前の内容に回答を添えて使う) */
+  async finalizeSpec(inv: Investigation, prior: RequirementSpec, answers: ClarifyAnswer[], hooks: RunHooks = {}): Promise<RequirementSpec> {
+    if (answers.length === 0) {
+      return { ...prior, answers };
+    }
+    const { llm, config } = this.deps;
+    hooks.onStatus?.("回答をもとに要件を確定中...");
+    try {
+      const res = await llm.chat({
+        messages: [
+          {
+            role: "system",
+            content: [
+              "あなたはプログラミング学習アシスタントの「要件確認担当」です。ユーザーの依頼と、確認して得た回答から、実装の要件を確定します。",
+              "回答で範囲を絞った場合は、その範囲だけを要件にします。質問はもうしません。出力は指定のJSONスキーマに厳密に従ってください。",
+              "- understanding: 確定した要件を1〜2文で。",
+              "- acceptanceCriteria: 受け入れ条件を1〜5件。「〜のとき〜になる」のように、実装できたかを確かめられる振る舞いで書く。",
+              "- contractChanges: 変わる約束の見込み(kind / subject / description)。",
+              `- ${levelStyle(config.level ?? "intermediate")}`,
+            ].join("\n"),
+          },
+          {
+            role: "user",
+            content: [
+              `【ユーザーの要求】\n${inv.query}`,
+              `\n【確認した内容】\n${answers.map((a) => `- ${a.question} → ${a.answer}`).join("\n")}`,
+              prior.criteria.length > 0 ? `\n【確認前の受け入れ条件】\n${prior.criteria.map((c, i) => `${i + 1}. ${c}`).join("\n")}` : "",
+              inv.notes ? `\n【調査メモ】\n${inv.notes}` : "",
+            ].join("\n"),
+          },
+        ],
+        jsonSchema: SPEC_SCHEMA,
+        signal: hooks.signal,
+        purpose: "要件の確定",
+      });
+      return specFrom(inv.query, parseJson<RawScope>(res.content), answers);
+    } catch (error) {
+      if (hooks.signal?.aborted) {
+        throw error;
+      }
+      return { ...prior, answers };
+    }
   }
 
   /** 調査結果(と確認した要件)からクイズを作る。 */
   async compose(inv: Investigation, answers: ClarifyAnswer[] = [], hooks: RunHooks = {}): Promise<AgentResult> {
     const status = hooks.onStatus ?? (() => undefined);
-    if (answers.length > 0) {
-      // 選んだ案によっては、まだ読んでいない場所に変更が入るので、調査の続きで確かめさせる
-      status("回答した要件をもとに、関連コードを追加で調査中...");
-      inv.messages.push({
-        role: "user",
-        content: [
-          "ユーザーに要件を確認し、次の回答を得ました。",
-          ...answers.map((a) => `- ${a.question} → ${a.answer}`),
-          "この要件で変更が入る場所と手本になる実装のうち、まだ読んでいないものがあれば追加で調べてください。",
-          "最後に、この要件に関係する重要な場所を、前回と同じ形式の箇条書きでまとめ直してください。",
-        ].join("\n"),
-      });
-      await this.explore(inv, FOLLOW_UP_STEPS, hooks);
-    }
+    await this.followUp(inv, answers, hooks);
     status("クイズを作成中...");
     const quiz = await this.generateQuiz(inv, requirementText(inv.query, answers), hooks);
     status("ヒントが答えを漏らしていないか確認中...");
@@ -686,7 +826,12 @@ export class QuizAgent {
     const limit = inv.steps + budget;
     for (let turn = 0; turn <= budget; turn++) {
       const exhausted = inv.steps >= limit;
-      const res = await llm.chat({ messages: inv.messages, tools: exhausted ? undefined : TOOL_DEFS, signal: hooks.signal });
+      const res = await llm.chat({
+        messages: inv.messages,
+        tools: exhausted ? undefined : TOOL_DEFS,
+        signal: hooks.signal,
+        purpose: exhausted ? "調査のまとめ" : `関連コードの調査(${inv.steps + 1}手目〜)`,
+      });
       if (res.toolCalls.length === 0 || exhausted) {
         inv.notes = res.content?.trim() ? res.content : inv.notes;
         inv.messages.push({ role: "assistant", content: res.content ?? "" });
@@ -725,7 +870,12 @@ export class QuizAgent {
     let goal = "";
     let overall = "";
     for (let attempt = 0; attempt < MAX_QUIZ_ATTEMPTS && accepted.length < MAX_ITEMS; attempt++) {
-      const res = await llm.chat({ messages, jsonSchema: QUIZ_SCHEMA, signal: hooks.signal });
+      const res = await llm.chat({
+        messages,
+        jsonSchema: QUIZ_SCHEMA,
+        signal: hooks.signal,
+        purpose: attempt === 0 ? "クイズの作成" : "クイズの作り直し",
+      });
       const content = res.content ?? "";
       let parsed: { goal?: string; overallExplanation?: string; items?: RawItem[] };
       try {
@@ -841,104 +991,120 @@ export class QuizAgent {
   }
 
   /** 手がかり・参考コードの場所が実在し、その行に答えが書かれていないことを確かめる(満たさないものは外す)。 */
-  private async checkRefs(item: QuizItem, ownText: string): Promise<void> {
-    const cache = new Map<string, string[] | undefined>([[item.path, splitLines(ownText)]]);
-    const answers = item.blanks.map((b) => b.answer);
-    const verify = async (ref: CodeRef | undefined): Promise<CodeRef | undefined> => {
-      const rel = ref && normalizeRelPath(ref.path);
-      if (!ref || !rel) {
-        return undefined;
-      }
-      if (!cache.has(rel)) {
-        cache.set(rel, await this.deps.ws.readText(rel).then(splitLines, () => undefined));
-      }
-      const lines = cache.get(rel);
-      const text = lines?.[ref.line - 1];
-      if (text === undefined || text.trim() === "") {
-        return undefined;
-      }
-      const squashed = text.replace(/\s+/g, "");
-      if (answers.some((a) => a.replace(/\s+/g, "").length >= 2 && squashed.includes(a.replace(/\s+/g, "")))) {
-        return undefined;
-      }
-      return { ...ref, path: rel };
-    };
-    for (const b of item.blanks) {
-      b.clue = await verify(b.clue);
-    }
-    const refs: CodeRef[] = [];
-    for (const r of (item.refs ?? []).slice(0, 3)) {
-      const ok = await verify(r);
-      if (ok) {
-        refs.push(ok);
-      }
-    }
-    item.refs = refs;
-    for (const b of item.blanks) {
-      if (!b.clue) {
-        delete b.clue;
-      }
-    }
+  private checkRefs(item: QuizItem, ownText: string): Promise<void> {
+    return checkItemRefs((path) => this.deps.ws.readText(path), item, ownText);
   }
 
   /** 解答前に見える文章の答え漏れを LLM に書き直させ、それでも残るものは伏せ字にする。 */
-  private async removeLeaks(quiz: GeneratedQuiz, hooks: RunHooks): Promise<void> {
-    const goal = { value: quiz.goal };
-    let leaks = findLeaks(goal.value, quiz.items);
-    if (leaks.length > 0) {
-      try {
-        const res = await this.deps.llm.chat({
-          messages: [
-            {
-              role: "system",
-              content: [
-                "あなたはプログラミング学習クイズの編集者です。以下の文章は、解答前に学習者へ見せるのに、答え(空欄に入るコード)を漏らしています。",
-                "各 id について、答えのコード片も、答えに含まれる識別子の組み合わせも使わずに、同じ役割の文章へ書き直してください。",
-                "答えを言う代わりに、関わる概念・見るべき場所・考え方・答えの形(言葉で)を示します。日本語で、元と同じくらいの長さにします。",
-                levelStyle(this.deps.config.level ?? "intermediate"),
-              ].join("\n"),
-            },
-            {
-              role: "user",
-              content: leaks
-                .map((l) => {
-                  const item = l.item !== undefined ? quiz.items[l.item] : undefined;
-                  return [
-                    `id: ${l.id}`,
-                    `種類: ${FIELD_LABEL[l.field]}`,
-                    `現在の文章: ${l.text}`,
-                    `漏れている答え: ${l.answers.join(" / ")}`,
-                    item ? `問題のコード(___BLANK___が空欄):\n${item.quizCode}` : "",
-                  ]
-                    .filter(Boolean)
-                    .join("\n");
-                })
-                .join("\n\n"),
-            },
-          ],
-          jsonSchema: LEAK_FIX_SCHEMA,
-          signal: hooks.signal,
-        });
-        const fixes = parseJson<{ fixes?: Array<{ id: string; text: string }> }>(res.content).fixes ?? [];
-        for (const leak of leaks) {
-          const fix = fixes.find((f) => f.id === leak.id)?.text?.trim();
-          if (fix && !leak.answers.some((a) => revealsAnswer(fix, a))) {
-            applyLeakFix(goal, quiz.items, leak, fix);
-          }
-        }
-      } catch (error) {
-        if (hooks.signal?.aborted) {
-          throw error;
-        }
-        // 書き直しに失敗しても、下の伏せ字処理で必ず漏れは塞ぐ
-      }
-      leaks = findLeaks(goal.value, quiz.items);
-      for (const leak of leaks) {
-        applyLeakFix(goal, quiz.items, leak, fallbackText(leak, quiz.items));
-      }
-    }
-    quiz.goal = goal.value;
+  private removeLeaks(quiz: GeneratedQuiz, hooks: RunHooks): Promise<void> {
+    return removeAnswerLeaks(this.deps.llm, this.deps.config.level ?? "intermediate", quiz, hooks);
   }
+}
+
+/** 手がかり・参考コードの場所が実在し、その行に答えが書かれていないことを確かめる(満たさないものは外す)。 */
+export async function checkItemRefs(read: (path: string) => Promise<string>, item: QuizItem, ownText: string): Promise<void> {
+  const cache = new Map<string, string[] | undefined>([[item.path, splitLines(ownText)]]);
+  const answers = item.blanks.map((b) => b.answer);
+  const verify = async (ref: CodeRef | undefined): Promise<CodeRef | undefined> => {
+    const rel = ref && normalizeRelPath(ref.path);
+    if (!ref || !rel) {
+      return undefined;
+    }
+    if (!cache.has(rel)) {
+      cache.set(rel, await read(rel).then(splitLines, () => undefined));
+    }
+    const lines = cache.get(rel);
+    const text = lines?.[ref.line - 1];
+    if (text === undefined || text.trim() === "") {
+      return undefined;
+    }
+    const squashed = text.replace(/\s+/g, "");
+    if (answers.some((a) => a.replace(/\s+/g, "").length >= 2 && squashed.includes(a.replace(/\s+/g, "")))) {
+      return undefined;
+    }
+    return { ...ref, path: rel };
+  };
+  for (const b of item.blanks) {
+    b.clue = await verify(b.clue);
+  }
+  const refs: CodeRef[] = [];
+  for (const r of (item.refs ?? []).slice(0, 3)) {
+    const ok = await verify(r);
+    if (ok) {
+      refs.push(ok);
+    }
+  }
+  item.refs = refs;
+  for (const b of item.blanks) {
+    if (!b.clue) {
+      delete b.clue;
+    }
+  }
+}
+
+/** 解答前に見える文章の答え漏れを LLM に書き直させ、それでも残るものは伏せ字にする。 */
+export async function removeAnswerLeaks(
+  llm: ChatLlm,
+  level: LearnerLevel,
+  quiz: Pick<GeneratedQuiz, "goal" | "items">,
+  hooks: RunHooks = {},
+): Promise<void> {
+  const goal = { value: quiz.goal };
+  let leaks = findLeaks(goal.value, quiz.items);
+  if (leaks.length > 0) {
+    try {
+      const res = await llm.chat({
+        messages: [
+          {
+            role: "system",
+            content: [
+              "あなたはプログラミング学習クイズの編集者です。以下の文章は、解答前に学習者へ見せるのに、答え(空欄に入るコード)を漏らしています。",
+              "各 id について、答えのコード片も、答えに含まれる識別子の組み合わせも使わずに、同じ役割の文章へ書き直してください。",
+              "答えを言う代わりに、関わる概念・見るべき場所・考え方・答えの形(言葉で)を示します。日本語で、元と同じくらいの長さにします。",
+              levelStyle(level),
+            ].join("\n"),
+          },
+          {
+            role: "user",
+            content: leaks
+              .map((l) => {
+                const item = l.item !== undefined ? quiz.items[l.item] : undefined;
+                return [
+                  `id: ${l.id}`,
+                  `種類: ${FIELD_LABEL[l.field]}`,
+                  `現在の文章: ${l.text}`,
+                  `漏れている答え: ${l.answers.join(" / ")}`,
+                  item ? `問題のコード(___BLANK___が空欄):\n${item.quizCode}` : "",
+                ]
+                  .filter(Boolean)
+                  .join("\n");
+              })
+              .join("\n\n"),
+          },
+        ],
+        jsonSchema: LEAK_FIX_SCHEMA,
+        signal: hooks.signal,
+        purpose: "答え漏れの書き直し",
+      });
+      const fixes = parseJson<{ fixes?: Array<{ id: string; text: string }> }>(res.content).fixes ?? [];
+      for (const leak of leaks) {
+        const fix = fixes.find((f) => f.id === leak.id)?.text?.trim();
+        if (fix && !leak.answers.some((a) => revealsAnswer(fix, a))) {
+          applyLeakFix(goal, quiz.items, leak, fix);
+        }
+      }
+    } catch (error) {
+      if (hooks.signal?.aborted) {
+        throw error;
+      }
+      // 書き直しに失敗しても、下の伏せ字処理で必ず漏れは塞ぐ
+    }
+    leaks = findLeaks(goal.value, quiz.items);
+    for (const leak of leaks) {
+      applyLeakFix(goal, quiz.items, leak, fallbackText(leak, quiz.items));
+    }
+  }
+  quiz.goal = goal.value;
 }
 
 const JUDGE_SCHEMA = {
@@ -979,6 +1145,7 @@ export function makeSemanticJudge(llm: ChatLlm): SemanticJudge {
         },
       ],
       jsonSchema: JUDGE_SCHEMA,
+      purpose: "採点の補助(表記ゆれの判定)",
     });
     const parsed = JSON.parse(res.content ?? "{}") as { results?: Array<{ index: number; equivalent: boolean; reason: string }> };
     return cases.map((_, i) => {

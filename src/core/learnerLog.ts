@@ -84,8 +84,11 @@ export class LearnerLog {
   }
 
   /** 1回の採点結果を記録する。間違い・ヒント使用があったブランクは復習カードになる。 */
-  async record(results: BlankResult[], now = Date.now()): Promise<void> {
-    this.data.totals.sessions++;
+  /** newSession: 1回の解答として数えるか(手順のように1回をステップに分けて記録するときは、最初だけ true) */
+  async record(results: BlankResult[], now = Date.now(), newSession = true): Promise<void> {
+    if (newSession) {
+      this.data.totals.sessions++;
+    }
     for (const r of results) {
       this.data.totals.blanks++;
       if (r.correct) {

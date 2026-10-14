@@ -336,19 +336,11 @@ test("実装依頼: 実装問題をどうしても作れなければ、読解の
   assert.match(r.quiz.notice ?? "", /読解問題のみ/);
 });
 
-test("要件の確認: 複数案がある実装依頼は出題せずに質問し、回答をもとに追加調査してから出題する", async (t) => {
-  const changeItem = {
-    ...goodItem,
-    kind: "change",
-    task: "パスワードの最低文字数を厳しくする(9文字以上で許可)",
-    newCode: ["export function login(user: string, password: string): boolean {", '  return password.length > 8 && user !== "";', "}"].join("\n"),
-    blanks: [blank(2, "password.length > 8")],
-    refs: [],
-  };
+test("要件の確認: 複数案がある実装依頼は計画に進まずに質問し、回答をもとに追加調査してから受け入れ条件を確定する", async (t) => {
   let scopeSystem = "";
   let scopeUser = "";
   let followUp = "";
-  let quizUser = "";
+  let specUser = "";
   const { ws, index, client } = await setup(t, (req) => {
     const b = req.body;
     if (b.tools || !b.response_format) {
@@ -377,6 +369,8 @@ test("要件の確認: 複数案がある実装依頼は出題せずに質問し
             understanding: "パスワードの判定を厳しくする",
             estimatedFiles: 1,
             estimatedLines: 4,
+            acceptanceCriteria: ["弱いパスワードではログインできない"],
+            contractChanges: [{ kind: "behavior", subject: "login", description: "判定が厳しくなる" }],
             questions: [
               {
                 question: "どのように厳しくしますか?",
@@ -391,12 +385,17 @@ test("要件の確認: 複数案がある実装依頼は出題せずに質問し
         ),
       };
     }
-    if (name === "quiz") {
-      quizUser = b.messages[1].content;
-      return { json: msg(JSON.stringify({ goal: "パスワード条件を変える", overallExplanation: "o", items: [changeItem] })) };
-    }
-    if (name === "leak_fix") {
-      return { json: msg(JSON.stringify({ fixes: [] })) };
+    if (name === "spec") {
+      specUser = b.messages[1].content;
+      return {
+        json: msg(
+          JSON.stringify({
+            understanding: "最低文字数を9文字にする",
+            acceptanceCriteria: ["8文字以下のパスワードではログインできない", "9文字以上ならログインできる"],
+            contractChanges: [{ kind: "behavior", subject: "login", description: "最低文字数が9文字になる" }],
+          }),
+        ),
+      };
     }
     throw new Error(`想定外のリクエスト: ${name}`);
   });
@@ -406,13 +405,15 @@ test("要件の確認: 複数案がある実装依頼は出題せずに質問し
   const inv = await agent.investigate("パスワードのチェックを強化したい", "auto", hooks);
   assert.equal(inv.notes, "- src/auth.ts の 1-3 行目が中心(login)");
 
-  const c = await agent.clarify(inv, hooks);
-  assert.ok(c, "複数案があるので、出題に進まずに質問する");
+  const { spec: prior, clarification: c } = await agent.organize(inv, hooks);
+  assert.ok(c, "複数案があるので、計画に進まずに質問する");
   assert.match(scopeSystem, /変更が大きい/);
   assert.match(scopeSystem, /解釈や方針が複数ある/);
+  assert.match(scopeSystem, /acceptanceCriteria/);
   assert.match(scopeUser, /パスワードのチェックを強化したい/);
   assert.match(scopeUser, /L2\|\s+return password\.length > 3/, "調査で読んだコードを根拠に判断させる");
-  assert.equal(quizUser, "", "回答を受け取るまでクイズは作らない");
+  assert.deepEqual(prior.criteria, ["弱いパスワードではログインできない"], "確認前の受け入れ条件も持っておく(確認せずに進めるとき用)");
+  assert.deepEqual(c.criteria, prior.criteria);
   assert.deepEqual(
     c.questions[0]!.options.map((o) => [o.label, o.recommended]),
     [
@@ -422,19 +423,19 @@ test("要件の確認: 複数案がある実装依頼は出題せずに質問し
   );
 
   const answers = answersFrom(c, [{ option: 0, text: "9文字以上" }]);
-  const r = await agent.compose(inv, answers, hooks);
+  await agent.followUp(inv, answers, hooks);
   assert.match(followUp, /どのように厳しくしますか\? → 最低文字数を増やす/);
   assert.ok(statuses.some((s) => s.includes("追加で調査")));
-  assert.equal(r.steps, 2, "回答後の追加調査は同じ調査の続きとして数える");
-  assert.ok(r.evidencePaths.includes("src/app.ts"), "回答後に読んだコードも根拠に加わる");
-  assert.equal(r.notes, "- src/app.ts の handleSubmit から login が呼ばれる");
-  assert.match(quizUser, /【ユーザーに確認した要件/);
-  assert.match(quizUser, /最低文字数を増やす.*補足: 9文字以上/);
-  assert.match(quizUser, /### src\/app\.ts/);
-  assert.deepEqual(
-    r.quiz.items.map((i) => i.kind),
-    ["change"],
-  );
+  assert.equal(inv.steps, 2, "回答後の追加調査は同じ調査の続きとして数える");
+  assert.ok(inv.evidence.paths().includes("src/app.ts"), "回答後に読んだコードも根拠に加わる");
+  assert.equal(inv.notes, "- src/app.ts の handleSubmit から login が呼ばれる");
+
+  const spec = await agent.finalizeSpec(inv, prior, answers, hooks);
+  assert.match(specUser, /最低文字数を増やす.*補足: 9文字以上/);
+  assert.match(specUser, /【確認前の受け入れ条件】\n1\. 弱いパスワードではログインできない/);
+  assert.deepEqual(spec.criteria, ["8文字以下のパスワードではログインできない", "9文字以上ならログインできる"]);
+  assert.equal(spec.answers, answers);
+  assert.deepEqual(spec.contracts, [{ kind: "behavior", subject: "login", description: "最低文字数が9文字になる" }]);
 });
 
 test("要件の確認: 小さな依頼・仕組みの質問では確認しない / 質問が欠けていれば作り直させる / 判定に失敗しても出題は止めない", async (t) => {
@@ -487,22 +488,26 @@ test("要件の確認: 小さな依頼・仕組みの質問では確認しない
 
   // 仕組みの質問は確認の判定自体を行わない
   const read = await agent.investigate("loginはどう動く?", "auto");
-  assert.equal(await agent.clarify(read), undefined);
+  assert.equal((await agent.organize(read)).clarification, undefined);
   assert.equal(scopeCalls, 0);
 
   const change = await agent.investigate("ログイン機能を作り直したい", "auto");
   scopes.push("proceed");
-  assert.equal(await agent.clarify(change), undefined, "小さく一つに決まる依頼はそのまま出題する");
+  const small = await agent.organize(change);
+  assert.equal(small.clarification, undefined, "小さく一つに決まる依頼はそのまま計画に進む");
+  assert.deepEqual(small.spec.criteria, ["ログイン機能を作り直したい"], "受け入れ条件が無ければ依頼文そのものを条件にする");
 
   scopes.push("large-without-questions", "clarify");
-  const c = await agent.clarify(change);
+  const c = (await agent.organize(change)).clarification;
   assert.ok(c, "大きいのに質問が無ければ作り直させて、質問する");
   assert.equal(c.large, true);
   assert.equal(c.questions[0]!.question, "今回どの段階から実装しますか?");
   assert.equal(scopeCalls, 3);
 
   scopes.push("broken");
-  assert.equal(await agent.clarify(change), undefined, "判定に失敗しても出題は止めない");
+  const broken = await agent.organize(change);
+  assert.equal(broken.clarification, undefined, "判定に失敗しても計画は止めない");
+  assert.deepEqual(broken.spec.criteria, ["ログイン機能を作り直したい"]);
 });
 
 test("答え漏れ: ヒント・課題文が答えを含むと書き直させ、直らなければ伏せ字にする", async (t) => {

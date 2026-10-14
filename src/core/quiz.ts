@@ -179,6 +179,8 @@ export interface RawItem {
 export interface ValidateOptions {
   /** 調査で読んだコード全体。既存の関数かどうかの判定に使う */
   knownText?: string;
+  /** 変更計画で検証済みの編集から作る問題(新規ファイルなど、元の範囲より大きく伸びてよい) */
+  allowLong?: boolean;
 }
 
 const IDENT_RE = /[A-Za-z_$][\w$]*/g;
@@ -442,7 +444,7 @@ export function validateRawItem(raw: RawItem, fileText: string, options: Validat
     if (isSameCode(codeLines.join("\n"), original, { loose: true })) {
       return { ok: false, reason: `${label} change問題: newCode が元コードと同じです(変更になっていません)` };
     }
-    if (codeLines.length > originalLines.length * 3 + 30) {
+    if (!options.allowLong && codeLines.length > originalLines.length * 3 + 30) {
       return { ok: false, reason: `${label} change問題: 変更後が元の範囲に比べて長すぎます` };
     }
   }
