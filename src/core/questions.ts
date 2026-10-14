@@ -33,7 +33,7 @@ export function buildCallersQuestion(
   const options = shuffle([...correct, ...distractors.slice(0, need)], rng);
   return {
     id: `callers:${where.path}:${symbol}`,
-    prompt: `「${symbol}」を呼び出している(参照している)関数・メソッドを、すべて選んでください(正解は${correct.length}個)。`,
+    prompt: `「${symbol}」を呼び出している(参照している)関数・メソッドを、すべて選んでください(該当は${correct.length}個)。`,
     options,
     correct: correct.map((c) => options.indexOf(c)).sort((a, b) => a - b),
     explanation: `言語サーバが返した参照元: ${uniqueCallers.join("、")}。`,

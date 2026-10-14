@@ -1,7 +1,7 @@
 {
   "name": "quiz-based-support",
-  "displayName": "quiz-based-support",
-  "description": "System understanding support in a quiz format.",
+  "displayName": "コード思考サポート",
+  "description": "要件からコードの変更までを、プロのエンジニアの考える順序で分解して理解する。",
   "version": "0.1.0",
   "publisher": "local-dev",
   "engines": {
@@ -17,26 +17,26 @@
     "commands": [
       {
         "command": "quiz-based-support.setApiKey",
-        "title": "Quiz Support: Set OpenAI API Key"
+        "title": "コード思考: OpenAI APIキーを設定"
       },
       {
         "command": "quiz-based-support.rebuildIndex",
-        "title": "Quiz Support: Rebuild Code Index"
+        "title": "コード思考: コード索引を作り直す"
       },
       {
         "command": "quiz-based-support.clearIndex",
-        "title": "Quiz Support: Clear Code Index"
+        "title": "コード思考: コード索引を削除"
       },
       {
         "command": "quiz-based-support.showLearningLog",
-        "title": "Quiz Support: Show Learning Log"
+        "title": "コード思考: 学習記録を表示"
       }
     ],
     "viewsContainers": {
       "activitybar": [
         {
           "id": "quiz-support-sidebar",
-          "title": "Quiz Support",
+          "title": "コード思考",
           "icon": "$(comment-discussion)"
         }
       ]
@@ -46,12 +46,12 @@
         {
           "type": "webview",
           "id": "quiz-support-chat",
-          "name": "AI Code Quiz"
+          "name": "要件から変更まで"
         }
       ]
     },
     "configuration": {
-      "title": "Quiz Support",
+      "title": "コード思考",
       "properties": {
         "quizSupport.learnerLevel": {
           "type": "string",
@@ -66,12 +66,12 @@
             "実務エンジニア: 一般的な用語はそのまま使い、設計意図や責務の分担を中心に説明します。",
             "上級: 独自の仕組み・一般的でない技術・設計上のトレードオフを中心に扱います。"
           ],
-          "description": "学習者のレベル。出題の難しさ・用語の扱い・解説の細かさが変わります(サイドバーからも変更できます)。"
+          "description": "学習者のレベル。扱う内容の深さ・用語の扱い・解説の細かさが変わります(サイドバーからも変更できます)。"
         },
         "quizSupport.model": {
           "type": "string",
           "default": "gpt-6-luna",
-          "description": "調査・出題・採点補助に使うチャットモデル名。"
+          "description": "調査・解説の生成・判断の照合に使うチャットモデル名。"
         },
         "quizSupport.reasoningEffort": {
           "type": "string",
@@ -114,7 +114,7 @@
         "quizSupport.structureQuestions": {
           "type": "boolean",
           "default": true,
-          "description": "言語サーバ(LSP)の事実から、呼び出し関係・定義場所の選択式問題を追加する。"
+          "description": "言語サーバ(LSP)の事実から、呼び出し関係・定義場所を確かめる項目を追加する。"
         },
         "quizSupport.autoEmbedMaxTokens": {
           "type": "number",
@@ -129,7 +129,7 @@
         "quizSupport.testMode": {
           "type": "boolean",
           "default": false,
-          "description": "テストモード(開発・検証向け)。OpenAI API を呼び出す前に目的と入力トークン数(見積もり)を表示して実行を確認し、処理ごとの API 使用量・索引の詳細・生成の内部情報(作り直した問題の数・計画の注意など)も表示します。オンのときは、ファイル変更時の埋め込みの自動更新も行いません(サイドバーの「設定」→「テストモード」でも切り替えられます)。"
+          "description": "テストモード(開発・検証向け)。OpenAI API を呼び出す前に目的と入力トークン数(見積もり)を表示して実行を確認し、処理ごとの API 使用量・索引の詳細・生成の内部情報(作り直した内容の数・計画の注意など)も表示します。オンのときは、ファイル変更時の埋め込みの自動更新も行いません(サイドバーの「設定」→「テストモード」でも切り替えられます)。"
         },
         "quizSupport.typeCheck": {
           "type": "boolean",

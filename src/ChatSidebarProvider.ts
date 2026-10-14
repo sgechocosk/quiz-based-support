@@ -261,10 +261,10 @@ export class ChatSidebarProvider
 <div id="app">
   <header id="toolbar">
     <label for="level" class="toolbar-label">学習レベル</label>
-    <select id="level" title="解説の細かさ・用語・問題の難しさが変わります"></select>
+    <select id="level" title="解説の細かさ・用語・扱う内容の深さが変わります"></select>
     <span class="spacer"></span>
     <button id="test-badge" class="badge test hidden" title="テストモード: API 実行前の確認・トークン数・内部の情報を表示中(クリックで設定を開く)">テスト</button>
-    <button id="btn-log" class="toolbar-btn" title="学習記録と復習" aria-expanded="false">学習記録</button>
+    <button id="btn-log" class="toolbar-btn" title="これまでの判断の記録と振り返り" aria-expanded="false">学習記録</button>
     <button id="btn-settings" class="toolbar-btn" title="APIキー・索引・テストモード" aria-expanded="false">設定</button>
   </header>
   <section id="settings-box" class="panel hidden" aria-label="設定">
@@ -294,10 +294,10 @@ export class ChatSidebarProvider
   <footer id="input-area">
     <input type="text" id="query" placeholder="準備中..." disabled aria-label="質問・要望">
     <div id="send-row">
-      <select id="mode" title="出題の種類" aria-label="出題の種類">
+      <select id="mode" title="進め方" aria-label="進め方">
         <option value="auto">自動で判断</option>
-        <option value="read">読んで理解</option>
-        <option value="change">実装して学ぶ</option>
+        <option value="read">仕組みを読み解く</option>
+        <option value="change">変更を組み立てる</option>
       </select>
       <span class="spacer"></span>
       <button id="btn-cancel" class="secondary hidden">中止</button>
@@ -718,7 +718,7 @@ export class ChatSidebarProvider
         throw error;
       }
       // 変更計画を作れなくても止めない: 理由を示して、調査済みのコードから実装のクイズを作る
-      this.status(`⚠ ${error.message}\n実装の手順の代わりに、実装のクイズで出題します。`);
+      this.status(`⚠ ${error.message}\n変更の手順を組み立てる代わりに、調べたコードで変更の考えどころをたどります。`);
       await this.presentQuiz(
         services,
         await agent.composeQuiz(inv, requirementText(inv.query, spec.answers), hooks),
@@ -884,7 +884,7 @@ export class ChatSidebarProvider
       return;
     }
     if (!session.finished) {
-      this.fail(new Error("先にすべてのステップに答えてください。"), "");
+      this.fail(new Error("先にすべてのステップを確かめてください。"), "");
       return;
     }
     if (session.applied) {
@@ -1148,7 +1148,7 @@ export class ChatSidebarProvider
     let questions: McqQuestion[] = [];
     const first = result.quiz.items[0];
     if (readConfig().structureQuestions && first) {
-      this.status("構造クイズ(呼び出し関係)を作成中...", true);
+      this.status("呼び出し関係を整理中...", true);
       questions = (
         await buildStructureQuestions(
           { ws: services.ws, lsp: services.lsp },
@@ -1176,7 +1176,7 @@ export class ChatSidebarProvider
     }
     if (result.quiz.rejected.length > 0 && readConfig().testMode) {
       this.status(
-        `検証で不合格だった${result.quiz.rejected.length}件は作り直し、直らなかったものは除外しました。`,
+        `検証に通らなかった${result.quiz.rejected.length}件は作り直し、直らなかったものは除外しました。`,
       );
     }
   }
@@ -1207,7 +1207,7 @@ export class ChatSidebarProvider
     const session = this.sessions.get(String(m.quizId ?? ""));
     if (!session) {
       this.fail(
-        new Error("このクイズは失効しました。もう一度質問してください。"),
+        new Error("この内容は失効しました。もう一度質問してください。"),
         "",
       );
       return;
@@ -1226,7 +1226,7 @@ export class ChatSidebarProvider
       ? m.choices.map((a: unknown) => (Array.isArray(a) ? a.map(Number) : []))
       : [];
 
-    this.status("採点中...", true);
+    this.status("確認中...", true);
     const results: BlankResult[] = [];
     const itemResults: Array<{
       grades: Awaited<ReturnType<typeof gradeItem>>["grades"];
@@ -1290,7 +1290,7 @@ export class ChatSidebarProvider
     if (!session || !item || !services) {
       this.fail(
         new Error(
-          "反映対象が見つかりません(クイズが失効した可能性があります)。",
+          "反映対象が見つかりません(内容が失効した可能性があります)。",
         ),
         "",
       );
@@ -1299,14 +1299,14 @@ export class ChatSidebarProvider
     if (item.kind !== "change" || session.review) {
       this.fail(
         new Error(
-          "この問題は既存コードの理解問題なので、反映対象ではありません。",
+          "これは既存コードを読み解く内容なので、反映するものはありません。",
         ),
         "",
       );
       return;
     }
     if (!session.graded) {
-      this.fail(new Error("先に解答して採点してください。"), "");
+      this.fail(new Error("先に考えを確かめてください。"), "");
       return;
     }
     const uri = services.ws.uriOf(item.path);
@@ -1315,7 +1315,7 @@ export class ChatSidebarProvider
     applyItemToText(doc.getText(), item);
 
     const choice = await vscode.window.showWarningMessage(
-      `${item.path} の ${item.startLine}〜${item.endLine} 行目を、正解コードで書き換えます。`,
+      `${item.path} の ${item.startLine}〜${item.endLine} 行目を、このコードで書き換えます。`,
       {
         modal: true,
         detail: "反映後は通常の編集と同じく、元に戻す(Undo)で取り消せます。",
@@ -1401,7 +1401,7 @@ export class ChatSidebarProvider
     }
     const cards: ReviewCard[] = this.log.dueCards(Date.now(), 5);
     if (cards.length === 0) {
-      this.status("いま復習するカードはありません。");
+      this.status("いま振り返る箇所はありません。");
       return;
     }
     const items: QuizItem[] = cards.map((c) => ({
@@ -1429,7 +1429,7 @@ export class ChatSidebarProvider
       items,
       questions: [],
       overall:
-        "復習おつかれさまです。間違えた箇所は間隔を空けてまた出題されます。",
+        "判断が分かれた箇所は、間隔を空けてまた振り返ります。",
       graded: false,
     };
     this.sessions.set(session.id, session);
@@ -1437,8 +1437,8 @@ export class ChatSidebarProvider
       type: "quiz",
       quiz: this.payloadOf(
         session,
-        "復習",
-        "前に間違えた・ヒントを使った箇所をもう一度。",
+        "振り返り",
+        "前に判断が分かれた・手がかりを使った箇所を、もう一度考えます。",
       ),
     });
   }

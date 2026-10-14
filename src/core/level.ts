@@ -24,9 +24,19 @@ export function coerceLevel(value: unknown): LearnerLevel {
   return LEARNER_LEVELS.includes(value as LearnerLevel) ? (value as LearnerLevel) : "intermediate";
 }
 
+/**
+ * 学習者に見せる文章の言葉づかい(全プロンプト共通)。
+ * 画面は「プロのエンジニアが要件からどう考えて変更するか」をたどる形にしているので、試験のような言葉は使わせない。
+ */
+export const WORDING_RULE =
+  "学習者に見せる文章(目標・課題・手がかり・解説・理由など)では「問題」「クイズ」「出題」「正解」「不正解」「空欄」「穴埋め」「採点」「解答」「ヒント」「〜問」といった試験のような言葉を使わない。" +
+  "エンジニアが要件からコードを読み、考え、変更する過程として書く(例: 「この空欄には」→「ここに入るコードは」、「正解は」→「このコードになるのは」、「この問題では」→「この変更では」「このコードでは」)。";
+
 /** 出題プロンプトに入れる、レベル別の指針 */
 export function levelGuide(level: LearnerLevel): string {
   const common = [
+    "【学習者に見せる文章の言葉づかい(全レベル共通)】",
+    `- ${WORDING_RULE}`,
     "【解説の飛躍を避ける(全レベル共通)】",
     "- 結論だけを書かない。「根拠の行(ファイル名:行) → そこで何が起きるか → だからこのコードになる」の順に、途中の段階を省かない。",
     "- 参照コードに無い仕組み・ライブラリの内部動作を推測で語らない。分からないことは書かない。",
@@ -72,5 +82,5 @@ export function levelStyle(level: LearnerLevel): string {
     beginner: "読み手は初学者です。専門用語は避けるか、短く言い換えてください。",
     intermediate: "読み手は実務エンジニアです。一般的な技術用語はそのまま使って構いません。",
     advanced: "読み手は上級者です。簡潔に、要点だけを書いてください。",
-  }[level];
+  }[level] + WORDING_RULE;
 }

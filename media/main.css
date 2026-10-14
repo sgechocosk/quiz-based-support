@@ -1,7 +1,8 @@
 /*
  * 見た目の方針
  * - 色はすべて VS Code のテーマ変数から取る(明るい/暗い/ハイコントラストのテーマに追従)
- * - AI の返答は「カード」(見出し → 本文のセクション → 操作ボタン)にまとめ、利用者の発言は右寄せの吹き出しにする
+ * - AI の返答は「カード」(見出し → 本文 → 操作ボタン)にまとめ、利用者の発言は右寄せの吹き出しにする
+ * - 本文は、エンジニアが考える順序を番号つきの縦の流れ(.chain / .thought)で見せる。試験のような見た目(点数・正誤の大きな表示)は使わない
  * - 補足的な情報は折りたたみ(details)に入れ、最初に目に入る情報を減らす
  */
 :root {
@@ -97,14 +98,26 @@ button.level-choice span { font-size: 12px; opacity: 0.9; }
 .card-foot { display: flex; gap: 6px; align-items: center; flex-wrap: wrap; padding-top: 2px; }
 .goal { margin: 0; font-size: 13px; }
 
+/* 考える順序: 番号つきの縦の流れ。番号の丸を縦線でつなぎ、①→②→③ とたどれるようにする */
+.chain { display: flex; flex-direction: column; counter-reset: thought; }
+.thought { position: relative; padding: 0 0 14px 28px; counter-increment: thought; min-width: 0; }
+.thought:last-child { padding-bottom: 2px; }
+.thought::before { content: counter(thought); position: absolute; left: 0; top: 0; width: 18px; height: 18px; box-sizing: border-box; border-radius: 50%; border: 1px solid var(--accent); color: var(--vscode-foreground); background: var(--card-bg); font-size: 11px; line-height: 16px; text-align: center; font-weight: 600; }
+.thought::after { content: ""; position: absolute; left: 8.5px; top: 20px; bottom: 2px; width: 1px; background: var(--border); }
+.thought:last-child::after { display: none; }
+.thought:has(+ .thought.hidden:last-child)::after { display: none; }
+.thought-label { font-weight: 600; line-height: 18px; margin-bottom: 4px; }
+.thought-body { display: flex; flex-direction: column; gap: 6px; min-width: 0; }
+.chain .chain .thought::before { width: 16px; height: 16px; line-height: 14px; font-size: 10px; border-color: var(--muted); color: var(--muted); }
+.chain .chain .thought::after { left: 7.5px; top: 18px; }
+.chain .chain .thought { padding-left: 24px; }
+.chain .chain .thought-label { font-size: 12px; line-height: 16px; }
+
 /* セクション: 小さな見出し + 内容 */
 .section { display: flex; flex-direction: column; gap: 4px; }
 .section-label { font-size: 11px; font-weight: 600; color: var(--muted); letter-spacing: 0.02em; }
 .badge { font-size: 11px; padding: 0 6px; border-radius: 8px; background: var(--vscode-badge-background); color: var(--vscode-badge-foreground); white-space: nowrap; line-height: 1.6; }
 .badge.quiet { background: transparent; color: var(--muted); border: 1px solid var(--subtle-border); }
-.badge.score { background: transparent; border: 1px solid currentColor; }
-.badge.score.good { color: var(--ok); }
-.badge.score.fair { color: var(--warn); }
 button.badge.test { border: 1px solid var(--warn); background: var(--warn-bg); color: var(--vscode-foreground); padding: 0 6px; font-size: 11px; cursor: pointer; }
 
 /* 折りたたみ */
@@ -127,12 +140,10 @@ details.section-fold > *:not(summary) { margin-top: 4px; }
 .file-link { color: var(--vscode-textLink-foreground); font-family: var(--code-font); font-size: 12px; text-decoration: none; word-break: break-all; }
 .file-link:hover { text-decoration: underline; }
 
-/* ---------- クイズ ---------- */
+/* ---------- コードと判断ポイント ---------- */
 textarea.prediction { width: 100%; box-sizing: border-box; resize: vertical; background: var(--vscode-input-background); color: var(--vscode-input-foreground); border: 1px solid var(--vscode-input-border, transparent); border-radius: 2px; padding: 4px 6px; font-family: inherit; }
-.quiz-item { display: flex; flex-direction: column; gap: 8px; padding-top: 10px; border-top: 1px solid var(--subtle-border); }
-.quiz-item:first-of-type { border-top: none; padding-top: 0; }
-.quiz-head { display: flex; gap: 6px; align-items: center; flex-wrap: wrap; }
-.item-no { font-weight: 600; }
+.code-item { display: flex; flex-direction: column; gap: 8px; min-width: 0; }
+.item-head { display: flex; gap: 6px; align-items: center; flex-wrap: wrap; }
 pre.code { margin: 0; padding: 6px 8px; background: var(--vscode-textCodeBlock-background); border-radius: var(--radius); overflow-x: auto; font-family: var(--code-font); font-size: var(--vscode-editor-font-size); line-height: 1.5; }
 .code-line { white-space: pre; }
 .code-line.add { background: var(--ok-bg); }
@@ -143,9 +154,10 @@ pre.code { margin: 0; padding: 6px 8px; background: var(--vscode-textCodeBlock-b
 .slot { display: inline-block; min-width: 4ch; padding: 0 4px; margin: 0 1px; border: 1px dashed var(--accent); border-radius: 3px; color: var(--muted); cursor: pointer; }
 .slot.filled { border-style: solid; color: var(--vscode-foreground); background: var(--vscode-editor-selectionBackground); }
 .slot.correct { border-color: var(--ok); background: var(--ok-bg); }
-.slot.incorrect { border-color: var(--ng); background: var(--ng-bg); }
+/* 判断が異なったところは「誤り」ではなく「エンジニアの判断との違い」なので、赤ではなく注意色で示す */
+.slot.incorrect { border-color: var(--warn); background: var(--warn-bg); }
 
-/* 空欄ごとの選択肢 */
+/* 判断ポイントごとの候補 */
 .blank-group { display: flex; flex-direction: column; gap: 4px; padding: 6px 8px; border: 1px solid var(--subtle-border); border-radius: var(--radius); scroll-margin: 8px; }
 .hint-head { display: flex; gap: 6px; align-items: center; flex-wrap: wrap; font-size: 12px; }
 .blank-no { font-weight: 600; font-size: 11px; padding: 0 6px; border-radius: 3px; border: 1px solid var(--accent); }
@@ -158,30 +170,30 @@ button.choice code { font-family: var(--code-font); font-size: var(--vscode-edit
 button.choice.selected { border-color: var(--accent); background: var(--vscode-list-activeSelectionBackground); color: var(--vscode-list-activeSelectionForeground); }
 button.choice.eliminated { text-decoration: line-through; }
 button.choice.right { border-color: var(--ok); background: var(--ok-bg); color: var(--vscode-foreground); opacity: 1; }
-button.choice.wrong { border-color: var(--ng); background: var(--ng-bg); color: var(--vscode-foreground); opacity: 1; }
+button.choice.wrong { border-color: var(--warn); background: var(--warn-bg); color: var(--vscode-foreground); opacity: 1; }
 .choice-note { font-size: 12px; color: var(--muted); padding-left: 8px; white-space: pre-wrap; }
 .hint-text { display: flex; flex-direction: column; gap: 2px; font-size: 12px; white-space: pre-wrap; color: var(--muted); }
 .hint-text:empty { display: none; }
 .result { font-size: 12px; white-space: pre-wrap; }
 .result:empty { display: none; }
 .result.ok { color: var(--ok); }
-.result.ng { color: var(--ng); }
+.result.ng { color: var(--warn); }
 .why-blank { color: var(--vscode-foreground); margin-top: 2px; }
 .after { display: flex; flex-direction: column; gap: 6px; }
 .after:empty { display: none; }
 .explain { white-space: pre-wrap; }
 .unanswered { font-size: 12px; color: var(--warn); }
 
-/* 採点の結果(カードの最後) */
-.summary { display: flex; flex-direction: column; gap: 6px; padding: 8px 10px; border-radius: var(--radius); background: var(--vscode-textBlockQuote-background); border-left: 3px solid var(--accent); white-space: pre-wrap; }
-.score { font-weight: 600; font-size: 13px; }
+/* 振り返り・変更の全体像(カードの最後) */
+.summary { display: flex; flex-direction: column; gap: 8px; padding: 8px 10px; border-radius: var(--radius); background: var(--vscode-textBlockQuote-background); border-left: 3px solid var(--accent); white-space: pre-wrap; }
+.summary-title { font-weight: 600; font-size: 13px; }
 
-/* 選択式の問題(構造クイズ・次に確認すべき場所・要件の確認) */
+/* 候補から選ぶもの(呼び出し関係・次に確認すべき場所・要件を詰める) */
 fieldset.mcq { border: 1px solid var(--subtle-border); border-radius: var(--radius); margin: 0; padding: 6px 10px 8px; display: flex; flex-direction: column; gap: 4px; }
 fieldset.mcq legend { font-size: 11px; font-weight: 600; color: var(--muted); padding: 0 4px; }
 .mcq label { display: flex; gap: 6px; align-items: center; padding: 2px 0; font-family: var(--code-font); font-size: 12px; cursor: pointer; }
 .mcq label.right { color: var(--ok); font-weight: 600; }
-.mcq label.wrong { color: var(--ng); text-decoration: line-through; }
+.mcq label.wrong { color: var(--warn); }
 .mcq .why { font-size: 12px; color: var(--muted); white-space: pre-wrap; }
 .mcq .why:empty { display: none; }
 
@@ -210,7 +222,8 @@ details.lesson-step > summary::-webkit-details-marker { display: none; }
 details.lesson-step > summary::before { content: "▸"; color: var(--muted); width: 10px; }
 details.lesson-step[open] > summary::before { content: "▾"; }
 details.lesson-step[open] > summary { border-bottom: 1px solid var(--subtle-border); }
-.step-body { display: flex; flex-direction: column; gap: 8px; padding: 8px; }
+.step-body { display: flex; flex-direction: column; gap: 8px; padding: 10px 8px 4px; }
+details.lesson-step > .card-foot { padding: 0 8px 8px 32px; }
 .step-no { font-size: 11px; color: var(--muted); }
 .step-label { font-weight: 600; flex: 1 1 60%; min-width: 0; }
 .contract { font-size: 12px; padding: 3px 8px; border: 1px dashed var(--subtle-border); border-radius: var(--radius); white-space: pre-wrap; }

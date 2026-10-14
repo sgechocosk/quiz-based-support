@@ -818,9 +818,9 @@ export class QuizAgent {
    */
   async composeQuiz(inv: Investigation, requirement: string, hooks: RunHooks = {}): Promise<AgentResult> {
     const status = hooks.onStatus ?? (() => undefined);
-    status("クイズを作成中...");
+    status("コードの考えどころを整理中...");
     const quiz = await this.generateQuiz(inv, requirement, hooks);
-    status("ヒントが答えを漏らしていないか確認中...");
+    status("手がかりの文章を点検中...");
     await this.removeLeaks(quiz, hooks);
     return { quiz, evidencePaths: inv.evidence.paths(), notes: inv.notes, steps: inv.steps };
   }
@@ -896,7 +896,7 @@ export class QuizAgent {
         if (accepted.length > 0) {
           break;
         }
-        throw new Error("クイズのJSONを解釈できませんでした。もう一度お試しください。");
+        throw new Error("生成結果を解釈できませんでした。もう一度お試しください。");
       }
       goal ||= parsed.goal ?? "";
       overall ||= parsed.overallExplanation ?? "";
@@ -959,13 +959,13 @@ export class QuizAgent {
       );
     }
     if (accepted.length === 0) {
-      throw new Error(`検証に通るクイズを作れませんでした。\n${rejected.slice(0, 4).join("\n")}`);
+      throw new Error(`検証に通る内容を作れませんでした。\n${rejected.slice(0, 4).join("\n")}`);
     }
     // 実装問題を主役にする: 手本の読解 → 実装 の順に並べる
     accepted.sort((a, b) => (a.kind === b.kind ? 0 : a.kind === "read" ? -1 : 1));
     const notice =
       needChange && !accepted.some((a) => a.kind === "change")
-        ? "実装問題を検証に通る形で作れなかったため、今回は読解問題のみです。変更したい場所(ファイル名や関数名)を含めて質問し直すと、実装問題を作りやすくなります。"
+        ? "変更の考えどころを検証に通る形で作れなかったため、今回は既存コードの読み解きだけです。変更したい場所(ファイル名や関数名)を含めて質問し直すと、変更まで扱いやすくなります。"
         : undefined;
     return { goal, overallExplanation: overall, items: accepted, rejected, notice };
   }

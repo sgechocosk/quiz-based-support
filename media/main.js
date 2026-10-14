@@ -158,11 +158,11 @@
     const hint = el(
       "div",
       { id: "empty-hint", class: "empty-hint" },
-      el("strong", { text: "コードを読んで、クイズで理解する" }),
+      el("strong", { text: "エンジニアの考え方で、コードと変更を分解する" }),
       el("div", { text: "下の入力欄に、知りたい仕組みや実装したいことを書いてください。" }),
     );
     const list = el("ul");
-    for (const t of ["仕組みの質問 → 実際のコードを使った穴埋めクイズ", "実装・修正の依頼 → 変更の手順を1ステップずつ"]) {
+    for (const t of ["仕組みの質問 → 実際のコードを、判断のポイントごとに読み解く", "実装・修正の依頼 → 要件から変更までを、考える順に1ステップずつ"]) {
       list.append(el("li", { text: t }));
     }
     hint.append(list);
@@ -175,6 +175,21 @@
     const body = el("div", { class: "card-body" });
     const root = el("div", { class: `message card ${kindClass}` }, head, body);
     return { root, head, body };
+  }
+
+  /**
+   * 考える順序を、番号つきの縦の流れ(①目的 → ②場所 → ③…)で見せる。
+   * エンジニアが要件からどう考えて変更するかを、1段ずつたどれるようにする。
+   */
+  function chain() {
+    return el("div", { class: "chain" });
+  }
+
+  /** chain の1段(番号は CSS の counter で振る) */
+  function thought(label, ...children) {
+    const body = el("div", { class: "thought-body" }, ...children);
+    const node = el("div", { class: "thought" }, el("div", { class: "thought-label", text: label }), body);
+    return { node, body };
   }
 
   /** 小さな見出しつきのまとまり */
@@ -246,13 +261,13 @@
     const box = $("setup-box");
     box.replaceChildren();
     if (!state.hasWorkspace) {
-      box.append(el("h4", { text: "フォルダを開いてください" }), el("div", { class: "muted", text: "開いたフォルダのコードを調べて出題します。" }));
+      box.append(el("h4", { text: "フォルダを開いてください" }), el("div", { class: "muted", text: "開いたフォルダのコードを調べて、考え方をたどります。" }));
     } else if (!state.hasKey) {
       const btn = el("button", { text: "APIキーを設定" });
       btn.onclick = () => vscode.postMessage({ type: "setApiKey" });
       box.append(
         el("h4", { text: "OpenAI APIキーを設定してください" }),
-        el("div", { class: "muted", text: "コードの調査と出題に使います。キーはこのPCの VS Code のシークレットに保存されます。" }),
+        el("div", { class: "muted", text: "コードの調査と解説の生成に使います。キーはこのPCの VS Code のシークレットに保存されます。" }),
         el("div", { class: "row" }, btn),
       );
     }
@@ -283,7 +298,7 @@
     }
     box.append(
       el("h4", { text: "はじめに: 学習レベルを選んでください" }),
-      el("div", { class: "muted", text: "問題の難しさ・用語の説明・解説の細かさを合わせます。あとから上の「学習レベル」でいつでも変えられます。" }),
+      el("div", { class: "muted", text: "扱う内容の深さ・用語の説明・解説の細かさを合わせます。あとから上の「学習レベル」でいつでも変えられます。" }),
     );
     for (const l of levels) {
       const btn = el("button", { class: "level-choice secondary" }, el("strong", { text: l.label }), el("span", { text: l.description }));
@@ -302,23 +317,23 @@
     const box = panels.log;
     box.replaceChildren();
     const l = state.learning;
-    box.append(panelHead("学習記録(このワークスペース)", () => togglePanel("log", false)));
+    box.append(panelHead("これまでの判断(このワークスペース)", () => togglePanel("log", false)));
     if (!l || l.blanks === 0) {
-      box.append(el("div", { class: "muted", text: "まだ記録がありません。クイズに答えるとここに溜まります。" }));
+      box.append(el("div", { class: "muted", text: "まだ記録がありません。考えを確かめるとここに残ります。" }));
     } else {
       const stat = (value, label) => el("div", { class: "stat" }, el("strong", { text: value }), el("span", { text: label }));
       box.append(
-        el("div", { class: "stat-line" }, stat(`${Math.round(l.accuracy * 100)}%`, "正答率"), stat(String(l.sessions), "解答回数"), stat(String(l.blanks), "空欄の数")),
+        el("div", { class: "stat-line" }, stat(`${Math.round(l.accuracy * 100)}%`, "判断の一致率"), stat(String(l.sessions), "取り組んだ回数"), stat(String(l.blanks), "判断ポイント")),
       );
       if (l.weak.length > 0) {
         const list = el("div", { class: "refs" });
         for (const w of l.weak) {
           list.append(el("div", { text: `・${w.concept}: ${Math.round(w.accuracy * 100)}%(${w.attempts}問)` }));
         }
-        box.append(section("苦手な概念(正答率の低い順)", list));
+        box.append(section("見直したい観点(一致率の低い順)", list));
       }
     }
-    const review = el("button", { text: `復習する(${l ? l.dueCount : 0}件)` });
+    const review = el("button", { text: `振り返る(${l ? l.dueCount : 0}件)` });
     review.disabled = !l || l.dueCount === 0 || state.busy;
     review.onclick = () => {
       vscode.postMessage({ type: "startReview" });
@@ -418,41 +433,33 @@
   }
 
   /**
-   * 穴埋め問題1件(コード・空欄・選択肢・段階ヒント)。クイズと実装の手順で共通。
-   * locked() が true の間は選択を変えられない(採点後)。
+   * コード1か所と、その中の判断ポイント(候補から選ぶ・段階的な手がかり)。読み解きと変更の手順で共通。
+   * locked() が true の間は選択を変えられない(考えを確かめた後)。
    */
   function renderItem(item, locked, options = {}) {
-    const block = el("div", { class: "quiz-item" });
+    const block = el("div", { class: "code-item" });
     const isChange = item.kind === "change";
     if (!options.noHead) {
-      block.append(
-        el(
-          "div",
-          { class: "quiz-head" },
-          options.number ? el("span", { class: "item-no", text: `問題 ${options.number}` }) : null,
-          el("span", { class: isChange ? "badge" : "badge quiet", text: isChange ? "実装" : "読解" }),
-          codeLink(item.path, item.startLine, `${item.path}:${item.startLine}-${item.endLine}`),
-        ),
-      );
+      block.append(el("div", { class: "item-head" }, codeLink(item.path, item.startLine, `${item.path}:${item.startLine}-${item.endLine}`)));
     }
     if (item.task) {
-      block.append(el("div", { class: "task" }, el("span", { class: "task-label", text: isChange ? "課題" : "読みどころ" }), document.createTextNode(item.task)));
+      block.append(el("div", { class: "task" }, el("span", { class: "task-label", text: "ねらい" }), document.createTextNode(item.task)));
     }
     if (item.newNames && item.newNames.length > 0) {
-      const names = el("div", { class: "names" }, el("div", { class: "section-label", text: "この問題で新しく作る名前" }));
+      const names = el("div", { class: "names" }, el("div", { class: "section-label", text: "この変更で新しく作る名前" }));
       for (const n of item.newNames) {
         names.append(el("div", {}, el("code", { text: n.name }), n.role ? document.createTextNode(` — ${n.role}`) : null));
       }
       block.append(names);
     }
     if (item.refs && item.refs.length > 0) {
-      // 実装の問題では手本として読むので開いておき、読解の問題では折りたたむ
+      // 変更では手本として読むので開いておき、読み解きでは折りたたむ
       const refs = el("div", { class: "refs" });
       item.refs.forEach((r) => refs.append(refLine("・", r)));
-      block.append(details(`参考にするコード(${item.refs.length})`, [refs], isChange));
+      block.append(details(`手本・参照するコード(${item.refs.length})`, [refs], isChange));
     }
 
-    /** コード中の空欄(選んだ選択肢がここにはまる) */
+    /** コード中の判断ポイント(選んだ候補がここにはまる) */
     const slots = [];
     const pre = el("pre", { class: "code" });
     // 折りたたむ行 → その範囲の [開始, 終了]
@@ -465,7 +472,7 @@
         const count = fold[1] - fold[0] + 1;
         const rows = [];
         foldedRows = rows;
-        const toggle = el("div", { class: "code-fold", text: `⋯ ${count}行省略(クリックで表示)`, title: "空欄と直接関係しない行" });
+        const toggle = el("div", { class: "code-fold", text: `⋯ ${count}行省略(クリックで表示)`, title: "判断ポイントと直接関係しない行" });
         toggle.addEventListener("click", () => {
           rows.forEach((r) => r.classList.remove("hidden"));
           toggle.remove();
@@ -484,7 +491,7 @@
         }
         if (i < parts.length - 1) {
           const n = slots.length + 1;
-          const slot = el("span", { class: "slot", text: `［ ${n} ］`, title: `空欄${n}: 下の選択肢から選んでください`, tabIndex: 0 });
+          const slot = el("span", { class: "slot", text: `［ ${n} ］`, title: `判断 ${n}: 下の候補から選んでください`, tabIndex: 0 });
           slots.push(slot);
           row.append(slot);
         }
@@ -502,14 +509,14 @@
     item.blanks.forEach((blank, k) => {
       const slot = slots[k];
       const buttons = blank.options.map((code, o) => {
-        const b = el("button", { class: "choice", title: "この選択肢を空欄に入れる" }, el("code", { text: code }));
+        const b = el("button", { class: "choice", title: "この候補をコードに当てはめる" }, el("code", { text: code }));
         b.onclick = () => {
           if (locked() || b.disabled) {
             return;
           }
           picked[k] = o;
           buttons.forEach((x, i) => x.classList.toggle("selected", i === o));
-          // 選んだコードを空欄にはめて、前後とつながるかを見ながら考えられるようにする
+          // 選んだコードをコードの中にはめて、前後とつながるかを見ながら考えられるようにする
           slot.textContent = code;
           slot.classList.add("filled");
         };
@@ -517,10 +524,10 @@
       });
       const notes = blank.options.map(() => el("div", { class: "choice-note hidden" }));
 
-      // ヒントの段階: 概念 → 考え方 → 手がかりの場所(あれば) → 誤りの選択肢を1つ消す(あれば)
+      // 手がかりの段階: 概念 → 考え方 → 読む場所(あれば) → 当てはまらない候補を1つ消す(あれば)
       const steps = blank.hints.filter((h) => h && h.trim()).map((h) => () => document.createTextNode(h));
       if (blank.clue) {
-        steps.push(() => refLine("この場所を読んでみよう: ", blank.clue));
+        steps.push(() => refLine("この場所を読むと判断できます: ", blank.clue));
       }
       if (blank.eliminate) {
         steps.push(() => {
@@ -534,18 +541,18 @@
             slot.textContent = `［ ${k + 1} ］`;
             slot.classList.remove("filled");
           }
-          return document.createTextNode(`選択肢「${blank.options[e.index]}」は誤りです。${e.note ? `理由: ${e.note}` : ""}`);
+          return document.createTextNode(`候補「${blank.options[e.index]}」は当てはまりません。${e.note ? `理由: ${e.note}` : ""}`);
         });
       }
       const text = el("div", { class: "hint-text" });
-      const hintBtn = el("button", { class: "link", text: steps.length ? `ヒント(0/${steps.length})` : "ヒントなし" });
+      const hintBtn = el("button", { class: "link", text: steps.length ? `考える手がかり(0/${steps.length})` : "" });
       hintBtn.disabled = steps.length === 0;
       hintBtn.onclick = () => {
         if (levels[k] < steps.length) {
           const step = steps[levels[k]];
           levels[k]++;
-          text.append(el("div", {}, document.createTextNode(`ヒント${levels[k]}: `), step()));
-          hintBtn.textContent = levels[k] < steps.length ? `次のヒント(${levels[k]}/${steps.length})` : "ヒントは以上です";
+          text.append(el("div", {}, document.createTextNode(`手がかり${levels[k]}: `), step()));
+          hintBtn.textContent = levels[k] < steps.length ? `次の手がかり(${levels[k]}/${steps.length})` : "手がかりは以上です";
           hintBtn.disabled = levels[k] >= steps.length;
         }
       };
@@ -555,7 +562,7 @@
       const group = el(
         "div",
         { class: "blank-group" },
-        el("div", { class: "hint-head" }, el("span", { class: "blank-no", text: `空欄 ${k + 1}` }), el("span", { class: "concept", text: blank.concept }), hintBtn),
+        el("div", { class: "hint-head" }, el("span", { class: "blank-no", text: `判断 ${k + 1}` }), el("span", { class: "concept", text: blank.concept }), steps.length ? hintBtn : null),
         list,
         text,
         result,
@@ -569,7 +576,7 @@
     return { block, state: { picked, levels, groups, after, kind: item.kind, index: item.index } };
   }
 
-  /** 採点結果を空欄・選択肢に書き込む */
+  /** 確かめた結果を、判断ポイント・候補に書き込む(実際のコードと、その根拠) */
   function markItemGrades(it, grades) {
     grades.forEach((g, k) => {
       const group = it.groups[k];
@@ -578,95 +585,101 @@
       }
       group.buttons.forEach((b) => (b.disabled = true));
       group.slot.classList.add(g.correct ? "correct" : "incorrect");
-      if (!group.slot.classList.contains("filled")) {
-        group.slot.textContent = "(未選択)";
-      }
+      // 合っていれば選んだコードのまま、違えば実際のコードに置き換えて、完成したコードとして読めるようにする
+      group.slot.textContent = g.expected;
       group.buttons.forEach((b, o) => {
         if (o === g.correctIndex) {
           b.classList.add("right");
         } else if (o === g.chosen) {
           b.classList.add("wrong");
         }
-        // 選んだ誤答には「なぜ違うか」を出す(他の誤答の解説は情報が多くなりすぎるので出さない)
+        // 選んだ候補が違ったときだけ「選ばない理由」を出す(他の候補の理由は情報が多くなりすぎるので出さない)
         if (o === g.chosen && o !== g.correctIndex && g.notes[o]) {
-          group.notes[o].textContent = `なぜ違う: ${g.notes[o]}`;
+          group.notes[o].textContent = `選ばない理由: ${g.notes[o]}`;
           group.notes[o].classList.remove("hidden");
         }
       });
       const out = group.result;
       out.replaceChildren();
       out.className = `result ${g.correct ? "ok" : "ng"}`;
-      out.append(document.createTextNode(g.correct ? "○ 正解" : g.note === "未選択" ? "× 未選択" : "× 不正解"));
+      const actual = it.kind === "change" ? "このコードにする" : "実際のコード";
+      out.append(document.createTextNode(g.correct ? "✓ 判断が一致" : g.note === "未選択" ? `– 未選択 → ${actual}: ` : `✗ 判断が異なる → ${actual}: `));
       if (!g.correct) {
-        out.append(document.createTextNode("  正解: "), el("code", { text: g.expected }));
+        out.append(el("code", { text: g.expected }));
       }
       if (g.why) {
-        out.append(el("div", { class: "why-blank", text: `なぜ: ${g.why}` }));
+        out.append(el("div", { class: "why-blank", text: `根拠: ${g.why}` }));
       }
     });
   }
 
-  /** 正答率に応じた結果のバッジ */
-  function scoreBadge(score) {
-    const rate = score.total > 0 ? score.correct / score.total : 0;
-    return el("span", { class: `badge score ${rate >= 0.8 ? "good" : rate >= 0.5 ? "fair" : ""}`, text: `${score.correct}/${score.total} 正解` });
-  }
-
+  /**
+   * 仕組みを読み解く(変更の考えどころを含むこともある)。
+   * ①何を理解するか → ②③…コードを読み、判断ポイントを考える → 呼び出し関係を確かめる → 振り返り、の順に並べる。
+   */
   function renderQuiz(q) {
-    const blankCount = q.items.reduce((n, item) => n + item.blanks.length, 0);
-    const count = q.items.length + q.questions.length;
-    const { root, head, body } = card("quiz", q.review ? "復習" : "クイズ", el("span", { class: "badge quiet", text: `${count}問・空欄${blankCount}個` }));
-    if (q.goal) {
-      body.append(el("p", { class: "goal", text: q.goal }));
-    }
+    const hasChange = q.items.some((item) => item.kind === "change");
+    const title = q.review ? "振り返り" : hasChange ? "変更の考えどころ" : "仕組みの読み解き";
+    const { root, head, body } = card("reading", title);
+    const flow = chain();
+    body.append(flow);
     const entry = { id: q.id, root, head, body, items: [], questions: [], prediction: null, graded: false, foot: null, gradeBtn: null };
 
+    const purpose = thought(q.review ? "もう一度考えること" : "何を理解するか");
+    if (q.goal) {
+      purpose.body.append(el("p", { class: "goal", text: q.goal }));
+    }
     if (!q.review) {
-      // 予想メモは任意。入力の負担を増やさないよう、開いたときだけ表示する
+      // 見立てのメモは任意。入力の負担を増やさないよう、開いたときだけ表示する
       const prediction = el("textarea", { class: "prediction hidden", rows: 2, placeholder: "このコードは何をしていそう?(自分の言葉で一言)" });
-      const toggle = el("button", { class: "link", text: "＋ 先に予想をメモする(任意)" });
+      const toggle = el("button", { class: "link", text: "＋ 読む前に、自分の見立てを書いておく(任意)" });
       toggle.onclick = () => {
         prediction.classList.remove("hidden");
         toggle.remove();
         prediction.focus();
       };
       entry.prediction = prediction;
-      body.append(el("div", {}, toggle, prediction));
+      purpose.body.append(el("div", {}, toggle, prediction));
     }
+    flow.append(purpose.node);
 
-    q.items.forEach((item, i) => {
-      const { block, state } = renderItem(item, () => entry.graded, { number: count > 1 ? i + 1 : 0 });
-      entry.items.push(state);
-      body.append(block);
+    q.items.forEach((item) => {
+      const { block, state } = renderItem(item, () => entry.graded);
+      entry.items.push({ ...state, path: item.path, concepts: item.blanks.map((b) => b.concept) });
+      flow.append(thought(item.kind === "change" ? "どう変えるか" : "どこを、どう読むか", block).node);
     });
 
-    for (const question of q.questions) {
-      const set = el("fieldset", { class: "mcq" }, el("legend", { text: `構造クイズ ${question.index + 1}` }), el("div", { text: question.prompt }));
-      const name = `q-${q.id}-${question.index}`;
-      const labels = question.options.map((option, i) => {
-        const input = el("input", { type: question.multi ? "checkbox" : "radio", name, value: String(i) });
-        const label = el("label", {}, input, document.createTextNode(option));
-        set.append(label);
-        return { input, label };
-      });
-      const why = el("div", { class: "why" });
-      set.append(why);
-      entry.questions.push({ labels, why });
-      body.append(set);
+    if (q.questions.length > 0) {
+      const step = thought("呼び出し関係を確かめる");
+      for (const question of q.questions) {
+        const set = el("fieldset", { class: "mcq" }, el("legend", { text: "つながり" }), el("div", { text: question.prompt }));
+        const name = `q-${q.id}-${question.index}`;
+        const labels = question.options.map((option, i) => {
+          const input = el("input", { type: question.multi ? "checkbox" : "radio", name, value: String(i) });
+          const label = el("label", {}, input, document.createTextNode(option));
+          set.append(label);
+          return { input, label };
+        });
+        const why = el("div", { class: "why" });
+        set.append(why);
+        entry.questions.push({ labels, why });
+        step.body.append(set);
+      }
+      flow.append(step.node);
     }
 
-    const gradeBtn = el("button", { text: "採点する" });
+    const gradeBtn = el("button", { text: "考えを確かめる" });
     const unanswered = el("span", { class: "unanswered" });
     gradeBtn.onclick = () => {
       const left = entry.items.reduce((n, it) => n + it.picked.filter((p) => p < 0).length, 0);
       if (left > 0 && !unanswered.textContent) {
-        // 1回目は知らせるだけ。もう一度押せば未選択のまま採点する
-        unanswered.textContent = `未選択の空欄が${left}個あります(もう一度押すとこのまま採点)`;
+        // 1回目は知らせるだけ。もう一度押せば選ばないまま確かめる
+        unanswered.textContent = `まだ選んでいない判断が${left}か所あります(もう一度押すとこのまま確かめます)`;
         return;
       }
       entry.graded = true;
       gradeBtn.disabled = true;
-      gradeBtn.textContent = "採点中...";
+      gradeBtn.textContent = "確かめています...";
       unanswered.textContent = "";
       for (const it of entry.items) {
         it.groups.forEach((g) => g.buttons.forEach((b) => (b.disabled = true)));
@@ -695,17 +708,24 @@
     if (!entry) {
       return;
     }
+    /** 判断が分かれた観点(振り返りで見直す) */
+    const revisit = [];
     m.items.forEach((res, i) => {
       const it = entry.items[i];
       markItemGrades(it, res.grades);
+      res.grades.forEach((g, k) => {
+        if (!g.correct) {
+          revisit.push(`${it.concepts[k] || "判断"}(${it.path.split("/").pop()} の判断 ${k + 1})`);
+        }
+      });
       if (res.explanation) {
-        it.after.append(section("解説", el("div", { class: "explain", text: res.explanation })));
+        it.after.append(section("このコードの役割と流れ", el("div", { class: "explain", text: res.explanation })));
       }
       if (res.completed) {
         it.after.append(details("変更点を見る(- 削除 / + 追加。変更のない行は省略)", [diffBlock(res.completed)], true));
       }
       if (res.canApply) {
-        const apply = el("button", { class: "secondary", text: "正解コードをファイルに反映…" });
+        const apply = el("button", { class: "secondary", text: "このコードをファイルに反映…" });
         apply.title = "反映する前に確認します";
         apply.onclick = () => vscode.postMessage({ type: "apply", quizId: m.quizId, itemIndex: i });
         it.after.append(el("div", { class: "row" }, apply));
@@ -721,18 +741,21 @@
           label.classList.add("wrong");
         }
       });
-      qu.why.textContent = `${res.correct ? "○ 正解" : "× 不正解"}  ${res.explanation}`;
+      qu.why.textContent = `${res.correct ? "✓ 一致" : "✗ 異なる"}  ${res.explanation}`;
     });
 
-    // 採点のボタンは役目を終えたので、結果のまとめに置き換える
-    entry.head.append(scoreBadge(m.score));
-    const summary = el("div", { class: "summary" }, el("div", { class: "score", text: `結果: ${m.score.total}問中 ${m.score.correct}問正解` }));
+    // 確かめるボタンは役目を終えたので、振り返りに置き換える
+    entry.head.append(el("span", { class: "badge quiet", text: "確認済み" }));
+    const summary = el("div", { class: "summary" }, el("div", { class: "summary-title", text: "振り返り" }));
     const mine = entry.prediction && entry.prediction.value.trim();
     if (mine) {
-      summary.append(section("あなたの予想", el("div", { text: mine })));
+      summary.append(section("最初の見立て", el("div", { text: mine })));
     }
     if (m.overall) {
-      summary.append(section("全体の解説", el("div", { text: m.overall })));
+      summary.append(section("全体の流れ", el("div", { text: m.overall })));
+    }
+    if (revisit.length > 0) {
+      summary.append(section("見直すとよい判断", el("div", { text: [...new Set(revisit)].map((r) => `・${r}`).join("\n") })));
     }
     entry.foot.replaceWith(summary);
     ensureVisible(summary);
@@ -755,7 +778,7 @@
   function renderClarify(id, c) {
     closeClarify("(新しい確認が届いたため無効になりました)");
     const scale = c.estimatedFiles || c.estimatedLines ? `約${c.estimatedFiles}ファイル・約${c.estimatedLines}行` : "";
-    const { root, body } = card("clarify", "実装の前に確認させてください", scale ? el("span", { class: "badge quiet", text: `見込み: ${scale}` }) : null);
+    const { root, body } = card("clarify", "着手前に要件を詰める", scale ? el("span", { class: "badge quiet", text: `見込み: ${scale}` }) : null);
     if (c.understanding) {
       body.append(section("依頼の理解", el("div", { class: "goal", text: c.understanding })));
     }
@@ -764,7 +787,7 @@
     }
 
     const inputs = c.questions.map((q, qi) => {
-      const set = el("fieldset", { class: "mcq clarify-q" }, el("legend", { text: `質問${qi + 1}` }), el("div", { class: "clarify-question", text: q.question }));
+      const set = el("fieldset", { class: "mcq clarify-q" }, el("legend", { text: `決めること ${qi + 1}` }), el("div", { class: "clarify-question", text: q.question }));
       if (q.why) {
         set.append(el("div", { class: "muted", text: q.why }));
       }
@@ -784,8 +807,8 @@
       return { radios, note };
     });
 
-    const submit = el("button", { text: "この内容で出題する" });
-    const skip = el("button", { class: "secondary", text: "確認せずに進める", title: "出題側の判断で、依頼のまま実装問題を作ります" });
+    const submit = el("button", { text: "この方針で進める" });
+    const skip = el("button", { class: "secondary", text: "確認せずに進める", title: "依頼の内容のまま、こちらの判断で進めます" });
     const footer = el("span", { class: "muted" });
     const disable = (note) => {
       inputs.forEach((q) => {
@@ -806,11 +829,11 @@
         return { option: option >= 0 ? option : undefined, text: q.note.value.trim() };
       });
       if (!skipped && answers.every((a) => a.option === undefined && !a.text)) {
-        footer.textContent = "どれかの質問に答えてください(答えずに進めるなら「確認せずに進める」)";
+        footer.textContent = "どれかを選ぶか、補足を書いてください(このまま進めるなら「確認せずに進める」)";
         return;
       }
       openClarify = null;
-      disable(skipped ? "確認せずに進めました" : "回答しました");
+      disable(skipped ? "確認せずに進めました" : "この方針で進めました");
       const summary = skipped
         ? "確認せずに進める"
         : c.questions
@@ -839,25 +862,28 @@
   const lessons = new Map();
 
   /**
-   * 実装の手順: 地図(サブゴールの一覧)を先に見せ、1ステップずつ
-   * 「なぜここを変えるか → 穴埋め → 次に確認すべき場所の予想 → 答え合わせ(見つけ方と判断)」の順に進める。
+   * 変更の組み立て: エンジニアが要件から変更を考える順に並べる。
+   * 要件の理解 → 完了の条件 → 変更の順序(地図)を先に見せ、各ステップでは
+   * 目的 → 場所 → 約束の変化 → 書き方(判断ポイント)→ 影響の予測 → エンジニアの判断、の順にたどる。
    */
   function renderLesson(l) {
     const total = l.steps.length;
     const progressText = el("span", { class: "badge quiet" });
-    const { root, body } = card("lesson", "実装の手順", el("span", { class: "spacer" }), progressText);
-    if (l.goal) {
-      body.append(el("p", { class: "goal", text: l.goal }));
-    }
+    const { root, body } = card("lesson", "変更の組み立て", el("span", { class: "spacer" }), progressText);
     const bar = el("div");
     body.append(el("div", { class: "progress", title: "進み具合" }, bar));
+    const flow = chain();
+    body.append(flow);
+    if (l.goal) {
+      flow.append(thought("要件をどう理解したか", el("p", { class: "goal", text: l.goal })).node);
+    }
     let criteria = null;
     if (l.criteria && l.criteria.length > 0) {
       const list = el("ol", { class: "criteria" });
       l.criteria.forEach((c) => list.append(el("li", { text: c })));
-      criteria = el("details", { class: "section-fold" }, el("summary", { text: `受け入れ条件(実装できたかを確かめる基準・${l.criteria.length}件)` }), list);
+      criteria = el("details", { class: "section-fold" }, el("summary", { text: `${l.criteria.length}件(実装できたかを確かめる振る舞い)` }), list);
       criteria.open = true;
-      body.append(criteria);
+      flow.append(thought("何ができたら完了か", criteria).node);
     }
     const map = el("ol", { class: "step-map" });
     const mapItems = l.steps.map((s) => {
@@ -865,29 +891,28 @@
       map.append(li);
       return li;
     });
-    const mapBox = el("details", { class: "section-fold" }, el("summary", { text: `手順の地図(全${total}ステップ・依存される側から順に)` }), map);
-    mapBox.open = true;
-    body.append(mapBox);
+    const order = thought("どの順に変えるか", el("div", { class: "muted", text: `依存される側から順に、${total}ステップに分けます。` }), map);
+    flow.append(order.node);
     const steps = el("div", { class: "lesson-steps" });
-    body.append(steps);
-    const entry = { id: l.id, root, body, steps, mapItems, criteria, bar, progressText, total, stepState: new Map(), final: null };
+    flow.append(thought("1ステップずつ考える", steps).node);
+    const entry = { id: l.id, root, body, flow, steps, mapItems, criteria, bar, progressText, total, stepState: new Map(), final: null };
     lessons.set(l.id, entry);
     append(root);
     renderLessonStep(entry, l.step);
-    // 届いたときは、目標と地図から読めるように手順の先頭を見せる
+    // 届いたときは、要件の理解と変更の順序から読めるように先頭を見せる
     scrollToStart(root);
   }
 
-  /** 進み具合(答え合わせ済みのステップ数) */
+  /** 進み具合(確かめ終えたステップ数) */
   function setProgress(entry, done) {
     entry.bar.style.width = `${Math.round((done / entry.total) * 100)}%`;
-    entry.progressText.textContent = done >= entry.total ? "完了" : `${done}/${entry.total} ステップ完了`;
+    entry.progressText.textContent = done >= entry.total ? "すべて確認済み" : `${done}/${entry.total} ステップ`;
   }
 
   function renderLessonStep(entry, s) {
     entry.mapItems.forEach((li, i) => (li.className = i < s.index ? "done" : i === s.index ? "current" : "todo"));
     setProgress(entry, s.index);
-    // 読み終えた古いステップは閉じる(直前のステップは答え合わせを読めるよう開いたまま)
+    // 読み終えた古いステップは閉じる(直前のステップはエンジニアの判断を読めるよう開いたまま)
     for (const [index, st] of entry.stepState) {
       if (index < s.index - 1) {
         st.block.open = false;
@@ -899,13 +924,16 @@
       el("span", { class: "step-no", text: `${s.number}/${s.total}` }),
       el("span", { class: "step-label", text: s.label }),
       el("span", { class: "badge quiet", text: s.kind }),
-      s.mechanical ? el("span", { class: "badge quiet", text: "考えどころ少" }) : null,
+      s.mechanical ? el("span", { class: "badge quiet", text: "定型の変更" }) : null,
     );
     const block = el("details", { class: "lesson-step" }, summary);
     block.open = true;
-    const stepBody = el("div", { class: "step-body" });
-    block.append(stepBody);
+    const flow = chain();
+    block.append(el("div", { class: "step-body" }, flow));
 
+    if (s.why) {
+      flow.append(thought("なぜこの変更が要るか", el("div", { class: "task", text: s.why })).node);
+    }
     const files = el("div", { class: "refs" });
     for (const f of s.files) {
       files.append(
@@ -916,22 +944,20 @@
         ),
       );
     }
-    stepBody.append(section("変更する場所", files));
-    if (s.why) {
-      stepBody.append(el("div", { class: "task" }, el("span", { class: "task-label", text: "なぜ" }), document.createTextNode(s.why)));
-    }
+    flow.append(thought("どこを変えるか", files).node);
     if (s.contract) {
-      stepBody.append(el("div", { class: "contract" }, el("span", { class: "task-label", text: "約束の変化" }), document.createTextNode(s.contract)));
+      flow.append(thought("何の約束が変わるか", el("div", { class: "contract", text: s.contract })).node);
     }
     const state = { answered: false, item: null, q: null, reveal: null, btn: null, block, summary };
+    const how = thought(s.item ? "どう書くか" : "変更の内容");
     if (s.item) {
       const { block: itemBlock, state: itemState } = renderItem(s.item, () => state.answered, { noHead: true });
       state.item = itemState;
-      stepBody.append(itemBlock);
+      how.body.append(itemBlock);
     }
     if (s.diffs && s.diffs.length > 0) {
       const label = s.item ? "このステップのほかの変更" : "このステップの変更";
-      stepBody.append(
+      how.body.append(
         details(
           `${label}(${s.diffs.length}件)`,
           s.diffs.flatMap((d) => [el("div", { class: "muted", text: `${d.path}${d.created ? "(新規)" : ""}` }), diffBlock(d.diff)]),
@@ -939,13 +965,11 @@
         ),
       );
     }
+    if (how.body.childElementCount > 0) {
+      flow.append(how.node);
+    }
     if (s.question) {
-      const set = el(
-        "fieldset",
-        { class: "mcq next-check" },
-        el("legend", { text: "予想: 次に確認すべき場所" }),
-        el("div", { text: s.question.prompt }),
-      );
+      const set = el("fieldset", { class: "mcq next-check" }, el("legend", { text: "次に確認すべき場所" }), el("div", { text: s.question.prompt }));
       const name = `next-${entry.id}-${s.index}`;
       const labels = s.question.options.map((option, i) => {
         const input = el("input", { type: s.question.multi ? "checkbox" : "radio", name, value: String(i) });
@@ -954,8 +978,8 @@
         return { input, label };
       });
       if (s.question.hint) {
-        const hint = el("div", { class: "hint-text hidden", text: `探し方のヒント\n${s.question.hint}` });
-        const hintBtn = el("button", { class: "link", text: "探し方のヒント" });
+        const hint = el("div", { class: "hint-text hidden", text: `探し方の手がかり\n${s.question.hint}` });
+        const hintBtn = el("button", { class: "link", text: "探し方の手がかり" });
         hintBtn.onclick = () => {
           hint.classList.remove("hidden");
           hintBtn.remove();
@@ -965,14 +989,16 @@
       const why = el("div", { class: "why" });
       set.append(why);
       state.q = { labels, why };
-      stepBody.append(set);
+      flow.append(thought("影響はどこに及ぶか", set).node);
     }
-    state.reveal = el("div", { class: "reveal" });
-    stepBody.append(state.reveal);
+    const reveal = thought("エンジニアの判断");
+    reveal.node.classList.add("hidden");
+    state.reveal = reveal;
+    flow.append(reveal.node);
     const last = s.index + 1 >= s.total;
     const nothingToAnswer = !s.item && !s.question;
     const btn = el("button", {
-      text: nothingToAnswer ? (last ? "確認してまとめへ" : "確認して次へ") : last ? "答え合わせ" : "答え合わせして次へ",
+      text: nothingToAnswer ? (last ? "確認してまとめへ" : "確認して次へ") : last ? "考えを確かめる" : "考えを確かめて次へ",
     });
     const warn = el("span", { class: "unanswered" });
     btn.onclick = () => {
@@ -982,13 +1008,13 @@
       const left = state.item ? state.item.picked.filter((p) => p < 0).length : 0;
       const noChoice = state.q && !state.q.labels.some((l) => l.input.checked);
       if ((left > 0 || noChoice) && !warn.textContent) {
-        // 1回目は知らせるだけ。もう一度押せば未回答のまま答え合わせする
-        warn.textContent = "未回答があります(もう一度押すとこのまま答え合わせ)";
+        // 1回目は知らせるだけ。もう一度押せば選ばないまま確かめる
+        warn.textContent = "まだ選んでいない判断があります(もう一度押すとこのまま確かめます)";
         return;
       }
       state.answered = true;
       btn.disabled = true;
-      btn.textContent = "答え合わせ中...";
+      btn.textContent = "確かめています...";
       warn.textContent = "";
       if (state.q) {
         state.q.labels.forEach((l) => (l.input.disabled = true));
@@ -1004,7 +1030,7 @@
     };
     state.btn = btn;
     state.foot = el("div", { class: "card-foot" }, btn, warn);
-    stepBody.append(state.foot);
+    block.append(state.foot);
     entry.stepState.set(s.index, state);
     entry.steps.append(block);
   }
@@ -1020,9 +1046,9 @@
     );
   }
 
-  /** 答え合わせの後: 変更の全体・確認が必要になった場所(見つけ方と判断) */
+  /** 考えを確かめた後: エンジニアがこの変更をどう判断したか(変更の全体・影響の追い方と、その見つけ方) */
   function renderReveal(box, rv) {
-    box.replaceChildren(el("div", { class: "section-label", text: "答え合わせ" }));
+    box.replaceChildren();
     if (rv.explanation) {
       box.append(el("div", { class: "explain", text: rv.explanation }));
     }
@@ -1059,7 +1085,7 @@
       }
       cards.push(check);
     }
-    const fold = el("details", { class: "section-fold" }, el("summary", { text: `この変更で確認が必要になった場所(見つけ方と判断・${rv.checks.length}件)` }), ...cards);
+    const fold = el("details", { class: "section-fold" }, el("summary", { text: `影響の追い方(どう見つけ、どう判断したか・${rv.checks.length}件)` }), ...cards);
     fold.open = true;
     box.append(fold);
   }
@@ -1071,12 +1097,8 @@
       return;
     }
     const r = m.result;
-    let correct = 0;
-    let total = 0;
     if (state.item && r.grades) {
       markItemGrades(state.item, r.grades);
-      correct += r.grades.filter((g) => g.correct).length;
-      total += r.grades.length;
     }
     if (state.q && r.question) {
       state.q.labels.forEach(({ label }, idx) => {
@@ -1086,16 +1108,15 @@
           label.classList.add("wrong");
         }
       });
-      state.q.why.textContent = r.question.correct ? "○ 正解" : "× 不正解(下の「確認が必要になった場所」で、見つけ方と判断を確かめましょう)";
-      correct += r.question.correct ? 1 : 0;
-      total++;
+      state.q.why.textContent = r.question.correct ? "✓ 見立てが一致" : "✗ 見立てと異なる(下の「影響の追い方」で、見つけ方と判断を確かめましょう)";
     }
-    renderReveal(state.reveal, r.reveal);
+    renderReveal(state.reveal.body, r.reveal);
+    state.reveal.node.classList.remove("hidden");
     state.foot.remove();
     state.block.classList.add("answered");
-    state.summary.append(total > 0 ? scoreBadge({ correct, total }) : el("span", { class: "badge quiet", text: "確認済み" }));
+    state.summary.append(el("span", { class: "badge quiet", text: "✓ 確認済み" }));
     if (entry.criteria) {
-      // 1ステップ目を終えたら、受け入れ条件は閉じて手順に集中できるようにする(見出しから開ける)
+      // 1ステップ目を終えたら、完了の条件は閉じて手順に集中できるようにする(見出しから開ける)
       entry.criteria.open = false;
     }
     if (m.next) {
@@ -1107,13 +1128,13 @@
     if (m.final) {
       renderLessonFinal(entry, m.final);
     }
-    // 答え合わせの結果(解説・確認した場所)から読めるようにする。次のステップへは下へ読み進める
-    ensureVisible(state.reveal);
+    // エンジニアの判断(解説・影響の追い方)から読めるようにする。次のステップへは下へ読み進める
+    ensureVisible(state.reveal.node);
   }
 
   function renderLessonFinal(entry, f) {
     const box = el("div", { class: "summary lesson-final" });
-    box.append(el("div", { class: "score", text: `まとめ: ${f.score.total}問中 ${f.score.correct}問正解` }));
+    box.append(el("div", { class: "summary-title", text: "変更の全体像" }));
     if (f.overall) {
       box.append(el("div", { class: "overall", text: f.overall }));
     }
