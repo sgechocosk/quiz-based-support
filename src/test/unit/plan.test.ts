@@ -10,7 +10,8 @@ import { changedSubjects } from "../../core/impact";
 import { IndexManager } from "../../core/indexer";
 import { buildLesson, gradeItem, gradeQuestion, nextCheckQuestion, revealPayload, stepPayload, whyText } from "../../core/lesson";
 import { OpenAiClient, estimateChatTokens, type ApiRequestInfo, type ApiUsageInfo } from "../../core/llm";
-import { applyRawEdit, VirtualWorkspace } from "../../core/overlay";
+import { locateBlock } from "../../core/editMatch";
+import { applyEdits, applyRawEdit, VirtualWorkspace } from "../../core/overlay";
 import { matchingRules, parseProjectRules } from "../../core/patterns";
 import { ChangePlanner, newDiagnostics, orderSteps, PlanError } from "../../core/planner";
 import type { PlanStep, RequirementSpec } from "../../core/planTypes";
@@ -911,4 +912,162 @@ test("編集の適用: 絶対パス・先頭の / を受け付け、firstLine �
   });
   assert.ok(slash.ok);
   assert.equal((await applyRawEdit(vws, { path: "C:/other/x.ts", create: true, startLine: 1, endLine: 1, firstLine: "", lastLine: "", newCode: "x" })).ok, false, "ワークスペースの外は拒否");
+});
+
+// ---------- 内容で探す編集(oldCode) ----------
+
+const TWO = [
+  "function a() {",
+  "  if (x) {",
+  "    run();",
+  "  }",
+  "  return 1;",
+  "}",
+  "",
+  "function b() {",
+  "  if (y) {",
+  "    run();",
+  "  }",
+  "  return 2;",
+  "}",
+  "",
+].join("\n");
+
+/** 括弧の対応だけを見る簡易構文チェック */
+const braces = {
+  isValid: async (_p: string, text: string) => {
+    let depth = 0;
+    for (const c of text) {
+      depth += c === "{" ? 1 : c === "}" ? -1 : 0;
+      if (depth < 0) {
+        return false;
+      }
+    }
+    return depth === 0;
+  },
+  errorLine: async () => 3,
+};
+
+test("oldCode の照合: 厳しい比較から緩め、インデントのずれを合わせ、1か所に決まらなければ失敗し、見つからなければ最も近い箇所を返す", () => {
+  const lines = TWO.split("\n");
+  // 空白の違い・行末の空白・前後の空行は吸収する
+  const loose = locateBlock(lines, ["", "function b(){  ", "  if (y) {"]);
+  assert.ok(loose.ok);
+  assert.deepEqual([loose.start, loose.end], [8, 9]);
+  // インデントだけずれていれば、置き換え後のコードにも同じずれを付ける
+  const shifted = locateBlock(lines, ["if (y) {", "  run();", "}"]);
+  assert.ok(shifted.ok);
+  assert.equal(shifted.start, 9);
+  assert.deepEqual(shifted.reindent(["if (y && z) {", "  run();", "}"]), ["  if (y && z) {", "    run();", "  }"]);
+  // 記号の違い(typographic な引用符)
+  assert.ok(locateBlock(['const s = "hi";'], ["const s = “hi”;"]).ok);
+  // 複数に一致: 行番号の手がかりが無い・あいまいなら失敗、ほぼ指定どおりなら選ぶ
+  const amb = locateBlock(lines, ["    run();"]);
+  assert.ok(!amb.ok && amb.kind === "ambiguous");
+  assert.deepEqual(amb.ok ? [] : amb.kind === "ambiguous" ? amb.starts : [], [3, 10]);
+  assert.equal(locateBlock(lines, ["    run();"], 6).ok, false, "どちらとも言えない行番号では選ばない");
+  const hinted = locateBlock(lines, ["    run();"], 10);
+  assert.ok(hinted.ok);
+  assert.equal(hinted.start, 10);
+  // 見つからない: 最も近い箇所と、最初に食い違う行
+  const miss = locateBlock(lines, ["function b() {", "  if (z) {", "    run();"]);
+  assert.ok(!miss.ok && miss.kind === "not-found");
+  assert.equal(miss.ok || miss.kind !== "not-found" ? 0 : miss.closest?.start, 8);
+  assert.deepEqual(miss.ok || miss.kind !== "not-found" ? undefined : miss.closest?.diff, { index: 2, expected: "  if (z) {", actual: "  if (y) {" });
+});
+
+test("編集の適用(ステップ単位): 構文は全部入れた後で確かめ、失敗したら何も書かず、既に反映済みの編集は飛ばす", async () => {
+  const root = await makeTempDir();
+  await writeFiles(root, { "src/two.ts": TWO });
+  const vws = new VirtualWorkspace(new NodeWorkspace(root));
+  // 開き括弧と閉じ括弧を別の編集に分けても、ステップ全体で正しければ入る(以前は1つ目で拒否されていた)
+  const wrap = await applyEdits(
+    vws,
+    [
+      { path: "src/two.ts", create: false, startLine: 9, oldCode: "function b() {\n  if (y) {", newCode: "function b() {\n  try {\n  if (y) {" },
+      { path: "src/two.ts", create: false, startLine: 12, oldCode: "  return 2;\n}", newCode: "  } finally {}\n  return 2;\n}" },
+    ],
+    braces,
+  );
+  assert.ok(wrap.ok, wrap.ok ? "" : wrap.reason);
+  assert.equal(wrap.edits.length, 2);
+  assert.match(await vws.readText("src/two.ts"), /try \{\n {2}if \(y\)/);
+
+  // 1か所に決まらない oldCode は、黙って別の場所を書き換えずに理由を返す
+  const before = await vws.readText("src/two.ts");
+  const amb = await applyEdits(vws, [{ path: "src/two.ts", create: false, startLine: 6, oldCode: "    run();", newCode: "    runB();" }], braces);
+  assert.ok(!amb.ok);
+  assert.match(amb.reason, /2か所\(3・11行目\)に一致/);
+  assert.equal(await vws.readText("src/two.ts"), before);
+
+  // 2つ目の編集が失敗したら、1つ目も入れない
+  const partial = await applyEdits(vws, [
+    { path: "src/two.ts", create: false, startLine: 5, oldCode: "  return 1;", newCode: "  return 10;" },
+    { path: "src/two.ts", create: false, startLine: 1, oldCode: "function c() {", newCode: "function d() {" },
+  ]);
+  assert.ok(!partial.ok);
+  assert.equal(await vws.readText("src/two.ts"), before);
+
+  // 構文エラーは、ステップ全体で壊れるときだけ、行を添えて拒否する
+  const broken = await applyEdits(vws, [{ path: "src/two.ts", create: false, startLine: 5, oldCode: "  return 1;\n}", newCode: "  return 1;" }], braces);
+  assert.ok(!broken.ok);
+  assert.match(broken.reason, /構文エラーになります\(3行目付近/);
+  assert.equal(broken.line, 3);
+
+  // 見つからなければ、最も近い箇所の今のコードを添える(作り直しで写し直せるように)
+  const miss = await applyEdits(vws, [{ path: "src/two.ts", create: false, startLine: 1, oldCode: "function a() {\n  if (z) {", newCode: "function a() {\n  if (w) {" }]);
+  assert.ok(!miss.ok);
+  assert.match(miss.reason, /最も近いのは1〜2行目.*2行目「if \(z\) \{」は実際には「if \(x\) \{」/);
+  assert.match(miss.reason, /L2\|\s+if \(x\) \{/);
+  assert.equal(miss.line, 1);
+
+  // 作り直しで、入れ済みの編集がもう一度返ってきた
+  const again = await applyEdits(vws, [{ path: "src/two.ts", create: false, startLine: 9, oldCode: "function b() {\n  if (y) {", newCode: "function b() {\n  try {\n  if (y) {" }]);
+  assert.ok(!again.ok && again.alreadyApplied);
+});
+
+test("編集の適用(以前の形式): lastLine が範囲の終わりに見つからなければ、推測した範囲で書き換えずに失敗する", async () => {
+  const root = await makeTempDir();
+  await writeFiles(root, { "src/two.ts": TWO });
+  const vws = new VirtualWorkspace(new NodeWorkspace(root));
+  const r = await applyRawEdit(vws, {
+    path: "src/two.ts",
+    create: false,
+    startLine: 8,
+    endLine: 10, // 正しくは 13
+    firstLine: "function b() {",
+    lastLine: "}  // 写し間違い",
+    newCode: "function b() {\n  return 3;\n}",
+  });
+  assert.ok(!r.ok);
+  assert.match(r.reason, /範囲の終わりを特定できません/);
+  assert.equal(await vws.readText("src/two.ts"), TWO);
+});
+
+test("変更計画: oldCode を写し間違えたら、最も近い箇所を示して作り直させ、2回目で完成させる", async (t) => {
+  const prompts: string[] = [];
+  const step = (oldCode: string) => ({
+    id: "a1",
+    dependsOn: [],
+    requirements: [1],
+    label: "最低文字数を厳しくする",
+    kind: "core",
+    why: "",
+    contract: "外から見た約束は変わらない",
+    mechanical: false,
+    edits: [{ path: "src/auth.ts", create: false, startLine: 2, oldCode, newCode: '  return password.length > 8 && user !== "";' }],
+  });
+  const { ws, client } = await setup(t, (req) => {
+    prompts.push(req.body.messages[req.body.messages.length - 1].content);
+    const oldCode = prompts.length === 1 ? "  return password.length > 3 && user != '';" : '  return password.length > 3 && user !== "";';
+    return { json: msg(JSON.stringify({ steps: [step(oldCode)] })) };
+  });
+  const inv = { query: "q", mode: "auto" as const, messages: [], evidence: { render: () => "", allText: () => "", paths: () => ["src/auth.ts"] } as any, notes: "", steps: 0 };
+  const plan = await new ChangePlanner({ llm: client, ws, config: { evidenceChars: 8000 } }).plan(inv, { query: "q", understanding: "", criteria: ["c"], contracts: [], answers: [] });
+  assert.equal(prompts.length, 2);
+  assert.match(prompts[1]!, /oldCode がファイルに見つかりません。最も近いのは2〜2行目/);
+  assert.match(prompts[1]!, /実際には「return password\.length > 3 && user !== "";」/);
+  assert.equal(plan.steps.length, 1);
+  assert.deepEqual(plan.warnings.filter((w) => w.startsWith("適用できなかった")), []);
+  assert.match(plan.files[0]!.final, /length > 8/);
 });

@@ -4,7 +4,7 @@ import { declarationsOf } from "./declarations";
 import { diffStat, lineMapper } from "./diff";
 import { impactOfStep, MAX_SITES, siteAt, type ImpactContext } from "./impact";
 import { levelStyle, type LearnerLevel } from "./level";
-import { applyRawEdit, toWorkspacePath, VirtualWorkspace, type RawEdit } from "./overlay";
+import { applyEdits, toWorkspacePath, VirtualWorkspace, type RawEdit } from "./overlay";
 import { describeRules, PATTERNS, type PatternId, type ProjectRule } from "./patterns";
 import {
   STEP_KINDS,
@@ -58,8 +58,8 @@ const BOOLEAN = { type: "boolean" } as const;
 
 const EDIT_ITEM = {
   type: "object",
-  properties: { path: STRING, create: BOOLEAN, startLine: INTEGER, endLine: INTEGER, firstLine: STRING, lastLine: STRING, newCode: STRING },
-  required: ["path", "create", "startLine", "endLine", "firstLine", "lastLine", "newCode"],
+  properties: { path: STRING, create: BOOLEAN, startLine: INTEGER, oldCode: STRING, newCode: STRING },
+  required: ["path", "create", "startLine", "oldCode", "newCode"],
   additionalProperties: false,
 } as const;
 
@@ -148,13 +148,17 @@ interface RawResolution {
 }
 
 const EDIT_RULES = [
-  "【編集 edits の書き方】",
-  "- 既存ファイル: path と、置き換える範囲 startLine〜endLine(コードの L数字| の行番号)を指定し、firstLine / lastLine にその範囲の最初と最後の行を逐語で写す。",
-  "  newCode は、その範囲を置き換える変更後のコード全体。範囲内で変えない行も一字一句同じに含める。create は false。",
-  "- 行を足すだけのときも、前後の既存の行を1行以上範囲に含めて置き換える(空の範囲は指定できない)。",
-  "- 新しいファイル: create を true、startLine と endLine を 1、firstLine と lastLine を空文字にし、newCode にファイル全体を書く。",
+  "【編集 edits の書き方】(置き換える前のコードを内容で探して置き換える)",
+  "- 既存ファイル: path と、oldCode(置き換える前の連続した行)・newCode(置き換えた後の行)を書く。create は false。",
+  "  oldCode は、示したコードの行を、行番号(L数字|)を付けずに一字一句そのまま写す。示されていない行を推測で書かない。",
+  "  oldCode はファイルの中で1か所だけに一致するようにする(「}」や「return;」だけでは複数に一致するので、前後の特徴のある行も含める)。",
+  "  newCode は oldCode を置き換える変更後のコード全体。oldCode のうち変えない行も一字一句同じに含める。",
+  "  startLine には oldCode の最初の行の行番号を書く(同じコードが複数あるときの手がかりにだけ使う)。",
+  "- 行を足すだけのときも、足す位置の前後の既存の行を1行以上 oldCode に含め、newCode にもその行を残す(oldCode を空にはできない)。",
+  "- 新しいファイル: create を true、startLine を 1、oldCode を空文字にし、newCode にファイル全体を書く。",
   "- 1つの編集で変える行は40行以内。1つのステップの中で同じ行を2つの編集で触らない。",
-  "- 出力が長くなりすぎないよう、範囲は変える行とその前後数行だけにする(関数全体やファイル全体を書き直さない)。",
+  "- 出力が長くなりすぎないよう、oldCode は変える行とその前後数行だけにする(関数全体やファイル全体を書き直さない)。",
+  "- 構文はステップの編集をすべて入れた後で確かめる。ブロックの開き括弧と閉じ括弧を別の編集に分けてもよいが、どちらも入れ忘れない。",
   "- 示したコードに無い関数・フィールド・ファイルを想像で使わない。新しく作る名前は同じ計画の中で定義し、既存の命名規則に合わせる。",
   "- インデント・引用符・セミコロンなどの書き方は周りのコードに合わせる。",
 ];
@@ -242,6 +246,11 @@ export class PlanError extends Error {
 
 function escapeRegExp(s: string): string {
   return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+/** 理由の1行目(作り直し用に添えた今のコードは、画面の警告には出さない) */
+function firstLine(reason: string): string {
+  return reason.split("\n")[0]!;
 }
 
 function coerceKind(kind: unknown): StepKind {
@@ -420,14 +429,14 @@ export class ChangePlanner {
             rawIds.set(raw.id, result.step.id);
           }
           result.step.dependsOn = raw.dependsOn ?? [];
-        } else {
+        } else if (!result.alreadyApplied) {
           failures.push({ reason: `ステップ「${raw.label ?? ""}」: ${result.reason}`, path: result.path, line: result.line });
         }
       }
       this.planProblems.push(...problems, ...failures.map((f) => f.reason));
       const done = this.steps.length > 0 && failures.length === 0;
       if (done || attempt === PLAN_ATTEMPTS - 1) {
-        this.warnings.push(...failures.map((f) => `適用できなかった変更: ${f.reason}`));
+        this.warnings.push(...failures.map((f) => `適用できなかった変更: ${firstLine(f.reason)}`));
         break;
       }
       messages.push(
@@ -499,13 +508,13 @@ export class ChangePlanner {
     return [
       problems.length > 0 || this.steps.length === 0
         ? "変更計画を出し直してください。適用できたステップがあればそれは出し直さず、残りのステップだけを steps に入れて、JSON全体を出し直してください。"
-        : "次のステップは適用できませんでした。適用できたステップは出し直さず、失敗したステップの修正版だけを steps に入れて、JSON全体を出し直してください。",
+        : "次のステップは適用できませんでした。適用できたステップは出し直さず、失敗したステップの修正版だけを steps に入れて、JSON全体を出し直してください(失敗したステップの編集は1つも入っていません)。",
       ...problems.map((p) => `- ${p}`),
       ...failures.map((f) => `- ${f.reason}`),
       problems.length > 0
         ? "要件を満たす最小限の変更を、少なくとも1ステップ書いてください。出力が長くならないよう、ステップは3つまで、各編集の範囲は変える行とその前後数行だけにしてください。"
         : "",
-      "firstLine / lastLine は、下の今のコードの行を、行番号(L数字|)を付けずに逐語で写してください(先に適用したステップで行番号がずれている場合があります)。",
+      "oldCode は、下の今のコードの行を、行番号(L数字|)を付けずに逐語で写してください(先に適用したステップで内容や行番号が変わっている場合があります)。",
       missing.length > 0
         ? `次のファイルはありません: ${missing.join(", ")}。既存のファイルを書き換えるなら参照コードにあるパスを使い、新しく作るなら create を true にしてください。参照コードにあるファイル: ${known.join(", ")}`
         : "",
@@ -515,33 +524,30 @@ export class ChangePlanner {
       .join("\n");
   }
 
-  /** ステップの編集をすべて適用する(1つでも失敗したら、そのステップの編集はすべて巻き戻す) */
+  /**
+   * ステップの編集をすべて適用する(1つでも失敗したら、そのステップの編集はどれも入れない)。
+   * alreadyApplied: 編集がすべて既に反映済みだった(作り直しで同じ編集がもう一度返ってきたなど。失敗ではない)
+   */
   private async applyStep(
     raw: RawStep,
     causedBy?: PlanStep["causedBy"],
-  ): Promise<{ ok: true; step: PlanStep } | { ok: false; reason: string; path?: string; line?: number }> {
+  ): Promise<{ ok: true; step: PlanStep } | { ok: false; reason: string; path?: string; line?: number; alreadyApplied?: boolean }> {
     const edits = (raw.edits ?? []).filter((e) => e && typeof e === "object");
     if (edits.length === 0) {
       return { ok: false, reason: "編集がありません" };
     }
-    const written = new Map<string, string | undefined>();
     const pre = new Map<string, string | null>();
-    const applied: PlanStep["edits"] = [];
     for (const edit of edits) {
       const path = toWorkspacePath(edit.path ?? "", this.vws.id);
-      if (path && !written.has(path)) {
-        written.set(path, this.vws.writtenText(path));
+      if (path && !pre.has(path)) {
         pre.set(path, await this.vws.readText(path).catch(() => null));
       }
-      const result = await applyRawEdit(this.vws, edit, this.deps.syntax);
-      if (!result.ok) {
-        for (const [p, text] of written) {
-          this.vws.restore(p, text);
-        }
-        return { ok: false, reason: result.reason, path: path ?? undefined, line: Number(edit.startLine) || 1 };
-      }
-      applied.push(result.edit);
     }
+    const result = await applyEdits(this.vws, edits, this.deps.syntax);
+    if (!result.ok) {
+      return result;
+    }
+    const applied = result.edits;
     const step: PlanStep = {
       id: `s${++this.stepSeq}`,
       number: 0,
@@ -711,11 +717,21 @@ export class ChangePlanner {
         let step: PlanStep | undefined;
         if ((r.step?.edits ?? []).length > 0) {
           const result = await this.applyStep(r.step!, { obligation: o.id, step: o.fromStep, pattern: o.pattern });
+          if (!result.ok && result.alreadyApplied) {
+            // 必要な変更は、計画内の別のステップで既に入っている
+            for (const [i, site] of o.sites.entries()) {
+              const d = decisions.get(i + 1);
+              o.verdicts.push({ ...site, changed: d?.change === true, auto: true, reason: d?.reason || "計画内の別のステップで既に反映済み" });
+              this.judged.add(siteKey(o.subject, site));
+            }
+            o.status = "done";
+            continue;
+          }
           if (!result.ok) {
             o.lastError = result.reason;
             if (o.attempts >= 2) {
               o.status = "gave-up";
-              this.warnings.push(`「${o.subject}」の確認事項を自動で直せませんでした: ${result.reason}`);
+              this.warnings.push(`「${o.subject}」の確認事項を自動で直せませんでした: ${firstLine(result.reason)}`);
             }
             continue;
           }

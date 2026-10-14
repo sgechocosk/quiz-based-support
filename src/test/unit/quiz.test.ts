@@ -204,6 +204,59 @@ test("change問題: ```フェンス付きの newCode も受け付け、CRLFを�
   assert.ok(!/[^\r]\n/.test(after), "LF単独の改行が混ざっている");
 });
 
+test("change問題(oldCode): 行番号がずれていても内容で範囲を探し、インデントのずれも合わせる", () => {
+  const v = validateRawItem(
+    raw({
+      kind: "change",
+      startLine: 1, // 大きくずれている(正しくは4)
+      endLine: 1,
+      firstLine: "",
+      lastLine: "",
+      // インデントを落として写している
+      oldCode: "if (a < 2 && b > 0) {\n  return a !== b;\n}",
+      newCode: "if (a < 2 && b > 0) {\n  return a === b;\n}",
+      blanks: [blank(2, "a === b")],
+    }),
+    FILE,
+  );
+  assert.ok(v.ok, v.ok ? "" : v.reason);
+  if (!v.ok) {
+    return;
+  }
+  assert.deepEqual([v.item.startLine, v.item.endLine], [4, 6]);
+  const after = applyItemToText(FILE, v.item);
+  assert.ok(after.includes("\n    return a === b;\n  }\n"), after);
+  assert.ok(after.includes("export function check(a: number, b: number): boolean {\n  if (a < 2 && b > 0) {"));
+});
+
+test("change問題(oldCode): 1か所に決まらない・見つからないときは、理由と最も近い箇所を返す", () => {
+  const twice = `${FILE}\n\nexport function other(): boolean {\n  return false;\n}`;
+  const item = (startLine: number) =>
+    raw({ kind: "change", startLine, oldCode: "  return false;", newCode: "  return true;", blanks: [blank(1, "true")] });
+  const amb = validateRawItem(item(10), twice);
+  assert.ok(!amb.ok, "どちらとも言えない行番号では選ばない");
+  assert.match(amb.reason, /2か所\(8・12行目\)に一致/);
+  const hinted = validateRawItem(item(12), twice);
+  assert.ok(hinted.ok, hinted.ok ? "" : hinted.reason);
+  assert.equal(hinted.ok && hinted.item.startLine, 12, "ほぼ指定どおりの行なら選ぶ");
+  const miss = validateRawItem(
+    raw({ kind: "change", startLine: 4, oldCode: "  if (a < 3 && b > 0) {\n    return a !== b;", newCode: "  if (a < 3 && b > 0) {\n    return a === b;", blanks: [blank(2, "a === b")] }),
+    FILE,
+  );
+  assert.ok(!miss.ok);
+  assert.match(miss.reason, /最も近いのは4〜5行目.*1行目「if \(a < 3 && b > 0\) \{」は実際には「if \(a < 2 && b > 0\) \{」/);
+  assert.match(miss.reason, /L4\|\s+if \(a < 2 && b > 0\) \{/);
+});
+
+test("change問題(以前の形式): lastLine が範囲の終わりに見つからなければ、推測した範囲で作らない", () => {
+  const v = validateRawItem(
+    raw({ kind: "change", startLine: 3, endLine: 6, lastLine: "} // 写し間違い", newCode: changed({ 5: "    return a === b;" }), blanks: [blank(3, "a === b")] }),
+    FILE,
+  );
+  assert.ok(!v.ok);
+  assert.match(v.reason, /範囲の終わりを特定できません/);
+});
+
 test("change問題: 変更が無い・変更行に空欄が無いものは不採用", () => {
   const same = validateRawItem(raw({ kind: "change", newCode: changed({}) }), FILE);
   assert.ok(!same.ok);

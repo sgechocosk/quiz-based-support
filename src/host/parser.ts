@@ -83,4 +83,43 @@ export class TreeSitterProvider implements ParserProvider, SyntaxChecker {
       return undefined;
     }
   }
+
+  async errorLine(filePath: string, text: string): Promise<number | undefined> {
+    const language = languageForPath(filePath)?.ast;
+    if (!language) {
+      return undefined;
+    }
+    try {
+      const tree = await this.parse(language, text);
+      if (!tree) {
+        return undefined;
+      }
+      try {
+        if (!tree.hasError) {
+          return undefined;
+        }
+        // 前から順に、ERROR ノードか、補われた(MISSING)ノードを探す
+        const stack: AstNode[] = [tree.root];
+        while (stack.length > 0) {
+          const node = stack.pop()! as AstNode & { isMissing?: boolean | (() => boolean); startPosition?: { row: number } };
+          const missing = typeof node.isMissing === "function" ? node.isMissing() : Boolean(node.isMissing);
+          if (node.type === "ERROR" || missing) {
+            // startIndex はバイト位置なので、行は startPosition から取る
+            return node.startPosition ? node.startPosition.row + 1 : undefined;
+          }
+          for (let i = node.children.length - 1; i >= 0; i--) {
+            const child = node.children[i];
+            if (child) {
+              stack.push(child);
+            }
+          }
+        }
+        return undefined;
+      } finally {
+        tree.dispose();
+      }
+    } catch {
+      return undefined;
+    }
+  }
 }

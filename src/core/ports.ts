@@ -96,6 +96,8 @@ export interface ChatLlm {
 export interface SyntaxChecker {
   /** true: エラー無し / false: 構文エラーあり / undefined: 判定不能 */
   isValid(path: string, text: string): Promise<boolean | undefined>;
+  /** 最初の構文エラーの行(1始まり。分からなければ undefined) */
+  errorLine?(path: string, text: string): Promise<number | undefined>;
 }
 
 export interface TypeDiagnostic {

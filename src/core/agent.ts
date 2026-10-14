@@ -113,6 +113,7 @@ export const QUIZ_SCHEMA = {
             endLine: INTEGER,
             firstLine: STRING,
             lastLine: STRING,
+            oldCode: STRING,
             task: STRING,
             newCode: STRING,
             blanks: {
@@ -166,7 +167,7 @@ export const QUIZ_SCHEMA = {
             explanation: STRING,
           },
           required: [
-            "kind", "path", "startLine", "endLine", "firstLine", "lastLine", "task", "newCode", "blanks", "refs", "newNames", "explanation",
+            "kind", "path", "startLine", "endLine", "firstLine", "lastLine", "oldCode", "task", "newCode", "blanks", "refs", "newNames", "explanation",
           ],
           additionalProperties: false,
         },
@@ -474,9 +475,12 @@ export function quizSystemPrompt(mode: QuizMode, intent: QuizIntent = "read", le
     "",
     "【問題の種類 kind】",
     "- \"read\": 既存コードの読解問題。対象範囲(path/startLine/endLine)を指定し、空欄にする部分を blanks で指定する。",
-    "  コードを書き写す必要はない(システムが実ファイルから問題を組み立てる)。newCode は空文字にする。",
-    "- \"change\": 実装・修正の問題。newCode に、対象範囲を置き換える「変更後のコード」を空欄なしで全部書く。",
-    "  変更しない行は参照コードと一字一句同じにする。空欄のうち少なくとも1つは変更した行に置く。",
+    "  firstLine/lastLine に範囲の最初と最後の行を逐語で入れる。コードを書き写す必要はない(システムが実ファイルから問題を組み立てる)。oldCode と newCode は空文字にする。",
+    "- \"change\": 実装・修正の問題。oldCode に置き換える前のコード(参照コードの連続した行)を、newCode にそれを置き換える「変更後のコード」を空欄なしで全部書く。",
+    "  oldCode は参照コードの行を、行番号(L数字|)を付けずに一字一句そのまま写す。表示されていない行を推測で書かない。",
+    "  oldCode はファイルの中で1か所だけに一致するようにする(「}」だけのような行では複数に一致するので、前後の特徴のある行も含める)。",
+    "  startLine には oldCode の最初の行の行番号を書く(endLine は oldCode の最後の行の行番号、firstLine/lastLine は空文字でよい)。",
+    "  newCode では、oldCode のうち変更しない行も一字一句同じに含める。空欄のうち少なくとも1つは変更した行に置く。",
     "",
     "【新しい名前は先に決めて示す(理不尽な問題を作らない)】",
     "- change で新しく作るメソッド・関数・変数・引数・フィールド・クラスの名前は、あなたが決めて newNames に {name, role} で全部書く(role はその名前の役割を一言で)。これらは解答前に学習者へ表示される。",
@@ -504,7 +508,7 @@ export function quizSystemPrompt(mode: QuizMode, intent: QuizIntent = "read", le
     "- goal: このクイズで何を理解してほしいかを1〜2文。答えは含めない。",
     "",
     "【共通ルール】",
-    "- items は1〜3件。path/startLine/endLine は参照コードの表示どおり。firstLine/lastLine には範囲の最初と最後の行を逐語で入れる。",
+    "- items は1〜3件。path/startLine/endLine は参照コードの表示どおり。",
     "- 範囲は空欄を含む関数・ブロックの必要最小限(目安15〜25行)。空欄と関係のない行は含めない(表示は空欄の前後数行に絞られる)。",
     "- concept は復習用の短いタグ(例: 非同期処理、条件分岐、配列操作、型注釈、状態管理)。答えの識別子は使わない。",
     "",
@@ -945,7 +949,7 @@ export class QuizAgent {
             ...(missingChange
               ? [
                   "これは実装・修正の依頼なので、学習者が穴埋めで実装する kind=\"change\" の問題が必要ですが、まだ1問もありません。",
-                  "変更を入れる範囲を参照コードから選び、newCode に変更後のコードを全部書き、変更した行に空欄を置いた change 問題を必ず含めてください。",
+                  "変更を入れる範囲を参照コードから選んで oldCode に逐語で写し、newCode に変更後のコードを全部書き、変更した行に空欄を置いた change 問題を必ず含めてください。",
                 ]
               : []),
             "参照コードを見直し、ルールを守って不合格だった問題の修正版(または別の範囲の問題)だけを items に入れて、JSON全体を出し直してください。",

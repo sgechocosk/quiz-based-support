@@ -1,5 +1,6 @@
 import { buildChoices, namePool, type RawDistractor } from "./choices";
-import { detectEol, splitLines } from "./text";
+import { describeBlockMiss, locateBlock, trimMirroredBlanks } from "./editMatch";
+import { detectEol, splitLines, truncate } from "./text";
 import { BLANK, type BlankSpec, type Choice, type NewName, type QuizItem, type QuizKind } from "./types";
 
 // ---------- ブランク操作 ----------
@@ -166,6 +167,11 @@ export interface RawItem {
   endLine: number;
   firstLine: string;
   lastLine: string;
+  /**
+   * change のみ: 置き換える前のコード(逐語の写し)。あれば範囲は行番号ではなくこの内容で探す(startLine は手がかり)。
+   * 空なら startLine〜endLine + firstLine/lastLine で探す(以前の形式・検証済みの編集から作る問題)
+   */
+  oldCode?: string;
   task: string;
   /** change のみ: 対象範囲を置き換える変更後のコード(空欄なし) */
   newCode: string;
@@ -411,9 +417,30 @@ const MAX_ANSWER_CHARS = 100;
  */
 export function validateRawItem(raw: RawItem, fileText: string, options: ValidateOptions = {}): Validation {
   const lines = splitLines(fileText);
-  const label = `${raw.path}:${raw.startLine}-${raw.endLine}`;
-  let range = locateRange(lines, raw.startLine, raw.endLine, raw.firstLine, raw.lastLine);
+  const byContent = raw.kind === "change" && typeof raw.oldCode === "string" && raw.oldCode.trim() !== "";
+  const label = byContent ? `${raw.path}:${raw.startLine}` : `${raw.path}:${raw.startLine}-${raw.endLine}`;
   const rawBlanks = Array.isArray(raw.blanks) ? raw.blanks : [];
+  let range: LineRange | undefined;
+  let reindent = (l: string[]): string[] => l;
+  if (byContent) {
+    const m = locateBlock(lines, cleanCodeLines(raw.oldCode!), Number(raw.startLine) || undefined);
+    if (!m.ok) {
+      return { ok: false, reason: `change問題: ${describeBlockMiss(label, m, lines).reason}` };
+    }
+    range = m;
+    const oldLines = cleanCodeLines(raw.oldCode!);
+    reindent = (l) => m.reindent(trimMirroredBlanks(oldLines, l));
+  } else {
+    range = locateRange(lines, raw.startLine, raw.endLine, raw.firstLine, raw.lastLine);
+    // 終わりの行が見つからないまま推測した範囲では、閉じ括弧などを消したり残したりしてしまう
+    const last = looseLine(stripLineNumber(raw.lastLine));
+    if (range && raw.kind === "change" && last !== "" && looseLine(lines[range.end - 1]) !== last) {
+      return {
+        ok: false,
+        reason: `${label} 範囲の終わりを特定できません(lastLine「${truncate((raw.lastLine ?? "").trim(), 120)}」が見つからない。${range.end}行目の実際の内容: ${truncate((lines[range.end - 1] ?? "").trim(), 120)})`,
+      };
+    }
+  }
   if (!range && raw.kind === "read" && raw.startLine >= 1 && raw.endLine >= raw.startLine && raw.endLine <= lines.length) {
     // firstLine が写し間違いでも、指定範囲に空欄の文字列が全部見つかるなら範囲は正しいとみなす
     const candidate = lines.slice(raw.startLine - 1, raw.endLine);
@@ -437,7 +464,7 @@ export function validateRawItem(raw: RawItem, fileText: string, options: Validat
   if (raw.kind === "read") {
     codeLines = originalLines;
   } else {
-    codeLines = cleanCodeLines(raw.newCode);
+    codeLines = reindent(cleanCodeLines(raw.newCode));
     if (codeLines.join("").trim() === "") {
       return { ok: false, reason: `${label} change問題: newCode が空です` };
     }
