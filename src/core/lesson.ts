@@ -279,7 +279,7 @@ export function nextCheckQuestion(
     id: `next:${step.id}`,
     prompt:
       correct.length > 1
-        ? `この変更のあと、確認が必要になる場所をすべて選んでください(正解は${correct.length}個)。`
+        ? `この変更のあと、確認が必要になる場所をすべて選んでください(該当は${correct.length}か所)。`
         : "この変更のあと、確認が必要になる場所はどこですか?",
     options,
     correct: correct.map((c) => options.indexOf(c)).sort((a, b) => a - b),
@@ -331,7 +331,7 @@ export async function buildLesson(plan: ChangePlan, deps: LessonDeps, hooks: Run
   const knownText = [deps.evidence.allText(), ...plan.files.map((f) => f.final)].join("\n");
 
   if (targets.length > 0) {
-    hooks.onStatus?.("手順ごとの問題を作成中...");
+    hooks.onStatus?.("ステップごとの考えどころを整理中...");
     const messages: ChatMessage[] = [
       { role: "system", content: stepQuizSystemPrompt(deps.level) },
       { role: "user", content: stepQuizUserPrompt(plan, targets, deps) },
@@ -402,7 +402,7 @@ export async function buildLesson(plan: ChangePlan, deps: LessonDeps, hooks: Run
   const goal = lessonGoal(plan);
   const quizItems = [...items.values()].map((v) => v.item);
   if (quizItems.length > 0) {
-    hooks.onStatus?.("ヒントが答えを漏らしていないか確認中...");
+    hooks.onStatus?.("手がかりの文章を点検中...");
     await removeAnswerLeaks(deps.llm, deps.level, { goal, items: quizItems }, hooks);
   }
 

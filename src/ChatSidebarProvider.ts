@@ -116,7 +116,7 @@ function readConfig() {
     autoEmbedMaxTokens: c.get<number>("autoEmbedMaxTokens", 100_000),
     maxFiles: c.get<number>("maxFiles", 3000),
     level: coerceLevel(c.get<string>("learnerLevel", "intermediate")),
-    confirmApiCalls: c.get<boolean>("confirmApiCalls", false),
+    testMode: c.get<boolean>("testMode", false),
     typeCheck: c.get<boolean>("typeCheck", true),
     testCommand: (c.get<string>("testCommand", "") ?? "").trim(),
   };
@@ -131,6 +131,15 @@ function reviewChoices(card: ReviewCard): Choice[] {
     pool: namePool(card.snippet),
     seed: card.id,
   }).choices;
+}
+
+/**
+ * 進捗の表示から、利用者が意識しなくてよい内部の情報(調査で呼んだツール名と引数)を除く。
+ * 詳しい表示はテストモードで見られる。
+ */
+function friendlyStatus(text: string): string {
+  const tool = /^調査 (\d+): /.exec(text);
+  return tool ? `関連コードを調査中...(${tool[1]})` : text;
 }
 
 function errorMessage(error: unknown, fallback: string): string {
@@ -250,35 +259,51 @@ export class ChatSidebarProvider
 </head>
 <body>
 <div id="app">
-  <div id="top-actions">
-    <button id="btn-key" class="secondary">APIキー</button>
-    <button id="btn-index" class="secondary">インデックス</button>
-    <button id="btn-log" class="secondary">学習記録</button>
-  </div>
-  <div id="level-row">
-    <label for="level" class="muted">学習レベル</label>
-    <select id="level" title="解説の細かさ・用語・問題の難しさが変わります"></select>
-    <label id="confirm-api-label" class="muted" title="OpenAI API を呼び出す前に、目的と入力トークン数(見積もり)を表示して実行を確認します">
-      <input type="checkbox" id="confirm-api"> API実行前に確認
-    </label>
-  </div>
-  <div id="level-box" class="card hidden"></div>
-  <div id="index-status" class="muted"></div>
-  <div id="plan-box" class="card hidden"></div>
-  <div id="log-box" class="card hidden"></div>
-  <div id="messages"></div>
-  <div id="input-area">
-    <div id="input-row">
-      <select id="mode" title="出題の種類">
-        <option value="auto">自動</option>
-        <option value="read">読んで理解</option>
-        <option value="change">実装して学ぶ</option>
-      </select>
-      <input type="text" id="query" placeholder="準備中..." disabled>
-      <button id="btn-send" disabled>送信</button>
-      <button id="btn-cancel" class="secondary hidden">中止</button>
+  <header id="toolbar">
+    <label for="level" class="toolbar-label">学習レベル</label>
+    <select id="level" title="解説の細かさ・用語・扱う内容の深さが変わります"></select>
+    <span class="spacer"></span>
+    <button id="test-badge" class="badge test hidden" title="テストモード: API 実行前の確認・トークン数・内部の情報を表示中(クリックで設定を開く)">テスト</button>
+    <button id="btn-log" class="toolbar-btn" title="これまでの判断の記録と振り返り" aria-expanded="false">学習記録</button>
+    <button id="btn-settings" class="toolbar-btn" title="APIキー・索引・テストモード" aria-expanded="false">設定</button>
+  </header>
+  <section id="settings-box" class="panel hidden" aria-label="設定">
+    <div class="panel-head"><h4>設定</h4><button id="btn-settings-close" class="icon-btn" title="閉じる" aria-label="閉じる">×</button></div>
+    <div class="setting">
+      <div class="setting-text"><div class="setting-name">OpenAI APIキー</div><div id="key-status" class="muted"></div></div>
+      <button id="btn-key" class="secondary">設定</button>
     </div>
+    <div class="setting">
+      <div class="setting-text"><div class="setting-name">コード検索の索引</div><div id="index-status" class="muted"></div></div>
+      <button id="btn-index" class="secondary">更新...</button>
+    </div>
+    <label class="setting setting-toggle" title="開発・検証向けの表示です">
+      <input type="checkbox" id="test-mode">
+      <div class="setting-text"><div class="setting-name">テストモード</div><div class="muted">API を呼ぶ前に目的と入力トークン数を確認し、処理ごとの使用量や生成の内部情報を表示します(開発・検証向け)。</div></div>
+    </label>
+  </section>
+  <section id="setup-box" class="panel notice-panel hidden"></section>
+  <section id="level-box" class="panel hidden"></section>
+  <section id="plan-box" class="panel hidden"></section>
+  <section id="log-box" class="panel hidden"></section>
+  <div id="messages-wrap">
+    <div id="messages"></div>
+    <button id="jump-latest" class="hidden" title="いちばん下へ移動">↓ 最新へ</button>
   </div>
+  <div id="live" class="hidden" role="status"></div>
+  <footer id="input-area">
+    <input type="text" id="query" placeholder="準備中..." disabled aria-label="質問・要望">
+    <div id="send-row">
+      <select id="mode" title="進め方" aria-label="進め方">
+        <option value="auto">自動で判断</option>
+        <option value="read">仕組みを読み解く</option>
+        <option value="change">変更を組み立てる</option>
+      </select>
+      <span class="spacer"></span>
+      <button id="btn-cancel" class="secondary hidden">中止</button>
+      <button id="btn-send" disabled>送信</button>
+    </div>
+  </footer>
 </div>
 <script nonce="${nonce}" src="${js}"></script>
 </body>
@@ -412,18 +437,17 @@ export class ChatSidebarProvider
       }
       const cfg = readConfig();
       const wantEmbed = services.index.isSemanticEnabled() && !!this.apiKey;
-      // API 実行前の確認がオンのときは、裏で勝手に API を呼ばない(「インデックス」から確認して更新する)
+      // テストモード(API 実行前に確認する)のときは、裏で勝手に API を呼ばない(「索引」から確認して更新する)
       const embed =
         wantEmbed &&
-        !cfg.confirmApiCalls &&
+        !cfg.testMode &&
         plan.pendingTokens <= cfg.autoEmbedMaxTokens;
       await services.index.commit(plan, { embed });
       if (wantEmbed && !embed && plan.pendingEmbeds.length > 0) {
         this.status(
-          `セマンティック検索に未反映の差分が約${plan.pendingTokens.toLocaleString()}トークンあります。「インデックス」から更新できます。` +
-            (cfg.confirmApiCalls
-              ? "(API実行前の確認がオンのため、自動では更新しません)"
-              : ""),
+          cfg.testMode
+            ? `意味検索に未反映の差分が約${plan.pendingTokens.toLocaleString()}トークンあります(テストモードのため自動では更新しません)。設定の「索引」から更新できます。`
+            : "意味検索に反映していない変更があります。設定の「索引」から更新できます。",
         );
       }
     } catch (error) {
@@ -450,7 +474,7 @@ export class ChatSidebarProvider
       busy: this.busy,
       index: stats,
       learning: this.log.summary(),
-      confirmApi: readConfig().confirmApiCalls,
+      testMode: readConfig().testMode,
     });
   }
 
@@ -499,11 +523,11 @@ export class ChatSidebarProvider
         case "lessonTest":
           await this.handleLessonTest(String(m.lessonId ?? ""));
           break;
-        case "setConfirmApi":
+        case "setTestMode":
           await vscode.workspace
             .getConfiguration("quizSupport")
             .update(
-              "confirmApiCalls",
+              "testMode",
               m.value === true,
               vscode.ConfigurationTarget.Global,
             );
@@ -694,7 +718,7 @@ export class ChatSidebarProvider
         throw error;
       }
       // 変更計画を作れなくても止めない: 理由を示して、調査済みのコードから実装のクイズを作る
-      this.status(`⚠ ${error.message}\n実装の手順の代わりに、実装のクイズで出題します。`);
+      this.status(`⚠ ${error.message}\n変更の手順を組み立てる代わりに、調べたコードで変更の考えどころをたどります。`);
       await this.presentQuiz(
         services,
         await agent.composeQuiz(inv, requirementText(inv.query, spec.answers), hooks),
@@ -768,8 +792,11 @@ export class ChatSidebarProvider
         step: stepPayload(lesson, 0),
       },
     });
-    for (const w of plan.warnings.slice(0, 3)) {
-      this.status(`⚠ ${w}`);
+    // 計画を作るときの注意は内部の情報なので、テストモードでだけ出す
+    if (readConfig().testMode) {
+      for (const w of plan.warnings.slice(0, 3)) {
+        this.status(`⚠ ${w}`);
+      }
     }
   }
 
@@ -817,6 +844,7 @@ export class ChatSidebarProvider
     const hasNext = session.current < session.lesson.steps.length;
     session.finished = !hasNext;
     const cfg = readConfig();
+    const final = finalPayload(session.lesson);
     this.post({
       type: "lessonStep",
       lessonId: session.id,
@@ -830,7 +858,12 @@ export class ChatSidebarProvider
       final: hasNext
         ? undefined
         : {
-            ...finalPayload(session.lesson),
+            ...final,
+            // 計画の注意・型検査を行わなかった理由は内部の情報なので、テストモードでだけ渡す
+            warnings: cfg.testMode ? final.warnings : [],
+            typecheck: cfg.testMode
+              ? final.typecheck
+              : { ...(final.typecheck as object), note: undefined },
             score: session.score,
             canTest: !!cfg.testCommand,
             testCommand: cfg.testCommand,
@@ -851,7 +884,7 @@ export class ChatSidebarProvider
       return;
     }
     if (!session.finished) {
-      this.fail(new Error("先にすべてのステップに答えてください。"), "");
+      this.fail(new Error("先にすべてのステップを確かめてください。"), "");
       return;
     }
     if (session.applied) {
@@ -991,10 +1024,10 @@ export class ChatSidebarProvider
     }
   }
 
-  // ---------- OpenAI API の実行前確認・使用量 ----------
+  // ---------- テストモード: OpenAI API の実行前確認・使用量 ----------
 
   private async confirmApi(info: ApiRequestInfo): Promise<void> {
-    if (!readConfig().confirmApiCalls || this.approveRest) {
+    if (!readConfig().testMode || this.approveRest) {
       return;
     }
     const kind = info.kind === "chat" ? "チャット" : "埋め込み";
@@ -1006,7 +1039,7 @@ export class ChatSidebarProvider
           `入力トークン数: 約 ${info.inputTokens.toLocaleString()}(見積もり)`,
           `モデル: ${info.model}(${kind})`,
           "",
-          "この確認は、サイドバーの「API実行前に確認」または設定 quizSupport.confirmApiCalls でオフにできます。",
+          "この確認はテストモードでだけ行います。サイドバーの設定の「テストモード」または設定 quizSupport.testMode でオフにできます。",
         ].join("\n"),
       },
       "実行する",
@@ -1033,9 +1066,10 @@ export class ChatSidebarProvider
     this.usage = { calls: 0, estimated: 0, actual: 0, output: 0 };
   }
 
+  /** 処理ごとの使用量はテストモードでだけ表示する */
   private reportUsage(): void {
     const u = this.usage;
-    if (u.calls === 0) {
+    if (u.calls === 0 || !readConfig().testMode) {
       return;
     }
     const input =
@@ -1056,7 +1090,7 @@ export class ChatSidebarProvider
     if (!this.apiKey) {
       this.fail(
         new Error(
-          "OpenAI APIキーが未設定です。「APIキー」から設定してください。",
+          "OpenAI APIキーが未設定です。上の案内またはサイドバーの「設定」から設定してください。",
         ),
         "",
       );
@@ -1095,7 +1129,7 @@ export class ChatSidebarProvider
         },
       });
       await work(agent, {
-        onStatus: (s) => this.status(s, true),
+        onStatus: (s) => this.status(cfg.testMode ? s : friendlyStatus(s), true),
         signal: this.abort.signal,
       });
     } finally {
@@ -1114,7 +1148,7 @@ export class ChatSidebarProvider
     let questions: McqQuestion[] = [];
     const first = result.quiz.items[0];
     if (readConfig().structureQuestions && first) {
-      this.status("構造クイズ(呼び出し関係)を作成中...", true);
+      this.status("呼び出し関係を整理中...", true);
       questions = (
         await buildStructureQuestions(
           { ws: services.ws, lsp: services.lsp },
@@ -1140,9 +1174,9 @@ export class ChatSidebarProvider
     if (result.quiz.notice) {
       this.status(`⚠ ${result.quiz.notice}`);
     }
-    if (result.quiz.rejected.length > 0) {
+    if (result.quiz.rejected.length > 0 && readConfig().testMode) {
       this.status(
-        `検証で不合格だった${result.quiz.rejected.length}件は作り直し、直らなかったものは除外しました。`,
+        `検証に通らなかった${result.quiz.rejected.length}件は作り直し、直らなかったものは除外しました。`,
       );
     }
   }
@@ -1173,7 +1207,7 @@ export class ChatSidebarProvider
     const session = this.sessions.get(String(m.quizId ?? ""));
     if (!session) {
       this.fail(
-        new Error("このクイズは失効しました。もう一度質問してください。"),
+        new Error("この内容は失効しました。もう一度質問してください。"),
         "",
       );
       return;
@@ -1192,7 +1226,7 @@ export class ChatSidebarProvider
       ? m.choices.map((a: unknown) => (Array.isArray(a) ? a.map(Number) : []))
       : [];
 
-    this.status("採点中...", true);
+    this.status("確認中...", true);
     const results: BlankResult[] = [];
     const itemResults: Array<{
       grades: Awaited<ReturnType<typeof gradeItem>>["grades"];
@@ -1256,7 +1290,7 @@ export class ChatSidebarProvider
     if (!session || !item || !services) {
       this.fail(
         new Error(
-          "反映対象が見つかりません(クイズが失効した可能性があります)。",
+          "反映対象が見つかりません(内容が失効した可能性があります)。",
         ),
         "",
       );
@@ -1265,14 +1299,14 @@ export class ChatSidebarProvider
     if (item.kind !== "change" || session.review) {
       this.fail(
         new Error(
-          "この問題は既存コードの理解問題なので、反映対象ではありません。",
+          "これは既存コードを読み解く内容なので、反映するものはありません。",
         ),
         "",
       );
       return;
     }
     if (!session.graded) {
-      this.fail(new Error("先に解答して採点してください。"), "");
+      this.fail(new Error("先に考えを確かめてください。"), "");
       return;
     }
     const uri = services.ws.uriOf(item.path);
@@ -1281,7 +1315,7 @@ export class ChatSidebarProvider
     applyItemToText(doc.getText(), item);
 
     const choice = await vscode.window.showWarningMessage(
-      `${item.path} の ${item.startLine}〜${item.endLine} 行目を、正解コードで書き換えます。`,
+      `${item.path} の ${item.startLine}〜${item.endLine} 行目を、このコードで書き換えます。`,
       {
         modal: true,
         detail: "反映後は通常の編集と同じく、元に戻す(Undo)で取り消せます。",
@@ -1367,7 +1401,7 @@ export class ChatSidebarProvider
     }
     const cards: ReviewCard[] = this.log.dueCards(Date.now(), 5);
     if (cards.length === 0) {
-      this.status("いま復習するカードはありません。");
+      this.status("いま振り返る箇所はありません。");
       return;
     }
     const items: QuizItem[] = cards.map((c) => ({
@@ -1395,7 +1429,7 @@ export class ChatSidebarProvider
       items,
       questions: [],
       overall:
-        "復習おつかれさまです。間違えた箇所は間隔を空けてまた出題されます。",
+        "判断が分かれた箇所は、間隔を空けてまた振り返ります。",
       graded: false,
     };
     this.sessions.set(session.id, session);
@@ -1403,8 +1437,8 @@ export class ChatSidebarProvider
       type: "quiz",
       quiz: this.payloadOf(
         session,
-        "復習",
-        "前に間違えた・ヒントを使った箇所をもう一度。",
+        "振り返り",
+        "前に判断が分かれた・手がかりを使った箇所を、もう一度考えます。",
       ),
     });
   }
@@ -1480,7 +1514,7 @@ export class ChatSidebarProvider
     await services.index.clear();
     this.pendingPlan = undefined;
     this.status(
-      "インデックスを削除しました。再作成するには「インデックス」を押してください。",
+      "索引を削除しました。キーワード検索の索引は自動で作り直します(意味検索はサイドバーの「設定」→「索引」から有効にできます)。",
     );
     await this.pushState();
     this.needFullSync = true;

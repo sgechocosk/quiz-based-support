@@ -773,7 +773,7 @@ export function applyItemToText(fileText: string, item: QuizItem, answers?: stri
   const lines = splitLines(fileText);
   const current = lines.slice(item.startLine - 1, item.endLine).join("\n");
   if (current.trimEnd() !== item.original.trimEnd()) {
-    throw new Error("対象範囲がクイズ生成時から変更されています。安全のため反映を中止しました。");
+    throw new Error("対象範囲が、内容を作ったときから変更されています。安全のため反映を中止しました。");
   }
   const resolved = resolveBlanks(item.quizCode, answers ?? item.blanks.map((b) => b.answer));
   lines.splice(item.startLine - 1, item.endLine - item.startLine + 1, ...splitLines(resolved));

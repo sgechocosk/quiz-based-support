@@ -333,7 +333,7 @@ test("実装依頼: 実装問題をどうしても作れなければ、読解の
   const agent = new QuizAgent({ llm: client, ws, index, config: { ...CONFIG, maxSteps: 1 } });
   const r = await agent.run("ログアウト機能を追加したい", "auto");
   assert.equal(r.quiz.items.length, 1, "同じ読解問題は重複させない");
-  assert.match(r.quiz.notice ?? "", /読解問題のみ/);
+  assert.match(r.quiz.notice ?? "", /既存コードの読み解きだけ/);
 });
 
 test("要件の確認: 複数案がある実装依頼は計画に進まずに質問し、回答をもとに追加調査してから受け入れ条件を確定する", async (t) => {
@@ -577,7 +577,7 @@ test("構文チェッカがあると、構文を壊すchange問題は不採用�
   });
   const syntax = { isValid: async (_p: string, text: string) => !text.includes("length >;") && !text.includes("length >\n") };
   const agent = new QuizAgent({ llm: client, ws, index, syntax, config: CONFIG });
-  await assert.rejects(agent.run("loginを変えたい", "change"), /検証に通るクイズを作れませんでした/);
+  await assert.rejects(agent.run("loginを変えたい", "change"), /検証に通る内容を作れませんでした/);
 });
 
 test("LLMクライアント: 429は待って再試行、401は明確なエラー、404等は即エラー", async (t) => {
