@@ -1,0 +1,14 @@
+[
+  {
+    "name": "設定の登録",
+    "when": { "literal": "^quizSupport\\." },
+    "check": ["package.json", "README.md"],
+    "criterion": "設定キーを足したら、package.json の contributes.configuration と README の設定表にも書く"
+  },
+  {
+    "name": "画面とホストのメッセージ",
+    "when": { "path": "media/main.js" },
+    "check": ["src/ChatSidebarProvider.ts"],
+    "criterion": "webview から送るメッセージの種類を足したら、ChatSidebarProvider の onMessage にも受け取る case を足す(逆向きは main.js の message の switch)"
+  }
+]

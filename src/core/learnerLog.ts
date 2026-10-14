@@ -1,4 +1,5 @@
 import type { KeyValueStore } from "./ports";
+import type { Choice } from "./types";
 import { sha1 } from "./text";
 
 /** ライトナー式の復習間隔(日)。box 0 は「すぐ再出題」。 */
@@ -16,6 +17,10 @@ export interface ReviewCard {
   snippet: string;
   answer: string;
   hints: string[];
+  /** 採点後の解説(旧データには無い) */
+  why?: string;
+  /** 選択肢(旧データには無い) */
+  choices?: Choice[];
   box: number;
   due: number;
   attempts: number;
@@ -44,6 +49,8 @@ export interface BlankResult {
   snippet: string;
   answer: string;
   hints: string[];
+  why?: string;
+  choices?: Choice[];
   correct: boolean;
   hintsUsed: number;
 }
@@ -77,8 +84,11 @@ export class LearnerLog {
   }
 
   /** 1回の採点結果を記録する。間違い・ヒント使用があったブランクは復習カードになる。 */
-  async record(results: BlankResult[], now = Date.now()): Promise<void> {
-    this.data.totals.sessions++;
+  /** newSession: 1回の解答として数えるか(手順のように1回をステップに分けて記録するときは、最初だけ true) */
+  async record(results: BlankResult[], now = Date.now(), newSession = true): Promise<void> {
+    if (newSession) {
+      this.data.totals.sessions++;
+    }
     for (const r of results) {
       this.data.totals.blanks++;
       if (r.correct) {
@@ -105,6 +115,8 @@ export class LearnerLog {
           snippet: r.snippet,
           answer: r.answer,
           hints: r.hints,
+          why: r.why,
+          choices: r.choices,
           box: 0,
           due: now,
           attempts: 0,
@@ -123,6 +135,8 @@ export class LearnerLog {
         card.attempts++;
         card.lastTs = now;
         card.snippet = r.snippet;
+        card.why = r.why ?? card.why;
+        card.choices = r.choices ?? card.choices;
         card.startLine = r.startLine;
         card.endLine = r.endLine;
       }

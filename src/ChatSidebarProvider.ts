@@ -1,25 +1,69 @@
 import * as crypto from "node:crypto";
 import * as path from "node:path";
 import * as vscode from "vscode";
-import { makeSemanticJudge, QuizAgent, type QuizMode } from "./core/agent";
+import {
+  answersFrom,
+  detectIntent,
+  QuizAgent,
+  requirementText,
+  requiresChange,
+  type AgentResult,
+  type Clarification,
+  type Investigation,
+  type QuizMode,
+  type RunHooks,
+} from "./core/agent";
+import { buildChoices, namePool } from "./core/choices";
 import { languageForPath } from "./core/chunker";
 import { IndexManager, type SyncPlan } from "./core/indexer";
-import { LearnerLog, type BlankResult, type ReviewCard } from "./core/learnerLog";
-import { OpenAiClient } from "./core/llm";
-import type { KeyValueStore } from "./core/ports";
-import { buildStructureQuestions } from "./core/questions";
 import {
-  applyItemToText,
-  gradeBlanks,
-  isolateBlank,
-  resolveBlanks,
-  scoreOf,
-  windowAround,
-  type BlankGrade,
-} from "./core/quiz";
-import { makeRng, sha1 } from "./core/text";
-import type { McqQuestion, QuizItem } from "./core/types";
+  buildLesson,
+  finalPayload,
+  gradeItem,
+  gradeQuestion,
+  itemPayload,
+  revealPayload,
+  stepPayload,
+  type Lesson,
+} from "./core/lesson";
+import {
+  coerceLevel,
+  LEARNER_LEVELS,
+  LEVEL_DESCRIPTION,
+  LEVEL_LABEL,
+} from "./core/level";
+import {
+  LearnerLog,
+  type BlankResult,
+  type ReviewCard,
+} from "./core/learnerLog";
+import {
+  LlmError,
+  OpenAiClient,
+  type ApiRequestInfo,
+  type ApiUsageInfo,
+} from "./core/llm";
+import {
+  parseProjectRules,
+  PROJECT_RULES_PATH,
+  type ProjectRule,
+} from "./core/patterns";
+import { ChangePlanner, PlanError } from "./core/planner";
+import type { RequirementSpec } from "./core/planTypes";
+import type { KeyValueStore, TypeChecker } from "./core/ports";
+import { buildStructureQuestions } from "./core/questions";
+import { applyItemToText, compactDiff, resolveBlanks } from "./core/quiz";
+import { makeRng, sha1, splitLines } from "./core/text";
+import type { Choice, McqQuestion, QuizItem } from "./core/types";
+import {
+  applyPlanFiles,
+  changedSince,
+  runTestCommand,
+  savePlanFiles,
+} from "./host/applier";
+import { GitHistory } from "./host/gitHistory";
 import { TreeSitterProvider } from "./host/parser";
+import { loadTypeScript, TsTypeChecker } from "./host/typeChecker";
 import { VscodeLsp, VscodeWorkspace } from "./host/workspaceVscode";
 
 const SECRET_KEY = "openai-api-key";
@@ -29,6 +73,9 @@ interface Services {
   lsp: VscodeLsp;
   index: IndexManager;
   watcher: vscode.FileSystemWatcher;
+  /** 型検査(TypeScript の設定が無ければ null)。初めて使うときに作る */
+  typeChecker?: TypeChecker | null;
+  history?: GitHistory;
 }
 
 /**
@@ -44,27 +91,55 @@ interface QuizSession {
   graded: boolean;
 }
 
+/** 実装の手順(変更計画をステップごとに学ぶ)。正解・判断の記録はホストにだけ置き、答え合わせのたびに次のステップを渡す */
+interface LessonSession {
+  id: string;
+  query: string;
+  lesson: Lesson;
+  /** 次に答えるステップ */
+  current: number;
+  finished: boolean;
+  applied: boolean;
+  score: { correct: number; total: number };
+}
+
 function readConfig() {
   const c = vscode.workspace.getConfiguration("quizSupport");
   return {
-    model: c.get<string>("model", "gpt-5-mini"),
+    model: c.get<string>("model", "gpt-6-luna"),
     embeddingModel: c.get<string>("embeddingModel", "text-embedding-3-small"),
     reasoningEffort: c.get<string>("reasoningEffort", "auto"),
     baseUrl: c.get<string>("baseUrl", "https://api.openai.com/v1"),
     maxAgentSteps: c.get<number>("maxAgentSteps", 8),
     minSimilarity: c.get<number>("minSimilarity", 0.2),
-    semanticGrading: c.get<boolean>("semanticGrading", true),
     structureQuestions: c.get<boolean>("structureQuestions", true),
     autoEmbedMaxTokens: c.get<number>("autoEmbedMaxTokens", 100_000),
     maxFiles: c.get<number>("maxFiles", 3000),
+    level: coerceLevel(c.get<string>("learnerLevel", "intermediate")),
+    confirmApiCalls: c.get<boolean>("confirmApiCalls", false),
+    typeCheck: c.get<boolean>("typeCheck", true),
+    testCommand: (c.get<string>("testCommand", "") ?? "").trim(),
   };
+}
+
+function reviewChoices(card: ReviewCard): Choice[] {
+  return buildChoices({
+    answer: card.answer,
+    why: card.why ?? "",
+    distractors: [],
+    known: new Set(card.snippet.match(/[A-Za-z_$][\w$]*/g) ?? []),
+    pool: namePool(card.snippet),
+    seed: card.id,
+  }).choices;
 }
 
 function errorMessage(error: unknown, fallback: string): string {
   return error instanceof Error ? error.message : fallback;
 }
 
-export class ChatSidebarProvider implements vscode.WebviewViewProvider, vscode.Disposable {
+export class ChatSidebarProvider
+  implements vscode.WebviewViewProvider, vscode.Disposable
+{
   private view?: vscode.WebviewView;
   private services?: Services;
   private servicesPromise?: Promise<Services | undefined>;
@@ -73,7 +148,20 @@ export class ChatSidebarProvider implements vscode.WebviewViewProvider, vscode.D
   private readonly client: OpenAiClient;
   private readonly log: LearnerLog;
   private readonly sessions = new Map<string, QuizSession>();
+  private readonly lessons = new Map<string, LessonSession>();
   private pendingPlan?: SyncPlan;
+  /** 回答待ちの要件確認(最新の1件だけ。新しい質問をすると無効になる) */
+  private pendingClarify?: {
+    id: string;
+    query: string;
+    inv: Investigation;
+    clarification: Clarification;
+    spec: RequirementSpec;
+  };
+  /** API 実行前の確認で「この処理では以降確認しない」が選ばれた(処理の始めに戻す) */
+  private approveRest = false;
+  /** 1つの処理での API 使用量(処理の終わりに表示する) */
+  private usage = { calls: 0, estimated: 0, actual: 0, output: 0 };
   private abort?: AbortController;
   private busy = false;
   private syncing = false;
@@ -85,11 +173,14 @@ export class ChatSidebarProvider implements vscode.WebviewViewProvider, vscode.D
   constructor(private readonly context: vscode.ExtensionContext) {
     this.parser = new TreeSitterProvider(context.extensionUri.fsPath);
     this.client = new OpenAiClient({
-      apiKey: async () => this.apiKey ?? (await context.secrets.get(SECRET_KEY)),
+      apiKey: async () =>
+        this.apiKey ?? (await context.secrets.get(SECRET_KEY)),
       baseUrl: () => readConfig().baseUrl,
       model: () => readConfig().model,
       embeddingModel: () => readConfig().embeddingModel,
       reasoningEffort: () => readConfig().reasoningEffort,
+      beforeRequest: (info) => this.confirmApi(info),
+      afterResponse: (info) => this.countUsage(info),
     });
     const store: KeyValueStore = {
       get: <T>(key: string) => context.workspaceState.get<T>(key),
@@ -127,7 +218,10 @@ export class ChatSidebarProvider implements vscode.WebviewViewProvider, vscode.D
   resolveWebviewView(webviewView: vscode.WebviewView): void {
     this.view = webviewView;
     const mediaRoot = vscode.Uri.joinPath(this.context.extensionUri, "media");
-    webviewView.webview.options = { enableScripts: true, localResourceRoots: [mediaRoot] };
+    webviewView.webview.options = {
+      enableScripts: true,
+      localResourceRoots: [mediaRoot],
+    };
     webviewView.webview.html = this.html(webviewView.webview, mediaRoot);
     webviewView.webview.onDidReceiveMessage((message: unknown) => {
       void this.onMessage(message);
@@ -137,7 +231,9 @@ export class ChatSidebarProvider implements vscode.WebviewViewProvider, vscode.D
 
   private html(webview: vscode.Webview, mediaRoot: vscode.Uri): string {
     const nonce = crypto.randomBytes(16).toString("base64");
-    const css = webview.asWebviewUri(vscode.Uri.joinPath(mediaRoot, "main.css"));
+    const css = webview.asWebviewUri(
+      vscode.Uri.joinPath(mediaRoot, "main.css"),
+    );
     const js = webview.asWebviewUri(vscode.Uri.joinPath(mediaRoot, "main.js"));
     const csp = [
       "default-src 'none'",
@@ -159,6 +255,14 @@ export class ChatSidebarProvider implements vscode.WebviewViewProvider, vscode.D
     <button id="btn-index" class="secondary">インデックス</button>
     <button id="btn-log" class="secondary">学習記録</button>
   </div>
+  <div id="level-row">
+    <label for="level" class="muted">学習レベル</label>
+    <select id="level" title="解説の細かさ・用語・問題の難しさが変わります"></select>
+    <label id="confirm-api-label" class="muted" title="OpenAI API を呼び出す前に、目的と入力トークン数(見積もり)を表示して実行を確認します">
+      <input type="checkbox" id="confirm-api"> API実行前に確認
+    </label>
+  </div>
+  <div id="level-box" class="card hidden"></div>
   <div id="index-status" class="muted"></div>
   <div id="plan-box" class="card hidden"></div>
   <div id="log-box" class="card hidden"></div>
@@ -223,7 +327,11 @@ export class ChatSidebarProvider implements vscode.WebviewViewProvider, vscode.D
     }
     const ws = new VscodeWorkspace(folder);
     await ws.refreshIgnore();
-    const dir = path.join(this.context.globalStorageUri.fsPath, "index-v2", sha1(ws.id).slice(0, 12));
+    const dir = path.join(
+      this.context.globalStorageUri.fsPath,
+      "index-v2",
+      sha1(ws.id).slice(0, 12),
+    );
     const index = new IndexManager({
       dir,
       workspace: ws,
@@ -234,7 +342,9 @@ export class ChatSidebarProvider implements vscode.WebviewViewProvider, vscode.D
     });
     await index.load();
 
-    const watcher = vscode.workspace.createFileSystemWatcher(new vscode.RelativePattern(folder, "**/*"));
+    const watcher = vscode.workspace.createFileSystemWatcher(
+      new vscode.RelativePattern(folder, "**/*"),
+    );
     const mark = (uri: vscode.Uri, deleted: boolean): void => {
       const rel = ws.relativeOf(uri);
       if (!rel) {
@@ -291,7 +401,10 @@ export class ChatSidebarProvider implements vscode.WebviewViewProvider, vscode.D
         return;
       }
       if (first) {
-        this.status("コードを解析しています(初回のみ・APIは使いません)...", true);
+        this.status(
+          "コードを解析しています(初回のみ・APIは使いません)...",
+          true,
+        );
       }
       const plan = await services.index.prepare(paths);
       if (plan.updates.size === 0) {
@@ -299,11 +412,18 @@ export class ChatSidebarProvider implements vscode.WebviewViewProvider, vscode.D
       }
       const cfg = readConfig();
       const wantEmbed = services.index.isSemanticEnabled() && !!this.apiKey;
-      const embed = wantEmbed && plan.pendingTokens <= cfg.autoEmbedMaxTokens;
+      // API 実行前の確認がオンのときは、裏で勝手に API を呼ばない(「インデックス」から確認して更新する)
+      const embed =
+        wantEmbed &&
+        !cfg.confirmApiCalls &&
+        plan.pendingTokens <= cfg.autoEmbedMaxTokens;
       await services.index.commit(plan, { embed });
       if (wantEmbed && !embed && plan.pendingEmbeds.length > 0) {
         this.status(
-          `セマンティック検索に未反映の差分が約${plan.pendingTokens.toLocaleString()}トークンあります。「インデックス」から更新できます。`,
+          `セマンティック検索に未反映の差分が約${plan.pendingTokens.toLocaleString()}トークンあります。「インデックス」から更新できます。` +
+            (cfg.confirmApiCalls
+              ? "(API実行前の確認がオンのため、自動では更新しません)"
+              : ""),
         );
       }
     } catch (error) {
@@ -320,10 +440,30 @@ export class ChatSidebarProvider implements vscode.WebviewViewProvider, vscode.D
       type: "state",
       hasKey: !!this.apiKey,
       hasWorkspace: !!vscode.workspace.workspaceFolders?.[0],
+      level: readConfig().level,
+      levelChosen: this.levelChosen(),
+      levels: LEARNER_LEVELS.map((id) => ({
+        id,
+        label: LEVEL_LABEL[id],
+        description: LEVEL_DESCRIPTION[id],
+      })),
       busy: this.busy,
       index: stats,
       learning: this.log.summary(),
+      confirmApi: readConfig().confirmApiCalls,
     });
+  }
+
+  /** 利用者が学習レベルを一度でも選んだか(未選択なら初回に選んでもらう) */
+  private levelChosen(): boolean {
+    const i = vscode.workspace
+      .getConfiguration("quizSupport")
+      .inspect<string>("learnerLevel");
+    return (
+      i?.globalValue !== undefined ||
+      i?.workspaceValue !== undefined ||
+      i?.workspaceFolderValue !== undefined
+    );
   }
 
   // ---------- メッセージ処理 ----------
@@ -344,6 +484,31 @@ export class ChatSidebarProvider implements vscode.WebviewViewProvider, vscode.D
         case "ask":
           await this.handleAsk(String(m.query ?? ""), this.coerceMode(m.mode));
           break;
+        case "clarifyAnswer":
+          await this.handleClarifyAnswer(m);
+          break;
+        case "lessonAnswer":
+          await this.handleLessonAnswer(m);
+          break;
+        case "lessonApply":
+          await this.handleLessonApply(String(m.lessonId ?? ""));
+          break;
+        case "lessonRevert":
+          await this.handleLessonRevert(String(m.lessonId ?? ""));
+          break;
+        case "lessonTest":
+          await this.handleLessonTest(String(m.lessonId ?? ""));
+          break;
+        case "setConfirmApi":
+          await vscode.workspace
+            .getConfiguration("quizSupport")
+            .update(
+              "confirmApiCalls",
+              m.value === true,
+              vscode.ConfigurationTarget.Global,
+            );
+          await this.pushState();
+          break;
         case "cancel":
           this.abort?.abort();
           break;
@@ -354,7 +519,11 @@ export class ChatSidebarProvider implements vscode.WebviewViewProvider, vscode.D
           await this.handleApply(String(m.quizId ?? ""), Number(m.itemIndex));
           break;
         case "open":
-          await this.handleOpen(String(m.path ?? ""), Number(m.line) || 1);
+          await this.handleOpen(
+            String(m.path ?? ""),
+            Number(m.line) || 1,
+            typeof m.text === "string" ? m.text : undefined,
+          );
           break;
         case "planIndex":
           await this.handlePlan();
@@ -367,6 +536,16 @@ export class ChatSidebarProvider implements vscode.WebviewViewProvider, vscode.D
           break;
         case "startReview":
           await this.handleReview();
+          break;
+        case "setLevel":
+          await vscode.workspace
+            .getConfiguration("quizSupport")
+            .update(
+              "learnerLevel",
+              coerceLevel(m.level),
+              vscode.ConfigurationTarget.Global,
+            );
+          await this.pushState();
           break;
         case "resetLog":
           await this.log.reset();
@@ -391,23 +570,514 @@ export class ChatSidebarProvider implements vscode.WebviewViewProvider, vscode.D
     if (!text) {
       return;
     }
+    const services = await this.readyServices();
+    if (!services) {
+      return;
+    }
+    // 新しい質問をしたら、答えていない要件の確認は無効にする
+    this.pendingClarify = undefined;
+    await this.withAgent(services, async (agent, hooks) => {
+      const inv = await agent.investigate(text, mode, hooks);
+      if (!requiresChange(mode, detectIntent(text))) {
+        // 仕組みの質問: 読解のクイズ
+        await this.presentQuiz(
+          services,
+          await agent.compose(inv, [], hooks),
+          text,
+        );
+        return;
+      }
+      // 実装・修正の依頼: 要件を整理し、大きい・案が複数あるなら先に質問する(調査結果は回答後の計画に使う)
+      const { spec, clarification } = await agent.organize(inv, hooks);
+      if (clarification) {
+        const id = crypto.randomUUID();
+        this.pendingClarify = { id, query: text, inv, clarification, spec };
+        this.post({ type: "clarify", id, clarification });
+        return;
+      }
+      await this.presentLesson(services, agent, inv, spec, text, hooks);
+    });
+  }
+
+  /** 要件の確認への回答(skip=true は「確認せずに進める」) */
+  private async handleClarifyAnswer(m: Record<string, any>): Promise<void> {
+    const pending = this.pendingClarify;
+    if (!pending || pending.id !== String(m.id ?? "")) {
+      this.fail(
+        new Error("この確認は失効しました。もう一度質問してください。"),
+        "",
+      );
+      return;
+    }
+    const services = await this.readyServices();
+    if (!services) {
+      return;
+    }
+    this.pendingClarify = undefined;
+    const picks = Array.isArray(m.answers)
+      ? m.answers.map((a: any) => ({
+          option: Number.isInteger(a?.option) ? Number(a.option) : undefined,
+          text: String(a?.text ?? ""),
+        }))
+      : [];
+    const answers = m.skip ? [] : answersFrom(pending.clarification, picks);
+    await this.withAgent(services, async (agent, hooks) => {
+      let spec = pending.spec;
+      if (answers.length > 0) {
+        // 選んだ案に関係するコードを調べてから、受け入れ条件を確定する
+        await agent.followUp(pending.inv, answers, hooks);
+        spec = await agent.finalizeSpec(
+          pending.inv,
+          pending.spec,
+          answers,
+          hooks,
+        );
+      }
+      await this.presentLesson(
+        services,
+        agent,
+        pending.inv,
+        spec,
+        pending.query,
+        hooks,
+      );
+    });
+  }
+
+  // ---------- 実装の手順(変更計画) ----------
+
+  /** 型検査は TypeScript の設定があるワークスペースでだけ使う(初回に作って使い回す) */
+  private typeCheckerFor(services: Services): TypeChecker | undefined {
+    if (!readConfig().typeCheck) {
+      return undefined;
+    }
+    if (services.typeChecker === undefined) {
+      const root = services.ws.folder.uri.fsPath;
+      const ts = loadTypeScript(
+        root,
+        vscode.env.appRoot,
+        vscode.workspace.isTrusted,
+      );
+      services.typeChecker = ts ? new TsTypeChecker(ts, root) : null;
+    }
+    return services.typeChecker ?? undefined;
+  }
+
+  /** .quiz-support/patterns.json(このプロジェクトの「これを変えたらあれも確認する」) */
+  private async projectRules(services: Services): Promise<ProjectRule[]> {
+    let text: string;
+    try {
+      text = await services.ws.readText(PROJECT_RULES_PATH);
+    } catch {
+      return [];
+    }
+    const { rules, errors } = parseProjectRules(text);
+    if (errors.length > 0) {
+      this.status(`⚠ ${errors.slice(0, 2).join(" / ")}`);
+    }
+    return rules;
+  }
+
+  private async presentLesson(
+    services: Services,
+    agent: QuizAgent,
+    inv: Investigation,
+    spec: RequirementSpec,
+    query: string,
+    hooks: RunHooks,
+  ): Promise<void> {
+    let lesson: Lesson;
+    try {
+      lesson = await this.buildPlanLesson(services, inv, spec, hooks);
+    } catch (error) {
+      if (hooks.signal?.aborted || !(error instanceof PlanError)) {
+        throw error;
+      }
+      // 変更計画を作れなくても止めない: 理由を示して、調査済みのコードから実装のクイズを作る
+      this.status(`⚠ ${error.message}\n実装の手順の代わりに、実装のクイズで出題します。`);
+      await this.presentQuiz(
+        services,
+        await agent.composeQuiz(inv, requirementText(inv.query, spec.answers), hooks),
+        query,
+      );
+      return;
+    }
+    this.showLesson(lesson, query);
+  }
+
+  /** 変更計画を作り、手順(ステップごとの問題)にする */
+  private async buildPlanLesson(
+    services: Services,
+    inv: Investigation,
+    spec: RequirementSpec,
+    hooks: RunHooks,
+  ): Promise<Lesson> {
+    const cfg = readConfig();
+    if (vscode.workspace.isTrusted) {
+      services.history ??= new GitHistory(services.ws.folder.uri.fsPath);
+    }
+    const planner = new ChangePlanner({
+      llm: this.client,
+      ws: services.ws,
+      lsp: services.lsp,
+      syntax: this.parser,
+      typeChecker: this.typeCheckerFor(services),
+      history: services.history,
+      rules: await this.projectRules(services),
+      config: { level: cfg.level, evidenceChars: 16_000 },
+    });
+    const plan = await planner.plan(inv, spec, hooks);
+    const lesson = await buildLesson(
+      plan,
+      {
+        llm: this.client,
+        ws: services.ws,
+        level: cfg.level,
+        evidence: inv.evidence,
+        evidenceChars: 16_000,
+      },
+      hooks,
+    );
+    return lesson;
+  }
+
+  private showLesson(lesson: Lesson, query: string): void {
+    const { plan } = lesson;
+    const session: LessonSession = {
+      id: crypto.randomUUID(),
+      query,
+      lesson,
+      current: 0,
+      finished: false,
+      applied: false,
+      score: { correct: 0, total: 0 },
+    };
+    this.lessons.set(session.id, session);
+    this.post({
+      type: "lesson",
+      lesson: {
+        id: session.id,
+        query,
+        goal: lesson.goal,
+        understanding: plan.spec.understanding,
+        criteria: plan.spec.criteria,
+        steps: lesson.steps.map((ls) => ({
+          number: ls.step.number,
+          label: ls.display.label,
+        })),
+        step: stepPayload(lesson, 0),
+      },
+    });
+    for (const w of plan.warnings.slice(0, 3)) {
+      this.status(`⚠ ${w}`);
+    }
+  }
+
+  /** 1ステップの答え合わせ → 判断の記録を見せて、次のステップ(最後ならまとめ)を渡す */
+  private async handleLessonAnswer(m: Record<string, any>): Promise<void> {
+    const session = this.lessons.get(String(m.lessonId ?? ""));
+    if (!session) {
+      this.fail(
+        new Error("この手順は失効しました。もう一度依頼してください。"),
+        "",
+      );
+      return;
+    }
+    const index = Number(m.index);
+    if (session.finished || index !== session.current) {
+      return; // 二重送信
+    }
+    const ls = session.lesson.steps[index]!;
+    const picks: number[] = Array.isArray(m.blanks) ? m.blanks.map(Number) : [];
+    const hints: number[] = Array.isArray(m.hints) ? m.hints.map(Number) : [];
+    const chosen: number[] = Array.isArray(m.choices)
+      ? m.choices.map(Number)
+      : [];
+
+    let grades: unknown[] = [];
+    if (ls.item) {
+      const graded = await gradeItem(ls.item, picks, hints);
+      grades = graded.grades;
+      session.score.correct += graded.grades.filter((g) => g.correct).length;
+      session.score.total += graded.grades.length;
+      await this.log.record(graded.records, Date.now(), index === 0);
+    }
+    let question: ReturnType<typeof gradeQuestion> | undefined;
+    if (ls.question) {
+      question = gradeQuestion(ls.question, chosen);
+      session.score.total++;
+      if (question.correct) {
+        session.score.correct++;
+      }
+      await this.log.recordConceptOnly([
+        { concept: ls.question.concept, correct: question.correct },
+      ]);
+    }
+    session.current++;
+    const hasNext = session.current < session.lesson.steps.length;
+    session.finished = !hasNext;
+    const cfg = readConfig();
+    this.post({
+      type: "lessonStep",
+      lessonId: session.id,
+      index,
+      result: {
+        grades,
+        question,
+        reveal: revealPayload(session.lesson, index),
+      },
+      next: hasNext ? stepPayload(session.lesson, session.current) : undefined,
+      final: hasNext
+        ? undefined
+        : {
+            ...finalPayload(session.lesson),
+            score: session.score,
+            canTest: !!cfg.testCommand,
+            testCommand: cfg.testCommand,
+          },
+    });
+    await this.pushState();
+  }
+
+  /** 計画したすべてのファイルを1つの編集として反映する(計画のあとに変わったファイルがあれば中止) */
+  private async handleLessonApply(lessonId: string): Promise<void> {
+    const session = this.lessons.get(lessonId);
+    const services = this.services;
+    if (!session || !services) {
+      this.fail(
+        new Error("反映対象が見つかりません(手順が失効した可能性があります)。"),
+        "",
+      );
+      return;
+    }
+    if (!session.finished) {
+      this.fail(new Error("先にすべてのステップに答えてください。"), "");
+      return;
+    }
+    if (session.applied) {
+      this.status("この手順は反映済みです。");
+      return;
+    }
+    const { plan } = session.lesson;
+    const moved = await changedSince(services.ws, plan.files, "original");
+    if (moved.length > 0) {
+      this.fail(
+        new Error(
+          `計画を作ったあとに次のファイルが変更されたため、反映を中止しました: ${moved.join(", ")}\nもう一度依頼すると、今の内容で計画し直します。`,
+        ),
+        "",
+      );
+      return;
+    }
+    const created = plan.files.filter((f) => f.original === null).length;
+    const notes = [
+      `${plan.files.length}ファイルを変更します${created > 0 ? `(うち新規作成 ${created})` : ""}: ${plan.files.map((f) => f.path).join(", ")}`,
+      plan.typecheck.remaining.length > 0
+        ? `⚠ 解消できなかった型エラーが${plan.typecheck.remaining.length}件あります。`
+        : "",
+      plan.obligations.some((o) => o.status !== "done")
+        ? "⚠ 判断しきれなかった確認事項があります(まとめを確認してください)。"
+        : "",
+      "反映後は「反映を取り消す」で元に戻せます(各ファイルの元に戻す操作でも戻せます)。",
+    ].filter(Boolean);
+    const choice = await vscode.window.showWarningMessage(
+      "実装の手順をファイルに反映します。",
+      { modal: true, detail: notes.join("\n") },
+      "反映する",
+    );
+    if (choice !== "反映する") {
+      return;
+    }
+    if (!(await applyPlanFiles(services.ws, plan.files, "apply"))) {
+      throw new Error("編集を適用できませんでした。");
+    }
+    session.applied = true;
+    const first = plan.files.find((f) => f.original !== null) ?? plan.files[0];
+    if (first) {
+      await vscode.window.showTextDocument(services.ws.uriOf(first.path), {
+        preview: false,
+      });
+    }
+    this.post({
+      type: "lessonApplied",
+      lessonId,
+      canTest: !!readConfig().testCommand,
+    });
+    this.status(
+      `✅ ${plan.files.length}ファイルに反映しました(保存はまだしていません)。`,
+    );
+  }
+
+  private async handleLessonRevert(lessonId: string): Promise<void> {
+    const session = this.lessons.get(lessonId);
+    const services = this.services;
+    if (!session || !services || !session.applied) {
+      return;
+    }
+    const { plan } = session.lesson;
+    const moved = await changedSince(services.ws, plan.files, "final");
+    if (moved.length > 0) {
+      this.fail(
+        new Error(
+          `反映したあとに次のファイルが編集されたため、自動では取り消せません: ${moved.join(", ")}\n各ファイルで元に戻す操作をしてください。`,
+        ),
+        "",
+      );
+      return;
+    }
+    if (!(await applyPlanFiles(services.ws, plan.files, "revert"))) {
+      throw new Error("取り消しを適用できませんでした。");
+    }
+    session.applied = false;
+    this.post({ type: "lessonReverted", lessonId });
+    this.status("反映を取り消しました。");
+  }
+
+  /** 設定されたテストコマンドを、反映したファイルを保存してから実行する */
+  private async handleLessonTest(lessonId: string): Promise<void> {
+    const session = this.lessons.get(lessonId);
+    const services = this.services;
+    const command = readConfig().testCommand;
+    if (!session || !services || !session.applied || !command) {
+      return;
+    }
     if (this.busy) {
       this.status("前の処理が終わるまでお待ちください。");
       return;
     }
-    if (!this.apiKey) {
-      this.fail(new Error("OpenAI APIキーが未設定です。「APIキー」から設定してください。"), "");
+    if (!vscode.workspace.isTrusted) {
+      this.fail(
+        new Error(
+          "信頼されていないワークスペースでは、テストコマンドを実行しません。",
+        ),
+        "",
+      );
       return;
+    }
+    const choice = await vscode.window.showWarningMessage(
+      `テストを実行します: ${command}`,
+      {
+        modal: true,
+        detail: `反映したファイルを保存してから、${services.ws.folder.uri.fsPath} で実行します。`,
+      },
+      "保存して実行",
+    );
+    if (choice !== "保存して実行") {
+      return;
+    }
+    await savePlanFiles(services.ws, session.lesson.plan.files);
+    this.busy = true;
+    this.abort = new AbortController();
+    await this.pushState();
+    try {
+      this.status(`テストを実行中: ${command}`, true);
+      const result = await runTestCommand(
+        command,
+        services.ws.folder.uri.fsPath,
+        this.abort.signal,
+      );
+      this.post({
+        type: "lessonTest",
+        lessonId,
+        ok: result.ok,
+        code: result.code,
+        output: result.output,
+        command,
+      });
+    } finally {
+      this.busy = false;
+      this.abort = undefined;
+      await this.pushState();
+    }
+  }
+
+  // ---------- OpenAI API の実行前確認・使用量 ----------
+
+  private async confirmApi(info: ApiRequestInfo): Promise<void> {
+    if (!readConfig().confirmApiCalls || this.approveRest) {
+      return;
+    }
+    const kind = info.kind === "chat" ? "チャット" : "埋め込み";
+    const choice = await vscode.window.showWarningMessage(
+      `OpenAI API を呼び出します: ${info.purpose}`,
+      {
+        modal: true,
+        detail: [
+          `入力トークン数: 約 ${info.inputTokens.toLocaleString()}(見積もり)`,
+          `モデル: ${info.model}(${kind})`,
+          "",
+          "この確認は、サイドバーの「API実行前に確認」または設定 quizSupport.confirmApiCalls でオフにできます。",
+        ].join("\n"),
+      },
+      "実行する",
+      "この処理では以降確認しない",
+    );
+    if (!choice) {
+      throw new LlmError("OpenAI API の呼び出しを取り消しました。");
+    }
+    if (choice === "この処理では以降確認しない") {
+      this.approveRest = true;
+    }
+  }
+
+  private countUsage(info: ApiUsageInfo): void {
+    this.usage.calls++;
+    this.usage.estimated += info.inputTokens;
+    this.usage.actual += info.actualInputTokens ?? 0;
+    this.usage.output += info.outputTokens ?? 0;
+  }
+
+  /** 処理の始めに、確認の省略と使用量の集計を戻す */
+  private beginOperation(): void {
+    this.approveRest = false;
+    this.usage = { calls: 0, estimated: 0, actual: 0, output: 0 };
+  }
+
+  private reportUsage(): void {
+    const u = this.usage;
+    if (u.calls === 0) {
+      return;
+    }
+    const input =
+      u.actual > 0
+        ? `${u.actual.toLocaleString()}(実測)`
+        : `約${u.estimated.toLocaleString()}(見積もり)`;
+    this.status(
+      `API 使用量: ${u.calls}回 / 入力 ${input}${u.output > 0 ? ` / 出力 ${u.output.toLocaleString()}` : ""} トークン`,
+    );
+  }
+
+  /** 出題を始められる状態か確かめる(できなければ理由を表示して undefined) */
+  private async readyServices(): Promise<Services | undefined> {
+    if (this.busy) {
+      this.status("前の処理が終わるまでお待ちください。");
+      return undefined;
+    }
+    if (!this.apiKey) {
+      this.fail(
+        new Error(
+          "OpenAI APIキーが未設定です。「APIキー」から設定してください。",
+        ),
+        "",
+      );
+      return undefined;
     }
     const services = await this.ensureServices();
     if (!services) {
       this.fail(new Error("フォルダを開いてから使ってください。"), "");
-      return;
     }
+    return services;
+  }
 
+  /** 処理中の表示・中止ボタンを有効にして、エージェントを使う処理を行う。 */
+  private async withAgent(
+    services: Services,
+    work: (agent: QuizAgent, hooks: RunHooks) => Promise<void>,
+  ): Promise<void> {
     const cfg = readConfig();
     this.busy = true;
     this.abort = new AbortController();
+    this.beginOperation();
     await this.pushState();
     try {
       const agent = new QuizAgent({
@@ -421,57 +1091,73 @@ export class ChatSidebarProvider implements vscode.WebviewViewProvider, vscode.D
           minSimilarity: cfg.minSimilarity,
           repoMapChars: 1800,
           evidenceChars: 16_000,
+          level: cfg.level,
         },
       });
-      const result = await agent.run(text, mode, {
+      await work(agent, {
         onStatus: (s) => this.status(s, true),
         signal: this.abort.signal,
       });
-
-      let questions: McqQuestion[] = [];
-      const first = result.quiz.items[0];
-      if (cfg.structureQuestions && first) {
-        this.status("構造クイズ(呼び出し関係)を作成中...", true);
-        questions = (
-          await buildStructureQuestions({ ws: services.ws, lsp: services.lsp }, first, makeRng(Date.now()))
-        ).slice(0, 2);
-      }
-
-      const session: QuizSession = {
-        id: crypto.randomUUID(),
-        review: false,
-        items: result.quiz.items,
-        questions,
-        overall: result.quiz.overallExplanation,
-        graded: false,
-      };
-      this.sessions.set(session.id, session);
-      this.post({ type: "quiz", quiz: this.payloadOf(session, text, result.quiz.goal) });
-      if (result.quiz.rejected.length > 0) {
-        this.status(`検証で${result.quiz.rejected.length}問を除外しました(実コードと食い違うなどの理由)。`);
-      }
     } finally {
       this.busy = false;
       this.abort = undefined;
+      this.reportUsage();
       await this.pushState();
     }
   }
 
-  private payloadOf(session: QuizSession, query: string, goal: string): Record<string, unknown> {
+  private async presentQuiz(
+    services: Services,
+    result: AgentResult,
+    query: string,
+  ): Promise<void> {
+    let questions: McqQuestion[] = [];
+    const first = result.quiz.items[0];
+    if (readConfig().structureQuestions && first) {
+      this.status("構造クイズ(呼び出し関係)を作成中...", true);
+      questions = (
+        await buildStructureQuestions(
+          { ws: services.ws, lsp: services.lsp },
+          first,
+          makeRng(Date.now()),
+        )
+      ).slice(0, 2);
+    }
+
+    const session: QuizSession = {
+      id: crypto.randomUUID(),
+      review: false,
+      items: result.quiz.items,
+      questions,
+      overall: result.quiz.overallExplanation,
+      graded: false,
+    };
+    this.sessions.set(session.id, session);
+    this.post({
+      type: "quiz",
+      quiz: this.payloadOf(session, query, result.quiz.goal),
+    });
+    if (result.quiz.notice) {
+      this.status(`⚠ ${result.quiz.notice}`);
+    }
+    if (result.quiz.rejected.length > 0) {
+      this.status(
+        `検証で不合格だった${result.quiz.rejected.length}件は作り直し、直らなかったものは除外しました。`,
+      );
+    }
+  }
+
+  private payloadOf(
+    session: QuizSession,
+    query: string,
+    goal: string,
+  ): Record<string, unknown> {
     return {
       id: session.id,
       query,
       goal,
       review: session.review,
-      items: session.items.map((item, index) => ({
-        index,
-        kind: item.kind,
-        path: item.path,
-        startLine: item.startLine,
-        endLine: item.endLine,
-        code: item.quizCode,
-        blanks: item.blanks.map((b) => ({ concept: b.concept, hints: b.hints })),
-      })),
+      items: session.items.map((item, index) => itemPayload(item, index)),
       questions: session.questions.map((q, index) => ({
         index,
         prompt: q.prompt,
@@ -486,79 +1172,72 @@ export class ChatSidebarProvider implements vscode.WebviewViewProvider, vscode.D
   private async handleGrade(m: Record<string, any>): Promise<void> {
     const session = this.sessions.get(String(m.quizId ?? ""));
     if (!session) {
-      this.fail(new Error("このクイズは失効しました。もう一度質問してください。"), "");
+      this.fail(
+        new Error("このクイズは失効しました。もう一度質問してください。"),
+        "",
+      );
       return;
     }
     if (session.graded) {
       return;
     }
-    const cfg = readConfig();
-    const services = this.services;
-    const given: string[][] = Array.isArray(m.blanks) ? m.blanks.map((a: unknown) => (Array.isArray(a) ? a.map(String) : [])) : [];
-    const hints: number[][] = Array.isArray(m.hints) ? m.hints.map((a: unknown) => (Array.isArray(a) ? a.map(Number) : [])) : [];
-    const choices: number[][] = Array.isArray(m.choices) ? m.choices.map((a: unknown) => (Array.isArray(a) ? a.map(Number) : [])) : [];
+    // 空欄ごとに選んだ選択肢の番号(未選択は -1)
+    const picked: number[][] = Array.isArray(m.blanks)
+      ? m.blanks.map((a: unknown) => (Array.isArray(a) ? a.map(Number) : []))
+      : [];
+    const hints: number[][] = Array.isArray(m.hints)
+      ? m.hints.map((a: unknown) => (Array.isArray(a) ? a.map(Number) : []))
+      : [];
+    const choices: number[][] = Array.isArray(m.choices)
+      ? m.choices.map((a: unknown) => (Array.isArray(a) ? a.map(Number) : []))
+      : [];
 
     this.status("採点中...", true);
-    const judge = cfg.semanticGrading && this.apiKey ? makeSemanticJudge(this.client) : undefined;
     const results: BlankResult[] = [];
-    const itemResults: Array<{ grades: BlankGrade[]; explanation: string; syntaxNote?: string; canApply: boolean }> = [];
+    const itemResults: Array<{
+      grades: Awaited<ReturnType<typeof gradeItem>>["grades"];
+      explanation: string;
+      canApply: boolean;
+      completed?: string;
+    }> = [];
     let correct = 0;
     let total = 0;
 
     for (const [i, item] of session.items.entries()) {
-      const answers = given[i] ?? [];
-      const grades = await gradeBlanks(item, answers, judge);
-      const score = scoreOf(grades);
-      correct += score.correct;
-      total += score.total;
-
-      let syntaxNote: string | undefined;
-      if (item.kind === "change" && !session.review && services && grades.some((g) => !g.correct) && answers.every((a) => a.trim())) {
-        try {
-          const text = await services.ws.readText(item.path);
-          if ((await this.parser.isValid(item.path, applyItemToText(text, item, answers))) === false) {
-            syntaxNote = "入力どおりに埋めると構文エラーになります。括弧・区切り・キーワードを見直してみましょう。";
-          }
-        } catch {
-          // 構文チェックは補助。失敗しても採点は続ける。
-        }
-      }
-      itemResults.push({
-        grades,
-        explanation: item.explanation,
-        syntaxNote,
-        canApply: item.kind === "change" && !session.review,
-      });
-
+      const graded = await gradeItem(item, picked[i] ?? [], hints[i] ?? []);
+      correct += graded.grades.filter((g) => g.correct).length;
+      total += graded.grades.length;
       const answerList = item.blanks.map((b) => b.answer);
-      item.blanks.forEach((b, k) => {
-        results.push({
-          path: item.path,
-          startLine: item.startLine,
-          endLine: item.endLine,
-          concept: b.concept,
-          snippet: windowAround(isolateBlank(item.quizCode, answerList, k)),
-          answer: b.answer,
-          hints: b.hints,
-          correct: grades[k]?.correct ?? false,
-          hintsUsed: hints[i]?.[k] ?? 0,
-        });
+      itemResults.push({
+        grades: graded.grades,
+        explanation: item.explanation,
+        canApply: item.kind === "change" && !session.review,
+        // 変更問題は、空欄以外も含めた完成形を見せて「どこがどう変わるか」を確認できるようにする
+        completed:
+          item.kind === "change" && !session.review
+            ? compactDiff(
+                item.original,
+                resolveBlanks(item.quizCode, answerList),
+              )
+            : undefined,
       });
+      results.push(...graded.records);
     }
 
     const questionResults = session.questions.map((q, i) => {
-      const chosen = [...new Set(choices[i] ?? [])].sort((a, b) => a - b);
-      const ok = chosen.length === q.correct.length && chosen.every((c, k) => c === q.correct[k]);
+      const r = gradeQuestion(q, choices[i] ?? []);
       total++;
-      if (ok) {
+      if (r.correct) {
         correct++;
       }
-      return { correct: ok, correctIndexes: q.correct, chosen, explanation: q.explanation, concept: q.concept };
+      return { ...r, explanation: q.explanation, concept: q.concept };
     });
 
     session.graded = true;
     await this.log.record(results);
-    await this.log.recordConceptOnly(questionResults.map((q) => ({ concept: q.concept, correct: q.correct })));
+    await this.log.recordConceptOnly(
+      questionResults.map((q) => ({ concept: q.concept, correct: q.correct })),
+    );
     this.post({
       type: "graded",
       quizId: session.id,
@@ -575,11 +1254,21 @@ export class ChatSidebarProvider implements vscode.WebviewViewProvider, vscode.D
     const item = session?.items[itemIndex];
     const services = this.services;
     if (!session || !item || !services) {
-      this.fail(new Error("反映対象が見つかりません(クイズが失効した可能性があります)。"), "");
+      this.fail(
+        new Error(
+          "反映対象が見つかりません(クイズが失効した可能性があります)。",
+        ),
+        "",
+      );
       return;
     }
     if (item.kind !== "change" || session.review) {
-      this.fail(new Error("この問題は既存コードの理解問題なので、反映対象ではありません。"), "");
+      this.fail(
+        new Error(
+          "この問題は既存コードの理解問題なので、反映対象ではありません。",
+        ),
+        "",
+      );
       return;
     }
     if (!session.graded) {
@@ -593,7 +1282,10 @@ export class ChatSidebarProvider implements vscode.WebviewViewProvider, vscode.D
 
     const choice = await vscode.window.showWarningMessage(
       `${item.path} の ${item.startLine}〜${item.endLine} 行目を、正解コードで書き換えます。`,
-      { modal: true, detail: "反映後は通常の編集と同じく、元に戻す(Undo)で取り消せます。" },
+      {
+        modal: true,
+        detail: "反映後は通常の編集と同じく、元に戻す(Undo)で取り消せます。",
+      },
       "反映する",
     );
     if (choice !== "反映する") {
@@ -606,17 +1298,35 @@ export class ChatSidebarProvider implements vscode.WebviewViewProvider, vscode.D
     )
       .split(/\r?\n/)
       .join(eol);
-    const range = new vscode.Range(item.startLine - 1, 0, item.endLine - 1, doc.lineAt(item.endLine - 1).text.length);
+    const range = new vscode.Range(
+      item.startLine - 1,
+      0,
+      item.endLine - 1,
+      doc.lineAt(item.endLine - 1).text.length,
+    );
     const edit = new vscode.WorkspaceEdit();
     edit.replace(uri, range, resolved);
     if (!(await vscode.workspace.applyEdit(edit))) {
       throw new Error("編集を適用できませんでした。");
     }
-    await vscode.window.showTextDocument(doc, { preview: false, selection: new vscode.Range(item.startLine - 1, 0, item.startLine - 1, 0) });
-    this.status(`✅ ${item.path} の ${item.startLine}〜${item.endLine} 行目に反映しました(Undoで元に戻せます)。`);
+    await vscode.window.showTextDocument(doc, {
+      preview: false,
+      selection: new vscode.Range(item.startLine - 1, 0, item.startLine - 1, 0),
+    });
+    this.status(
+      `✅ ${item.path} の ${item.startLine}〜${item.endLine} 行目に反映しました(Undoで元に戻せます)。`,
+    );
   }
 
-  private async handleOpen(relPath: string, line: number): Promise<void> {
+  /**
+   * ワークスペース内の場所を開く。text があれば、その内容の行を line の近くから探し直す
+   * (手順の行番号は計画の途中の位置なので、反映前・反映後どちらでも正しい行を開くため)。
+   */
+  private async handleOpen(
+    relPath: string,
+    line: number,
+    text?: string,
+  ): Promise<void> {
     const services = this.services;
     if (!services || !relPath) {
       return;
@@ -625,8 +1335,28 @@ export class ChatSidebarProvider implements vscode.WebviewViewProvider, vscode.D
     if (rel.startsWith("/") || rel.split("/").includes("..")) {
       return;
     }
-    const pos = new vscode.Position(Math.max(line - 1, 0), 0);
-    await vscode.window.showTextDocument(services.ws.uriOf(rel), { selection: new vscode.Range(pos, pos), preview: true });
+    let target = Math.max(line, 1);
+    const wanted = text?.trim();
+    if (wanted) {
+      const lines = splitLines(await services.ws.readText(rel).catch(() => ""));
+      let best = -1;
+      lines.forEach((l, i) => {
+        if (
+          l.trim() === wanted &&
+          (best < 0 || Math.abs(i + 1 - line) < Math.abs(best + 1 - line))
+        ) {
+          best = i;
+        }
+      });
+      if (best >= 0) {
+        target = best + 1;
+      }
+    }
+    const pos = new vscode.Position(target - 1, 0);
+    await vscode.window.showTextDocument(services.ws.uriOf(rel), {
+      selection: new vscode.Range(pos, pos),
+      preview: true,
+    });
   }
 
   // ---------- 復習 ----------
@@ -647,7 +1377,16 @@ export class ChatSidebarProvider implements vscode.WebviewViewProvider, vscode.D
       endLine: c.endLine,
       original: "",
       quizCode: c.snippet,
-      blanks: [{ answer: c.answer, concept: c.concept, hints: c.hints }],
+      // 旧データの復習カードには選択肢が無いので、正解を少しずつ変えた誤答で作る
+      blanks: [
+        {
+          answer: c.answer,
+          concept: c.concept,
+          hints: c.hints,
+          why: c.why,
+          choices: c.choices ?? reviewChoices(c),
+        },
+      ],
       explanation: "",
     }));
     const session: QuizSession = {
@@ -655,13 +1394,18 @@ export class ChatSidebarProvider implements vscode.WebviewViewProvider, vscode.D
       review: true,
       items,
       questions: [],
-      overall: "復習おつかれさまです。間違えた箇所は間隔を空けてまた出題されます。",
+      overall:
+        "復習おつかれさまです。間違えた箇所は間隔を空けてまた出題されます。",
       graded: false,
     };
     this.sessions.set(session.id, session);
     this.post({
       type: "quiz",
-      quiz: this.payloadOf(session, "復習", "前に間違えた・ヒントを使った箇所をもう一度。"),
+      quiz: this.payloadOf(
+        session,
+        "復習",
+        "前に間違えた・ヒントを使った箇所をもう一度。",
+      ),
     });
   }
 
@@ -674,7 +1418,9 @@ export class ChatSidebarProvider implements vscode.WebviewViewProvider, vscode.D
       return;
     }
     this.status("差分を計算しています...", true);
-    const plan = await services.index.prepare(undefined, (s) => this.status(s, true));
+    const plan = await services.index.prepare(undefined, (s) =>
+      this.status(s, true),
+    );
     this.pendingPlan = plan;
     this.post({
       type: "plan",
@@ -695,22 +1441,31 @@ export class ChatSidebarProvider implements vscode.WebviewViewProvider, vscode.D
       return;
     }
     if (!this.pendingPlan) {
+      // 確認画面(トークン数の見積もり)を見せずに埋め込みを始めない。最新の見積もりを出し直して、押し直してもらう
       await this.handlePlan();
-    }
-    const plan = this.pendingPlan;
-    if (!plan) {
       return;
     }
+    const plan = this.pendingPlan;
     this.pendingPlan = undefined;
     this.busy = true;
     this.abort = new AbortController();
+    this.beginOperation();
+    // 更新の画面でトークン数を見せて押してもらっているので、埋め込みの呼び出しごとには確認しない
+    this.approveRest = true;
     await this.pushState();
     try {
-      const stats = await services.index.commit(plan, { embed: embed && !!this.apiKey }, (s) => this.status(s, true), this.abort.signal);
+      const stats = await services.index.commit(
+        plan,
+        { embed: embed && !!this.apiKey },
+        (s) => this.status(s, true),
+        this.abort.signal,
+      );
       this.status(
         `インデックスを更新しました(${stats.files}ファイル / ${stats.chunks}チャンク / ベクトル${stats.vectors}件${embed ? "" : "・キーワード検索のみ"})。`,
       );
+      this.reportUsage();
     } finally {
+      this.approveRest = false;
       this.busy = false;
       this.abort = undefined;
       await this.pushState();
@@ -724,7 +1479,9 @@ export class ChatSidebarProvider implements vscode.WebviewViewProvider, vscode.D
     }
     await services.index.clear();
     this.pendingPlan = undefined;
-    this.status("インデックスを削除しました。再作成するには「インデックス」を押してください。");
+    this.status(
+      "インデックスを削除しました。再作成するには「インデックス」を押してください。",
+    );
     await this.pushState();
     this.needFullSync = true;
     this.scheduleSync();

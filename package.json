@@ -53,15 +53,38 @@
     "configuration": {
       "title": "Quiz Support",
       "properties": {
+        "quizSupport.learnerLevel": {
+          "type": "string",
+          "default": "intermediate",
+          "enum": [
+            "beginner",
+            "intermediate",
+            "advanced"
+          ],
+          "enumDescriptions": [
+            "初学者・学生: 用語を言い換え、基本の仕組みから一歩ずつ説明します。",
+            "実務エンジニア: 一般的な用語はそのまま使い、設計意図や責務の分担を中心に説明します。",
+            "上級: 独自の仕組み・一般的でない技術・設計上のトレードオフを中心に扱います。"
+          ],
+          "description": "学習者のレベル。出題の難しさ・用語の扱い・解説の細かさが変わります(サイドバーからも変更できます)。"
+        },
         "quizSupport.model": {
           "type": "string",
-          "default": "gpt-5-mini",
+          "default": "gpt-6-luna",
           "description": "調査・出題・採点補助に使うチャットモデル名。"
         },
         "quizSupport.reasoningEffort": {
           "type": "string",
           "default": "auto",
-          "enum": ["auto", "default", "none", "minimal", "low", "medium", "high"],
+          "enum": [
+            "auto",
+            "default",
+            "none",
+            "minimal",
+            "low",
+            "medium",
+            "high"
+          ],
           "description": "推論強度。auto: 通常は未指定で送り、「ツールと reasoning_effort は併用不可」と返すモデル(gpt-6-luna 等)では自動で none に切り替えて再試行。default: 常に未指定。それ以外: その値を常に送信。"
         },
         "quizSupport.embeddingModel": {
@@ -88,11 +111,6 @@
           "maximum": 1,
           "description": "意味検索のみでヒットしたコードに課すコサイン類似度の下限。"
         },
-        "quizSupport.semanticGrading": {
-          "type": "boolean",
-          "default": true,
-          "description": "厳密一致しなかった回答を、LLMで『同じ動作か』判定して救済する(不正解の回答ごとにAPIを1回使います)。"
-        },
         "quizSupport.structureQuestions": {
           "type": "boolean",
           "default": true,
@@ -107,6 +125,21 @@
           "type": "number",
           "default": 3000,
           "description": "インデックス対象の最大ファイル数。"
+        },
+        "quizSupport.confirmApiCalls": {
+          "type": "boolean",
+          "default": false,
+          "description": "OpenAI API を呼び出す前に、目的と入力トークン数(見積もり)を表示して実行を確認します。オンのときは、ファイル変更時の埋め込みの自動更新も行いません(サイドバーの「API実行前に確認」でも切り替えられます)。"
+        },
+        "quizSupport.typeCheck": {
+          "type": "boolean",
+          "default": true,
+          "description": "実装の手順を作るとき、ワークスペースの tsconfig.json / jsconfig.json を使って型検査し、変更で新しく生じた型エラーも確認事項にする(信頼済みのワークスペースではその TypeScript、それ以外は VS Code 同梱の TypeScript を使用)。"
+        },
+        "quizSupport.testCommand": {
+          "type": "string",
+          "default": "",
+          "description": "実装の手順をファイルに反映したあとに実行できるテストコマンド(例: npm test)。空なら実行ボタンを出しません。実行前にコマンドを表示して確認します。"
         }
       }
     }

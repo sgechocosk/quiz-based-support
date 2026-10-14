@@ -41,6 +41,11 @@ export class EvidenceStore {
     return this.files.size === 0;
   }
 
+  /** 読んだ行すべて(行番号なし)。既存の名前かどうかの判定に使う */
+  allText(): string {
+    return [...this.files.values()].map((m) => [...m.values()].join("\n")).join("\n");
+  }
+
   /** 新しく見たファイルから優先して、文字数予算内で行番号付きに整形する。 */
   render(maxChars: number): string {
     const sections: string[] = [];
@@ -234,7 +239,7 @@ async function suggestPaths(ctx: ToolContext, wanted: string): Promise<string> {
   return near.length > 0 ? ` 近いパス: ${near.map((f) => f.path).join(", ")}` : "";
 }
 
-interface GrepMatch {
+export interface GrepMatch {
   path: string;
   line: number;
   text: string;
@@ -246,14 +251,28 @@ async function grepFiles(
   glob: string | undefined,
   limit: number,
 ): Promise<{ matches: GrepMatch[]; truncated: boolean }> {
-  const files = (await ctx.ws.listFiles())
-    .filter((f) => f.size <= MAX_FILE_BYTES && matchGlob(glob, f.path) && (languageForPath(f.path) || glob))
-    .sort((a, b) => a.path.localeCompare(b.path))
-    .slice(0, MAX_GREP_FILES);
+  return grepWorkspace(ctx.ws, regex, { glob, limit });
+}
+
+/** ワークスペース(言語として扱えるファイル)を正規表現で1行ずつ検索する */
+export async function grepWorkspace(
+  ws: WorkspacePort,
+  regex: RegExp,
+  options: { glob?: string; limit: number; paths?: string[] },
+): Promise<{ matches: GrepMatch[]; truncated: boolean }> {
+  const { glob, limit } = options;
+  const files = options.paths
+    ? options.paths.map((path) => ({ path, size: 0 }))
+    : (await ws.listFiles())
+        .filter((f) => f.size <= MAX_FILE_BYTES && matchGlob(glob, f.path) && (languageForPath(f.path) || glob))
+        .sort((a, b) => a.path.localeCompare(b.path))
+        .slice(0, MAX_GREP_FILES);
   const matches: GrepMatch[] = [];
   for (const f of files) {
-    const lines = await readFileLines(ctx, f.path);
-    if (!lines) {
+    let lines: string[];
+    try {
+      lines = splitLines(await ws.readText(f.path));
+    } catch {
       continue;
     }
     for (let i = 0; i < lines.length; i++) {

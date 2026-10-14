@@ -22,11 +22,31 @@ export interface SearchHit {
   similarity?: number;
 }
 
+/** 実ファイル上の位置(検証済み)。手がかり・参考コードのリンクに使う。 */
+export interface CodeRef {
+  path: string;
+  /** 1始まり */
+  line: number;
+  note: string;
+}
+
+/** 選択式の選択肢。note は採点後に見せる「なぜ正しい/誤りか」 */
+export interface Choice {
+  code: string;
+  note: string;
+}
+
 export interface BlankSpec {
   answer: string;
   concept: string;
-  /** [概念, 方針, 形] の3段階 */
+  /** [概念, 考え方] の段階的ヒント */
   hints: string[];
+  /** 選択肢(正解を含む・表示順)。旧データには無い */
+  choices?: Choice[];
+  /** 採点後に見せる「なぜこのコードになるか」 */
+  why?: string;
+  /** 答えを導く手がかりになる別の場所(答えそのものは含まない行) */
+  clue?: CodeRef;
 }
 
 export type QuizKind = "change" | "read";
@@ -41,6 +61,18 @@ export interface QuizItem {
   quizCode: string;
   blanks: BlankSpec[];
   explanation: string;
+  /** 解答前に見せる課題文(read: この範囲の役割と読みどころ / change: 何をどう変えるか)。答えは含まない */
+  task?: string;
+  /** 解答前に見せる参考コードの場所 */
+  refs?: CodeRef[];
+  /** change で新しく作る名前(メソッド・変数など)。推測させず解答前に明示する */
+  newNames?: NewName[];
+}
+
+export interface NewName {
+  name: string;
+  /** 何のための名前か */
+  role: string;
 }
 
 export interface McqQuestion {
@@ -60,6 +92,8 @@ export interface GeneratedQuiz {
   overallExplanation: string;
   items: QuizItem[];
   rejected: string[];
+  /** 利用者に伝えるべき出題上の注意(例: 実装依頼なのに実装問題を作れなかった) */
+  notice?: string;
 }
 
 export const BLANK = "___BLANK___";
