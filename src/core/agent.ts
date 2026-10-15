@@ -1,6 +1,25 @@
+import {
+  applyReview,
+  checkpointAfter,
+  continueMessage,
+  defaultNeeds,
+  definitionGaps,
+  formatNotes,
+  markKeyLocations,
+  NEED_LABEL,
+  NEEDS_SCHEMA,
+  parseNeeds,
+  planRequest,
+  REVIEW_SCHEMA,
+  reviewRequest,
+  startMessage,
+  type InfoNeed,
+  type RawReview,
+  type ReviewOutcome,
+} from "./investigation";
 import { maskAnswers, revealsAnswer } from "./leak";
 import { levelGuide, levelStyle, type LearnerLevel } from "./level";
-import type { ChatLlm, ChatMessage, LspPort, SyntaxChecker, WorkspacePort } from "./ports";
+import type { ChatLlm, ChatMessage, LspPort, SyntaxChecker, ToolCall, WorkspacePort } from "./ports";
 import { applyItemToText, compactItem, validateRawItem, type RawItem, type Validation } from "./quiz";
 import { parseJson, splitLines } from "./text";
 import { EvidenceStore, executeTool, normalizeRelPath, TOOL_DEFS, type CodeIndex } from "./tools";
@@ -11,6 +30,7 @@ import type { CodeRef, GeneratedQuiz, QuizItem } from "./types";
 export type QuizMode = "auto" | "change" | "read";
 
 export interface AgentConfig {
+  /** 調査で呼べるツールの回数の上限(目安ではない。材料が足りたと判断した時点で終える) */
   maxSteps: number;
   minSimilarity: number;
   repoMapChars: number;
@@ -49,6 +69,10 @@ export interface Investigation {
   evidence: EvidenceStore;
   notes: string;
   steps: number;
+  /** 調べること(要求に答えるために知る必要があること)と、それぞれ分かったか */
+  needs: InfoNeed[];
+  /** 実行したツール呼び出し(呼び出しの内容 → 何手目か)。同じ呼び出しの繰り返しで回数を使わないため */
+  calls: Map<string, number>;
 }
 
 export interface ClarifyOption {
@@ -98,11 +122,15 @@ export const LARGE_CHANGE_LINES = 60;
 /** 1回の手順(段階)で扱える規模 */
 export const STAGE_SIZE = { places: MAX_ITEMS, lines: LARGE_CHANGE_LINES };
 /** 要件の回答を受けて行う追加調査のツール呼び出し上限 */
-const FOLLOW_UP_STEPS = 3;
-/** 段階ごとに今のコードで調べ直すときのツール呼び出し上限 */
-const STAGE_STEPS = 4;
+const FOLLOW_UP_STEPS = 6;
+/** 段階ごとに今のコードで調べ直すときのツール呼び出し上限(材料が足りれば上限を待たずに終える) */
+const STAGE_STEPS = 8;
 /** 段階ごとに調べ直すとき、ファイル全体を参照コードにする行数の上限(超えれば変えた行の周りだけ) */
 const STAGE_FILE_LINES = 400;
+/** 1回の調査で「材料が足りたか」を確かめる回数の上限 */
+const MAX_REVIEWS = 3;
+/** 要求の文で検索して、調査の手がかりとして最初に示す候補の数 */
+const SEED_LEADS = 6;
 
 export const QUIZ_SCHEMA = {
   name: "quiz",
@@ -189,15 +217,18 @@ export const QUIZ_SCHEMA = {
 
 export function exploreSystemPrompt(maxSteps: number, repoMap: string): string {
   return [
-    "あなたはコードベースの理解を支援するアシスタントの「調査担当」です。",
-    "ユーザーの要求に関係するコードをツールで調べて特定してください。この段階ではクイズも回答コードも作りません。",
+    "あなたはコードベースの理解を支援するアシスタントの「調査担当」です。この段階ではクイズも回答コードも作りません。",
+    "経験のあるエンジニアが初めてのコードベースで作業するときと同じように、",
+    "(1) 要求に答える(実装する)には何を知る必要があるかを先に決め、(2) それを1つずつコードで確かめ、(3) 材料がそろったら上限を待たずに調査を終えます。",
     "",
     "【進め方】",
-    "- まず下の「リポジトリ概観」で当たりを付け、search_code(識別子や英語のキーワードを含めると精度が上がる)で探す。名前や文字列を厳密に探すなら grep。",
-    "- 候補が見つかったら read_file で実際のコードを読む。構造や呼び出し関係は outline / find_references / find_definition で確かめる。",
+    "- 当たりを付ける: 下の「リポジトリ概観」と、要求の文で検索した「手がかり」から候補を選ぶ。search_code(識別子や英語のキーワードを含めると精度が上がる)で探し、名前や文字列を厳密に探すなら grep、シンボル名なら find_symbols。",
+    "- 確かめる: 候補は read_file で実際に読む(検索結果の抜粋だけで判断しない)。大きなファイルは outline で構造を見てから、必要な関数の範囲を読む。",
+    "- たどる: 呼び出し関係は find_references / find_definition で確かめる。中心のコードが呼んでいる関数・使っている型の定義も読んでおく(利用者が答えを自力で導く手がかりになり、変更で既存の関数を正しく使う根拠になる)。",
     "- 要求が「〜を追加・修正したい」なら、変更が入る場所と、手本にすべき既存の実装を見つける。「〜はどう動く/どこ?」なら、中心となる処理と呼び出し関係を見つける。",
-    "- 中心のコードが呼んでいる関数・使っている型の定義も read_file で読んでおく(利用者が答えを自力で導くための手がかりとして使う)。",
-    `- ツール呼び出しは最大${maxSteps}回まで。必要十分に調べたら、ツールを呼ばずに「どのファイルの何行目付近が重要で、なぜか(何を受け取り、何を返し、誰から呼ばれるか)」を短い箇条書きで答えて終了する。`,
+    "- 互いに関係しない呼び出し(別々のファイルを読む・別々の名前を探す)は、1回の応答でまとめて呼ぶ。同じ呼び出しを繰り返さない。",
+    `- ツール呼び出しの上限は${maxSteps}回(目安ではない)。調べることがすべて分かったら、ツールを呼ばずに「どのファイルの何行目付近が重要で、なぜか(何を受け取り、何を返し、誰から呼ばれるか)」を短い箇条書きで答えて終える。`,
+    "- 終えるとシステムが材料が足りているかを確かめ、足りなければ何が足りないかを伝えます。",
     "- 行番号は read_file の表示(L数字|)のとおりに引用する。推測で行番号を作らない。",
     "",
     "【リポジトリ概観(ファイル — 主なシンボル。他から参照される順)】",
@@ -564,6 +595,21 @@ function summarizeArgs(raw: string): string {
   }
 }
 
+/** 同じ呼び出しかどうかを比べるための引数の表記(キーの順序をそろえる) */
+function canonicalArgs(raw: string): string {
+  try {
+    const a = JSON.parse(raw) as Record<string, unknown>;
+    return JSON.stringify(Object.keys(a).sort().map((k) => [k, a[k]]));
+  } catch {
+    return raw.trim();
+  }
+}
+
+function needList(needs: InfoNeed[]): string {
+  const shown = needs.slice(0, 2).map((n) => n.need).join(" / ");
+  return needs.length > 2 ? `${shown} ほか${needs.length - 2}件` : shown;
+}
+
 // ---------- 答え漏れの検出と修正 ----------
 
 type LeakField = "goal" | "task" | "refNote" | "concept" | "hint0" | "hint1" | "clueNote";
@@ -682,7 +728,8 @@ const FIELD_LABEL: Record<LeakField, string> = {
 
 /**
  * 3段構えのエージェント。
- * 1) 調査: LLMがツール(検索・grep・読み取り・LSP)を自分で呼んで関連コードを探す(エージェント型検索)
+ * 1) 調査: 要求に答えるために知る必要があることを決め、LLMがツール(検索・grep・読み取り・LSP)を自分で呼んで確かめる
+ *    (エージェント型検索)。材料が足りたかを項目ごとに確かめ、足りれば上限を待たずに終える(investigation.ts)
  * 2) 要件の確認: 実装依頼で、変更が大きい・解釈や方針が複数ある場合は、出題せずにユーザーへ質問する
  * 3) 出題: 実際に読んだコードだけを根拠に構造化JSONでクイズを作り、実ファイルと突き合わせて検証する
  */
@@ -697,6 +744,8 @@ export class QuizAgent {
 
   async investigate(query: string, mode: QuizMode, hooks: RunHooks = {}): Promise<Investigation> {
     const { index, config } = this.deps;
+    const change = requiresChange(mode, detectIntent(query));
+    const leads = await this.seedLeads(query, hooks);
     const inv: Investigation = {
       query,
       mode,
@@ -704,16 +753,20 @@ export class QuizAgent {
         { role: "system", content: exploreSystemPrompt(config.maxSteps, index.repoMap(config.repoMapChars)) },
         {
           role: "user",
-          content: requiresChange(mode, detectIntent(query))
-            ? `${query}\n\n(これは実装・修正の依頼です。変更を入れる場所と、手本にすべき既存の実装を必ず特定してください)`
-            : query,
+          content: [
+            change ? `${query}\n\n(これは実装・修正の依頼です。変更を入れる場所と、手本にすべき既存の実装を必ず特定してください)` : query,
+            leads ? `\n【手がかり: 要求の文で検索して見つかった候補(まだ読んでいない)】\n${leads}` : "",
+          ].join("\n"),
         },
       ],
       evidence: new EvidenceStore(),
       notes: "",
       steps: 0,
+      needs: [],
+      calls: new Map(),
     };
-    hooks.onStatus?.("関連コードを調査中...");
+    hooks.onStatus?.("調べることを整理中...");
+    await this.planNeeds(inv, change, config.maxSteps, hooks);
     await this.explore(inv, config.maxSteps, hooks);
 
     if (inv.evidence.isEmpty()) {
@@ -797,7 +850,7 @@ export class QuizAgent {
         "ユーザーに要件を確認し、次の回答を得ました。",
         ...answers.map((a) => `- ${a.question} → ${a.answer}`),
         "この要件で変更が入る場所と手本になる実装のうち、まだ読んでいないものがあれば追加で調べてください。",
-        "最後に、この要件に関係する重要な場所を、前回と同じ形式の箇条書きでまとめ直してください。",
+        "調べ終えたら、ツールを呼ばずに、この要件に関係する重要な場所を前回と同じ形式の箇条書きでまとめ直してください(システムが、材料が足りているかをもう一度確かめます)。",
       ].join("\n"),
     });
     await this.explore(inv, FOLLOW_UP_STEPS, hooks);
@@ -842,7 +895,11 @@ export class QuizAgent {
       evidence,
       notes: "",
       steps: 0,
+      needs: [],
+      calls: new Map(),
     };
+    // 前の段階で読んだ行も根拠に使えるので、今回の段階に必要なことが既に読んだ範囲で分かれば、調べずに終えられる
+    await this.planNeeds(inv, true, budget, hooks);
     await this.explore(inv, budget, hooks);
     inv.notes ||= base.notes;
     return inv;
@@ -972,32 +1029,169 @@ export class QuizAgent {
     return { ws, lsp, index, evidence, minSimilarity: config.minSimilarity };
   }
 
-  /** 調査の会話を続け、ツール呼び出しが budget 回に達するか LLM がまとめを返したら終える。 */
-  private async explore(inv: Investigation, budget: number, hooks: RunHooks): Promise<void> {
-    const { llm } = this.deps;
-    const status = hooks.onStatus ?? (() => undefined);
-    const ctx = this.toolContext(inv.evidence);
-    const limit = inv.steps + budget;
-    for (let turn = 0; turn <= budget; turn++) {
-      const exhausted = inv.steps >= limit;
-      const res = await llm.chat({
-        messages: inv.messages,
-        tools: exhausted ? undefined : TOOL_DEFS,
+  /** 要求の文そのもので検索した候補(場所と名前だけ。読んだことにはしない)。検索できなければ空文字 */
+  private async seedLeads(query: string, hooks: RunHooks): Promise<string> {
+    const { index, config } = this.deps;
+    if (!index.hasChunks()) {
+      return "";
+    }
+    try {
+      const { hits } = await index.search(query, { k: SEED_LEADS, minSimilarity: config.minSimilarity });
+      return hits
+        .map(({ chunk: c }) => {
+          const label = [c.kind, c.symbols.slice(0, 3).join(",")].filter(Boolean).join(" ");
+          return `- ${c.file}:${c.startLine}-${c.endLine}${label ? `(${label})` : ""}`;
+        })
+        .join("\n");
+    } catch (error) {
+      if (hooks.signal?.aborted) {
+        throw error;
+      }
+      return "";
+    }
+  }
+
+  /** 調べることを決める(調査の会話の続きで、ツールを使わずに答えさせる)。決められなければ既定の項目で調べる */
+  private async planNeeds(inv: Investigation, change: boolean, budget: number, hooks: RunHooks): Promise<void> {
+    const request: ChatMessage = { role: "user", content: planRequest(change) };
+    let needs: InfoNeed[] | undefined;
+    try {
+      const res = await this.deps.llm.chat({
+        messages: [...inv.messages, request],
+        jsonSchema: NEEDS_SCHEMA,
         signal: hooks.signal,
-        purpose: exhausted ? "調査のまとめ" : `関連コードの調査(${inv.steps + 1}手目〜)`,
+        purpose: "調べることの整理",
       });
-      if (res.toolCalls.length === 0 || exhausted) {
-        inv.notes = res.content?.trim() ? res.content : inv.notes;
-        inv.messages.push({ role: "assistant", content: res.content ?? "" });
-        return;
+      needs = parseNeeds(parseJson(res.content), change);
+      inv.messages.push(request, { role: "assistant", content: res.content ?? "" });
+    } catch (error) {
+      if (hooks.signal?.aborted) {
+        throw error;
       }
-      inv.messages.push({ role: "assistant", content: res.content, toolCalls: res.toolCalls });
-      for (const call of res.toolCalls) {
+    }
+    inv.needs = needs ?? defaultNeeds(change);
+    hooks.onStatus?.(`調べること: ${inv.needs.map((n) => `${NEED_LABEL[n.kind]}(${n.need})`).join(" / ")}`);
+    inv.messages.push({ role: "user", content: startMessage(inv.needs, budget) });
+  }
+
+  /**
+   * 調査の会話を続ける。終えるのは次のとき:
+   * - 調査担当がツールを呼ばずに終え、材料の確認で「足りた」と判断された
+   * - 一定の回数を調べたところで材料を確認し、足りていた(上限まで使い切らない)
+   * - ツール呼び出しが budget 回に達した / 材料の確認を MAX_REVIEWS 回した / 前の確認のあと何も調べずに終えた
+   * 足りなければ、まだ分かっていない項目を伝えて続けさせる。
+   */
+  private async explore(inv: Investigation, budget: number, hooks: RunHooks): Promise<void> {
+    const status = hooks.onStatus ?? (() => undefined);
+    const change = requiresChange(inv.mode, detectIntent(inv.query));
+    const limit = inv.steps + budget;
+    let checkpoint = inv.steps + checkpointAfter(inv.needs.filter((n) => n.status === "open").length);
+    let reviews = 0;
+    let reviewedAt = -1;
+    let assessed = inv.needs.some((n) => n.status !== "open");
+    let lastText = "";
+    let summary = "";
+    // ツールを呼ばない・同じ呼び出しを繰り返すだけの応答が続いても必ず終わるよう、応答の回数にも上限を設ける
+    for (let turn = 0; turn < budget + MAX_REVIEWS + 2; turn++) {
+      let stopped = false;
+      if (inv.steps < limit) {
+        const res = await this.deps.llm.chat({
+          messages: inv.messages,
+          tools: TOOL_DEFS,
+          signal: hooks.signal,
+          purpose: `関連コードの調査(${inv.steps + 1}手目〜)`,
+        });
+        if (res.toolCalls.length === 0) {
+          lastText = res.content?.trim() || lastText;
+          inv.messages.push({ role: "assistant", content: res.content ?? "" });
+          stopped = true;
+        } else {
+          inv.messages.push({ role: "assistant", content: res.content, toolCalls: res.toolCalls });
+          await this.runTools(inv, res.toolCalls, limit, status);
+          if (inv.steps < limit && inv.steps < checkpoint) {
+            continue;
+          }
+        }
+      }
+      // ここに来るのは: 調査担当が自分で終えた / 確認する回数まで調べた / 上限に達した
+      if (stopped && inv.steps === reviewedAt) {
+        break; // 足りないと伝えても何も調べずに終えた: これ以上続けても進まない
+      }
+      const final = inv.steps >= limit;
+      reviews++;
+      reviewedAt = inv.steps;
+      status(final ? "集めた材料を整理中..." : "集めた材料で足りるかを確認中...");
+      const outcome = await this.review(inv, { change, final, remaining: limit - inv.steps }, hooks);
+      if (!outcome) {
+        break; // 確認できなければ、調査担当の判断で終える
+      }
+      assessed = true;
+      summary = outcome.summary || summary;
+      if (outcome.sufficient || final || reviews >= MAX_REVIEWS) {
+        if (!outcome.sufficient) {
+          status(`材料の確認: 調べきれなかったこと — ${needList(outcome.open)}`);
+        }
+        break;
+      }
+      status(`材料の確認: まだ分からないこと — ${needList(outcome.open)}。追加で調査します`);
+      inv.messages.push({ role: "user", content: continueMessage(outcome, limit - inv.steps) });
+      checkpoint = inv.steps + checkpointAfter(outcome.open.length);
+    }
+    // 一度も確認できていなければ、項目の状態は分からないので、調査担当のまとめだけを使う
+    inv.notes = assessed ? formatNotes(inv.needs, summary || lastText) : lastText || inv.notes;
+    markKeyLocations(inv.needs, inv.evidence);
+  }
+
+  /**
+   * ツールを実行する。上限を超える分は実行せず、同じ呼び出しの繰り返しは回数に数えずに知らせる。
+   * 最後に残りの回数とまだ分かっていない項目を添えて、予算を意識させる。
+   */
+  private async runTools(inv: Investigation, calls: ToolCall[], limit: number, status: (s: string) => void): Promise<void> {
+    const ctx = this.toolContext(inv.evidence);
+    for (const call of calls) {
+      const key = `${call.name}:${canonicalArgs(call.arguments)}`;
+      const done = inv.calls.get(key);
+      let result: string;
+      if (done !== undefined) {
+        result = `この呼び出しは調査 ${done} で実行済みです(結果はその応答にあります)。別の調べ方をするか、分かったならツールを呼ばずに終えてください。`;
+      } else if (inv.steps >= limit) {
+        result = "ツール呼び出しの上限に達したため、実行しませんでした。";
+      } else {
         inv.steps++;
+        inv.calls.set(key, inv.steps);
         status(`調査 ${inv.steps}: ${call.name}(${summarizeArgs(call.arguments)})`);
-        const result = await executeTool(call.name, call.arguments, ctx);
-        inv.messages.push({ role: "tool", toolCallId: call.id, content: result });
+        result = await executeTool(call.name, call.arguments, ctx);
       }
+      inv.messages.push({ role: "tool", toolCallId: call.id, content: result });
+    }
+    const open = inv.needs.filter((n) => n.status === "open").map((n) => n.id);
+    const last = inv.messages[inv.messages.length - 1]!;
+    last.content += `\n\n(残りのツール呼び出し: ${limit - inv.steps}回${open.length > 0 ? `。まだ確かめていない項目: ${open.join(", ")}` : ""})`;
+  }
+
+  /** 材料が足りたかを、項目ごとに判断させる(会話の続きで、ツールを使わずに答えさせる)。失敗したら undefined */
+  private async review(
+    inv: Investigation,
+    opts: { change: boolean; final: boolean; remaining: number },
+    hooks: RunHooks,
+  ): Promise<ReviewOutcome | undefined> {
+    const gaps = definitionGaps(inv.needs, inv.evidence, this.deps.index);
+    const request: ChatMessage = { role: "user", content: reviewRequest(inv.needs, { ...opts, gaps }) };
+    try {
+      const res = await this.deps.llm.chat({
+        messages: [...inv.messages, request],
+        jsonSchema: REVIEW_SCHEMA,
+        signal: hooks.signal,
+        purpose: opts.final ? "調査のまとめ" : "集めた材料で足りるかの確認",
+      });
+      const outcome = applyReview(inv.needs, parseJson<RawReview>(res.content), inv.evidence, opts);
+      inv.messages.push(request, { role: "assistant", content: res.content ?? "" });
+      return outcome;
+    } catch (error) {
+      if (hooks.signal?.aborted) {
+        throw error;
+      }
+      return undefined;
     }
   }
 

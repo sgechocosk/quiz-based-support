@@ -14,10 +14,15 @@ export interface CodeIndex {
   findSymbols(query: string, limit?: number): ChunkRecord[];
 }
 
+/** 重要な場所を予算内に残すとき、範囲の前後に含める行数 */
+const KEY_MARGIN = 8;
+
 /** エージェントが「実際に見た」コード行を蓄積する。クイズ生成はこの内容だけを根拠にする。 */
 export class EvidenceStore {
   private readonly files = new Map<string, Map<number, string>>();
   private readonly recency: string[] = [];
+  /** 調査で重要と確かめた場所(ファイル → 優先度と範囲)。render で先に並べ、収まらなければ範囲だけを残す */
+  private readonly keys = new Map<string, { rank: number; ranges: Array<[number, number]> }>();
 
   add(path: string, startLine: number, lines: string[]): void {
     let map = this.files.get(path);
@@ -68,40 +73,103 @@ export class EvidenceStore {
     return [...this.files.values()].map((m) => [...m.values()].join("\n")).join("\n");
   }
 
-  /** 新しく見たファイルから優先して、文字数予算内で行番号付きに整形する。 */
+  /** 範囲のうち、読んだ行の割合(0〜1) */
+  coverage(path: string, startLine: number, endLine: number): number {
+    const map = this.files.get(path);
+    if (!map || endLine < startLine) {
+      return 0;
+    }
+    let hit = 0;
+    for (let n = startLine; n <= endLine; n++) {
+      if (map.has(n)) {
+        hit++;
+      }
+    }
+    return hit / (endLine - startLine + 1);
+  }
+
+  /** 範囲のうち、読んだ行 */
+  linesIn(path: string, startLine: number, endLine: number): string[] {
+    const map = this.files.get(path);
+    if (!map) {
+      return [];
+    }
+    return [...map.keys()]
+      .filter((n) => n >= startLine && n <= endLine)
+      .sort((a, b) => a - b)
+      .map((n) => map.get(n)!);
+  }
+
+  /**
+   * 調査で重要と確かめた場所を記録する(rank が小さいほど先)。
+   * render では、このファイルを先に並べ、予算に収まらなければこの範囲(前後数行)だけを残す。
+   */
+  markKey(path: string, startLine: number, endLine: number, rank: number): void {
+    if (!this.files.has(path)) {
+      return;
+    }
+    const key = this.keys.get(path) ?? { rank, ranges: [] };
+    key.rank = Math.min(key.rank, rank);
+    key.ranges.push([startLine, endLine]);
+    this.keys.set(path, key);
+  }
+
+  /**
+   * 重要な場所のあるファイルを先に、残りは新しく見たファイルから、文字数予算内で行番号付きに整形する。
+   * 先に読んだファイルほど落ちるのではなく、変更する場所・手本など調査で確かめた場所が残るようにする。
+   */
   render(maxChars: number): string {
+    const recent = [...this.recency].reverse();
+    const order = [
+      ...recent.filter((p) => this.keys.has(p)).sort((a, b) => this.keys.get(a)!.rank - this.keys.get(b)!.rank),
+      ...recent.filter((p) => !this.keys.has(p)),
+    ];
     const sections: string[] = [];
     let used = 0;
-    for (const path of [...this.recency].reverse()) {
-      const map = this.files.get(path)!;
-      const nums = [...map.keys()].sort((a, b) => a - b);
-      const blocks: string[] = [];
-      let blockStart = -1;
-      let prev = -2;
-      let buf: string[] = [];
-      const close = (): void => {
-        if (buf.length > 0) {
-          blocks.push(numberLines(buf, blockStart));
-          buf = [];
-        }
-      };
-      for (const n of nums) {
-        if (n !== prev + 1) {
-          close();
-          blockStart = n;
-        }
-        buf.push(map.get(n)!);
-        prev = n;
+    for (const path of order) {
+      const room = maxChars - used;
+      let section = this.section(path);
+      const key = this.keys.get(path);
+      if (section.length > room && key) {
+        section = this.section(path, key.ranges);
       }
-      close();
-      const section = `### ${path}\n${blocks.join("\n…\n")}`;
-      if (used + section.length > maxChars && sections.length > 0) {
-        break;
+      if (section.length > room && sections.length > 0) {
+        continue; // 収まらないファイルは飛ばし、後ろの小さなファイルを入れる
       }
-      sections.push(truncate(section, Math.max(maxChars - used, 2000)));
-      used += section.length;
+      const shown = truncate(section, Math.max(room, 2000));
+      sections.push(shown);
+      used += shown.length;
     }
     return sections.join("\n\n");
+  }
+
+  /** 1ファイル分の読んだ行(ranges を渡すと、その範囲の前後だけ) */
+  private section(path: string, ranges?: Array<[number, number]>): string {
+    const map = this.files.get(path)!;
+    let nums = [...map.keys()].sort((a, b) => a - b);
+    if (ranges) {
+      nums = nums.filter((n) => ranges.some(([s, e]) => n >= s - KEY_MARGIN && n <= e + KEY_MARGIN));
+    }
+    const blocks: string[] = [];
+    let blockStart = -1;
+    let prev = -2;
+    let buf: string[] = [];
+    const close = (): void => {
+      if (buf.length > 0) {
+        blocks.push(numberLines(buf, blockStart));
+        buf = [];
+      }
+    };
+    for (const n of nums) {
+      if (n !== prev + 1) {
+        close();
+        blockStart = n;
+      }
+      buf.push(map.get(n)!);
+      prev = n;
+    }
+    close();
+    return `### ${path}\n${blocks.join("\n…\n")}`;
   }
 }
 

@@ -9,7 +9,7 @@ import { buildStructureQuestions } from "../../core/questions";
 import { EvidenceStore, executeTool, normalizeRelPath, type ToolContext } from "../../core/tools";
 import { makeRng } from "../../core/text";
 import { FakeLsp } from "./helpers/fakeLsp";
-import { msg, startFakeOpenAi } from "./helpers/fakeOpenAi";
+import { investigationReply, msg, startFakeOpenAi } from "./helpers/fakeOpenAi";
 import { makeTempDir, NodeWorkspace, writeFiles } from "./helpers/nodeWorkspace";
 import { TsCompilerParser } from "./helpers/tsAst";
 
@@ -52,11 +52,12 @@ const FILES = {
 
 const CONFIG: AgentConfig = { maxSteps: 6, minSimilarity: 0.05, repoMapChars: 1500, evidenceChars: 12000 };
 
-async function setup(t: TestContext, handler: Parameters<typeof startFakeOpenAi>[0]) {
+/** fakeInvestigation: 調べることの整理・材料の確認には既定の応答を返す(false ならハンドラが答える) */
+async function setup(t: TestContext, handler: Parameters<typeof startFakeOpenAi>[0], { fakeInvestigation = true } = {}) {
   const root = await makeTempDir();
   await writeFiles(root, FILES);
   const ws = new NodeWorkspace(root);
-  const server = await startFakeOpenAi(handler);
+  const server = await startFakeOpenAi((req, n) => (fakeInvestigation ? investigationReply(req.body) : undefined) ?? handler(req, n));
   t.after(() => server.close());
   const client = new OpenAiClient({
     apiKey: async () => "sk-test",
@@ -399,7 +400,7 @@ test("要件の確認: 複数案がある実装依頼は計画に進まずに質
   const statuses: string[] = [];
   const hooks = { onStatus: (s: string) => statuses.push(s) };
   const inv = await agent.investigate("パスワードのチェックを強化したい", "auto", hooks);
-  assert.equal(inv.notes, "- src/auth.ts の 1-3 行目が中心(login)");
+  assert.equal(inv.notes, "- src/auth.ts の 1-3 行目が中心(login)\n\n【調査で確かめた場所】\n- [変更する場所] src/auth.ts:1-8 — 読んだ");
 
   const { spec: prior, clarification: c } = await agent.organize(inv, hooks);
   assert.ok(c, "複数案があるので、計画に進まずに質問する");
@@ -426,7 +427,7 @@ test("要件の確認: 複数案がある実装依頼は計画に進まずに質
   assert.ok(statuses.some((s) => s.includes("追加で調査")));
   assert.equal(inv.steps, 2, "回答後の追加調査は同じ調査の続きとして数える");
   assert.ok(inv.evidence.paths().includes("src/app.ts"), "回答後に読んだコードも根拠に加わる");
-  assert.equal(inv.notes, "- src/app.ts の handleSubmit から login が呼ばれる");
+  assert.match(inv.notes, /^- src\/app\.ts の handleSubmit から login が呼ばれる\n\n【調査で確かめた場所】/);
 
   const spec = await agent.finalizeSpec(inv, prior, answers, hooks);
   assert.match(specUser, /最低文字数を増やす.*補足: 9文字以上/);

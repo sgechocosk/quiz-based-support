@@ -20,7 +20,7 @@ import { makeRng } from "../../core/text";
 import { parseGitLog } from "../../host/gitHistory";
 import { TsTypeChecker } from "../../host/typeChecker";
 import { FakeLsp } from "./helpers/fakeLsp";
-import { msg, startFakeOpenAi } from "./helpers/fakeOpenAi";
+import { investigationReply, msg, startFakeOpenAi } from "./helpers/fakeOpenAi";
 import { makeTempDir, NodeWorkspace, writeFiles } from "./helpers/nodeWorkspace";
 import { TsCompilerParser } from "./helpers/tsAst";
 
@@ -351,11 +351,12 @@ const FILES = {
 
 const CONFIG: AgentConfig = { maxSteps: 3, minSimilarity: 0.05, repoMapChars: 1500, evidenceChars: 12000 };
 
-async function setup(t: TestContext, handler: Parameters<typeof startFakeOpenAi>[0]) {
+/** fakeInvestigation: 調べることの整理・材料の確認には既定の応答を返す(false ならハンドラが答える) */
+async function setup(t: TestContext, handler: Parameters<typeof startFakeOpenAi>[0], { fakeInvestigation = true } = {}) {
   const root = await makeTempDir();
   await writeFiles(root, FILES);
   const ws = new NodeWorkspace(root);
-  const server = await startFakeOpenAi(handler);
+  const server = await startFakeOpenAi((req, n) => (fakeInvestigation ? investigationReply(req.body) : undefined) ?? handler(req, n));
   t.after(() => server.close());
   const client = new OpenAiClient({
     apiKey: async () => "sk-test",
@@ -698,6 +699,8 @@ test("変更計画: 新しいメッセージの種類は、同じ種類の既存
     evidence: { render: () => "", allText: () => "", paths: () => ["src/host.ts"], add() {}, isEmpty: () => false } as any,
     notes: "",
     steps: 0,
+    needs: [],
+    calls: new Map(),
   };
   const planner = new ChangePlanner({ llm: client, ws, config: { evidenceChars: 8000 } });
   const plan = await planner.plan(inv, { query: "q", understanding: "", criteria: ["c"], contracts: [], answers: [] });
@@ -777,7 +780,7 @@ test("変更計画: 起点の変更が既に呼び出し元も直していれば
       }
       throw new Error(`想定外: ${name}`);
     });
-    const inv = { query: "q", mode: "auto" as const, messages: [], evidence: { render: () => "", allText: () => "", paths: () => [] } as any, notes: "", steps: 0 };
+    const inv = { query: "q", mode: "auto" as const, messages: [], evidence: { render: () => "", allText: () => "", paths: () => [] } as any, notes: "", steps: 0, needs: [], calls: new Map() };
     const planner = new ChangePlanner({ llm: client, ws, lsp, typeChecker: new TsTypeChecker(ts, root), config: { evidenceChars: 8000 } });
     const plan = await planner.plan(inv, { query: "q", understanding: "", criteria: ["c"], contracts: [], answers: [] });
     return { plan, resolvePrompts };
@@ -840,7 +843,7 @@ test("変更計画: 出力が途中で切れた・ステップが空でも、理
     }
     return { json: msg(JSON.stringify({ steps: [good] })) };
   });
-  const inv = { query: "q", mode: "auto" as const, messages: [], evidence: { render: () => "", allText: () => "", paths: () => ["src/auth.ts"] } as any, notes: "", steps: 0 };
+  const inv = { query: "q", mode: "auto" as const, messages: [], evidence: { render: () => "", allText: () => "", paths: () => ["src/auth.ts"] } as any, notes: "", steps: 0, needs: [], calls: new Map() };
   const plan = await new ChangePlanner({ llm: client, ws, config: { evidenceChars: 8000 } }).plan(inv, { query: "q", understanding: "", criteria: ["c"], contracts: [], answers: [] });
   assert.equal(calls, 3);
   assert.match(prompts[1]!, /出力が長すぎて途中で切れた/);
@@ -867,7 +870,7 @@ test("変更計画: 行を写し間違えたら、そのファイル全体を見
     prompts.push(req.body.messages[req.body.messages.length - 1].content);
     return { json: msg(JSON.stringify({ steps: [wrong] })) };
   });
-  const inv = { query: "q", mode: "auto" as const, messages: [], evidence: { render: () => "", allText: () => "", paths: () => ["src/auth.ts"] } as any, notes: "", steps: 0 };
+  const inv = { query: "q", mode: "auto" as const, messages: [], evidence: { render: () => "", allText: () => "", paths: () => ["src/auth.ts"] } as any, notes: "", steps: 0, needs: [], calls: new Map() };
   const planner = new ChangePlanner({ llm: client, ws, config: { evidenceChars: 8000 } });
   await assert.rejects(planner.plan(inv, { query: "q", understanding: "", criteria: ["c"], contracts: [], answers: [] }), (error: unknown) => {
     assert.ok(error instanceof PlanError);
@@ -1063,7 +1066,7 @@ test("変更計画: oldCode を写し間違えたら、最も近い箇所を示�
     const oldCode = prompts.length === 1 ? "  return password.length > 3 && user != '';" : '  return password.length > 3 && user !== "";';
     return { json: msg(JSON.stringify({ steps: [step(oldCode)] })) };
   });
-  const inv = { query: "q", mode: "auto" as const, messages: [], evidence: { render: () => "", allText: () => "", paths: () => ["src/auth.ts"] } as any, notes: "", steps: 0 };
+  const inv = { query: "q", mode: "auto" as const, messages: [], evidence: { render: () => "", allText: () => "", paths: () => ["src/auth.ts"] } as any, notes: "", steps: 0, needs: [], calls: new Map() };
   const plan = await new ChangePlanner({ llm: client, ws, config: { evidenceChars: 8000 } }).plan(inv, { query: "q", understanding: "", criteria: ["c"], contracts: [], answers: [] });
   assert.equal(prompts.length, 2);
   assert.match(prompts[1]!, /oldCode がファイルに見つかりません。最も近いのは2〜2行目/);

@@ -122,7 +122,7 @@ test("段階: 次の段階の前に今のコードで調べ直し(変わった�
   const evidence = new EvidenceStore();
   evidence.add("src/auth.ts", 1, AUTH.split("\n").slice(0, 3));
   evidence.add("src/util.ts", 1, UTIL.split("\n").slice(0, 3));
-  const base: Investigation = { query: OVERALL.query, mode: "change", messages: [], evidence, notes: "- 前の段階のメモ", steps: 3 };
+  const base: Investigation = { query: OVERALL.query, mode: "change", messages: [], evidence, notes: "- 前の段階のメモ", steps: 3, needs: [], calls: new Map() };
   // 前の段階で auth.ts を書き換えて反映した
   const applied = ["const MIN = 8;", "", ...AUTH.split("\n")].join("\n").replace("password.length > 3", "password.length > MIN");
   await fs.writeFile(path.join(root, "src/auth.ts"), applied);
@@ -131,6 +131,17 @@ test("段階: 次の段階の前に今のコードで調べ直し(変わった�
   const llm = fakeLlm((req) => {
     if (!req.jsonSchema) {
       return "- src/util.ts の clamp に設定を渡す";
+    }
+    if (req.jsonSchema.name === "investigation_plan") {
+      return JSON.stringify({ needs: [{ need: "上限を決めている関数はどこか", kind: "change_site", why: "w", hints: "clamp" }] });
+    }
+    if (req.jsonSchema.name === "sufficiency") {
+      // 前の段階で読んだ範囲(変わっていない util.ts)だけで分かる
+      return JSON.stringify({
+        needs: [{ id: "n1", status: "found", locations: [{ path: "src/util.ts", startLine: 1, endLine: 3 }], note: "clamp が上限を決めている" }],
+        newNeeds: [],
+        summary: "",
+      });
     }
     if (req.jsonSchema.name === "change_plan") {
       planUser = req.messages[1]!.content!;
@@ -166,7 +177,12 @@ test("段階: 次の段階の前に今のコードで調べ直し(変わった�
   assert.ok(!first.messages.some((m) => m.role === "tool"), "前の段階の古いツール結果は持ち込まない");
   assert.match(first.messages[1]!.content!, /今回は2段階目「処理」だけを実装する/);
   assert.match(first.messages[1]!.content!, /前の段階で変えたファイル\(今の内容は読み込み済み\): src\/auth\.ts/);
-  assert.equal(inv.notes, "- src/util.ts の clamp に設定を渡す");
+  assert.equal(inv.notes, "- src/util.ts の clamp に設定を渡す\n\n【調査で確かめた場所】\n- [変更する場所] src/util.ts:1-3 — clamp が上限を決めている");
+  assert.equal(inv.steps, 0, "前の段階で読んだ範囲で分かれば、新しく調べずに終える");
+  assert.ok(
+    llm.requests.some((r) => r.messages.some((m) => m.role === "user" && /最大6回\(目安ではなく上限\)/.test(m.content ?? ""))),
+    "段階の上限(設定の6回と段階の8回の小さい方)を伝える",
+  );
   // 変わったファイルは今の内容、変わっていないファイルは前に読んだ内容のまま
   const rendered = inv.evidence.render(8000);
   assert.match(rendered, /L1\| const MIN = 8;/);

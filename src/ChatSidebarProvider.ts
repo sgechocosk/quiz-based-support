@@ -155,7 +155,7 @@ function readConfig() {
     embeddingModel: c.get<string>("embeddingModel", "text-embedding-3-small"),
     reasoningEffort: c.get<string>("reasoningEffort", "auto"),
     baseUrl: c.get<string>("baseUrl", "https://api.openai.com/v1"),
-    maxAgentSteps: c.get<number>("maxAgentSteps", 8),
+    maxAgentSteps: c.get<number>("maxAgentSteps", 20),
     minSimilarity: c.get<number>("minSimilarity", 0.2),
     structureQuestions: c.get<boolean>("structureQuestions", true),
     autoEmbedMaxTokens: c.get<number>("autoEmbedMaxTokens", 100_000),
@@ -184,7 +184,11 @@ function reviewChoices(card: ReviewCard): Choice[] {
  */
 function friendlyStatus(text: string): string {
   const tool = /^調査 (\d+): /.exec(text);
-  return tool ? `関連コードを調査中...(${tool[1]})` : text;
+  if (tool) {
+    return `関連コードを調査中...(${tool[1]})`;
+  }
+  // 調べることの一覧は長いので、テストモードでだけそのまま出す
+  return text.startsWith("調べること: ") ? "調べることを決めました。関連コードを調査中..." : text;
 }
 
 function errorMessage(error: unknown, fallback: string): string {

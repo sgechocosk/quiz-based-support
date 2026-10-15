@@ -99,10 +99,10 @@
         },
         "quizSupport.maxAgentSteps": {
           "type": "number",
-          "default": 8,
+          "default": 20,
           "minimum": 1,
-          "maximum": 20,
-          "description": "調査フェーズでLLMが呼べるツールの最大回数。増やすと精度が上がる代わりに時間とトークンが増えます。"
+          "maximum": 40,
+          "description": "調査でツールを呼べる回数の上限(安全のための上限で、目安ではありません)。調査は「調べること」を決めてから進み、材料が足りたと確かめられた時点で終わるので、通常は上限まで使いません。"
         },
         "quizSupport.minSimilarity": {
           "type": "number",
