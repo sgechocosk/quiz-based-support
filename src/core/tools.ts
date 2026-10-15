@@ -33,6 +33,28 @@ export class EvidenceStore {
     this.recency.push(path);
   }
 
+  /** 飛び飛びの行をまとめて加える([行番号(1始まり), 内容]) */
+  addAll(path: string, entries: Iterable<[number, string]>): void {
+    let map = this.files.get(path);
+    if (!map) {
+      map = new Map();
+      this.files.set(path, map);
+    }
+    for (const [line, text] of entries) {
+      map.set(line, text);
+    }
+    const at = this.recency.indexOf(path);
+    if (at >= 0) {
+      this.recency.splice(at, 1);
+    }
+    this.recency.push(path);
+  }
+
+  /** 読んだ行(古く読んだファイルから順に) */
+  entries(): Array<{ path: string; lines: ReadonlyMap<number, string> }> {
+    return this.recency.map((path) => ({ path, lines: this.files.get(path)! }));
+  }
+
   paths(): string[] {
     return [...this.recency];
   }

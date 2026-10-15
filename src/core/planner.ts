@@ -1,4 +1,4 @@
-import { parseJson, type Investigation, type RunHooks } from "./agent";
+import type { Investigation, RunHooks } from "./agent";
 import { coChangeSuggestions, keyLiteralsOf, quotedLiteralPattern } from "./coupling";
 import { declarationsOf } from "./declarations";
 import { diffStat, lineMapper } from "./diff";
@@ -17,7 +17,8 @@ import {
 } from "./planTypes";
 import type { ChatLlm, ChatMessage, HistoryPort, LspPort, SyntaxChecker, TypeChecker, TypeDiagnostic, WorkspacePort } from "./ports";
 import { compactDiff } from "./quiz";
-import { numberLines, splitLines, truncate } from "./text";
+import { stageBrief } from "./stages";
+import { numberLines, parseJson, splitLines, truncate } from "./text";
 
 /**
  * 変更計画を作る。
@@ -165,9 +166,10 @@ const EDIT_RULES = [
 
 export function planSystemPrompt(level: LearnerLevel = "intermediate"): string {
   return [
-    "あなたはプログラミング学習アシスタントの「変更計画担当」です。確定した要件と調査済みのコードをもとに、要件を直接満たす「起点の変更」を、学習者が順に理解できるステップに分けて作ります。",
+    "あなたはコードの理解と変更を支援するアシスタントの「変更計画担当」です。確定した要件と調査済みのコードをもとに、要件を直接満たす「起点の変更」を、利用者が順に理解できるステップに分けて作ります。",
     "変更が波及する場所(呼び出し元・分岐・文字列キーの相手側・データの読み書き・型エラー・テスト・説明文など)は、このあとシステムが依存関係・文字列キー・変更履歴・型検査で機械的に洗い出し、1か所ずつ判断を求めます。",
     "ここでは、要件を満たすために必ず必要な変更だけを書いてください(波及先を推測で先回りして直さない)。",
+    "依頼を段階に分けて進めているときは、今回の段階の受け入れ条件を満たす変更だけを書き、後の段階でやることには手を付けない(途中の段階でもビルド・既存の動作が壊れないようにする)。",
     "出力は指定のJSONスキーマに厳密に従ってください。",
     "",
     "【ステップの作り方】",
@@ -188,7 +190,7 @@ export function planSystemPrompt(level: LearnerLevel = "intermediate"): string {
 
 export function resolveSystemPrompt(level: LearnerLevel = "intermediate"): string {
   return [
-    "あなたはプログラミング学習アシスタントの「影響確認担当」です。計画に入れた変更によって確認が必要になった場所(確認事項)について、",
+    "あなたはコードの理解と変更を支援するアシスタントの「影響確認担当」です。計画に入れた変更によって確認が必要になった場所(確認事項)について、",
     "変更が必要かどうかを1か所ずつ判断し、必要なら編集を書きます。出力は指定のJSONスキーマに厳密に従ってください。",
     "",
     "【判断のしかた】",
@@ -456,8 +458,9 @@ export class ChangePlanner {
     const hints = await this.historyHints(inv.evidence.paths());
     return [
       `【ユーザーの要求】\n${spec.query}`,
+      spec.stage ? `\n${stageBrief(spec)}` : "",
       spec.answers.length > 0 ? `\n【確認した要件】\n${spec.answers.map((a) => `- ${a.question} → ${a.answer}`).join("\n")}` : "",
-      `\n【受け入れ条件】\n${spec.criteria.map((c, i) => `${i + 1}. ${c}`).join("\n")}`,
+      `\n【受け入れ条件${spec.stage ? "(今回の段階)" : ""}】\n${spec.criteria.map((c, i) => `${i + 1}. ${c}`).join("\n")}`,
       spec.contracts.length > 0
         ? `\n【変わる約束(見込み)】\n${spec.contracts.map((c) => `- ${c.subject}(${c.kind}): ${c.description}`).join("\n")}`
         : "",
@@ -815,7 +818,8 @@ export class ChangePlanner {
     }
     return [
       `【要件】\n${spec.query}`,
-      `\n【受け入れ条件】\n${spec.criteria.map((c, i) => `${i + 1}. ${c}`).join("\n")}`,
+      spec.stage ? `\n${stageBrief(spec)}` : "",
+      `\n【受け入れ条件${spec.stage ? "(今回の段階)" : ""}】\n${spec.criteria.map((c, i) => `${i + 1}. ${c}`).join("\n")}`,
       `\n【計画に入れたステップ】\n${stepsDone.join("\n")}`,
       `\n【確認事項(行番号 L数字| は現在のコード。表示用で、コードの一部ではない)】\n${sections.join("\n\n")}`,
       "\nすべての確認事項について、resolutions に1件ずつ答えてください(obligation には確認事項の id を入れる)。",

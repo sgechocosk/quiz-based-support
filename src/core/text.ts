@@ -78,3 +78,8 @@ export function shuffle<T>(items: T[], rng: () => number): T[] {
   }
   return a;
 }
+
+/** LLM の JSON 出力を読む(```json の囲みがあれば外す)。読めなければ例外 */
+export function parseJson<T>(content: string | null | undefined): T {
+  return JSON.parse((content ?? "").replace(/^```json\s*|```\s*$/g, "").trim()) as T;
+}

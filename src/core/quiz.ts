@@ -271,7 +271,7 @@ export function declaredNames(lines: string[]): Set<string> {
 }
 
 /**
- * 答えの中で、学習者が既存コードから推測できない名前を探す。
+ * 答えの中で、利用者が既存コードから推測できない名前を探す。
  * - 新しく作る名前(newNames)はあらかじめ示すので推測不要
  * - 既存コード・表示中のコード・標準の名前にも無い関数呼び出し(先頭が . でない name(...))は推測不能
  */
@@ -537,7 +537,7 @@ export function validateRawItem(raw: RawItem, fileText: string, options: Validat
     const unknown = unguessableCalls(answer, new Set([...known, ...visible]));
     if (unknown.length > 0) {
       warnings.push(
-        `${label} 空欄「${answer}」: ${unknown.join(", ")} は既存コードにも表示中のコードにも無く、学習者が推測できません。新しく作るなら newCode に定義を書き newNames で示してください`,
+        `${label} 空欄「${answer}」: ${unknown.join(", ")} は既存コードにも表示中のコードにも無く、利用者が推測できません。新しく作るなら newCode に定義を書き newNames で示してください`,
       );
       spans.splice(k, 1);
     }
@@ -760,10 +760,6 @@ export function compactDiff(before: string, after: string, context = 2): string 
 
 // ---------- 反映(ファイル更新) ----------
 
-export function rangeText(fileText: string, startLine: number, endLine: number): string {
-  return splitLines(fileText).slice(startLine - 1, endLine).join("\n");
-}
-
 /**
  * 変更後のファイル全文を返す(CRLF/LF保持)。生成時の内容と一致しなければ例外。
  * answers を省略すると正解で埋める。採点時の構文チェックでは利用者の入力を渡す。
@@ -794,26 +790,15 @@ export function windowAround(code: string, radius = 5): string {
 
 export interface BlankGrade {
   correct: boolean;
-  via: "exact" | "semantic" | "none";
+  via: "exact" | "none";
   expected: string;
   given: string;
   note?: string;
 }
 
-export interface JudgeCase {
-  context: string;
-  expected: string;
-  given: string;
-}
-
-export type SemanticJudge = (cases: JudgeCase[]) => Promise<Array<{ equivalent: boolean; reason: string }>>;
-
-export async function gradeBlanks(
-  item: Pick<QuizItem, "quizCode" | "blanks">,
-  given: string[],
-  judge?: SemanticJudge,
-): Promise<BlankGrade[]> {
-  const grades: BlankGrade[] = item.blanks.map((b, i) => {
+/** 選んだコード(given)が答えと同じか(空白・末尾の ; ・引用符の違いは同じとみなす) */
+export function gradeBlanks(item: Pick<QuizItem, "blanks">, given: string[]): BlankGrade[] {
+  return item.blanks.map((b, i) => {
     const g = (given[i] ?? "").trim();
     if (!g) {
       return { correct: false, via: "none", expected: b.answer, given: g, note: "未入力" };
@@ -821,40 +806,4 @@ export async function gradeBlanks(
     const exact = isSameCode(g, b.answer);
     return { correct: exact, via: exact ? "exact" : "none", expected: b.answer, given: g };
   });
-
-  if (judge) {
-    const pending = grades.map((g, i) => ({ g, i })).filter(({ g }) => !g.correct && g.given !== "");
-    if (pending.length > 0) {
-      try {
-        const verdicts = await judge(
-          pending.map(({ i }) => ({
-            context: isolateBlank(item.quizCode, item.blanks.map((b) => b.answer), i),
-            expected: item.blanks[i]!.answer,
-            given: grades[i]!.given,
-          })),
-        );
-        pending.forEach(({ g }, k) => {
-          const v = verdicts[k];
-          if (v?.equivalent) {
-            g.correct = true;
-            g.via = "semantic";
-          }
-          if (v?.reason) {
-            g.note = v.reason;
-          }
-        });
-      } catch {
-        // 判定器の失敗は不正解扱いのまま(採点自体は止めない)
-      }
-    }
-  }
-  return grades;
-}
-
-export function scoreOf(grades: Array<{ correct: boolean }>): { correct: number; total: number } {
-  return { correct: grades.filter((g) => g.correct).length, total: grades.length };
-}
-
-export function blankSpecsOf(item: Pick<QuizItem, "blanks">): BlankSpec[] {
-  return item.blanks;
 }

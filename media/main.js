@@ -202,7 +202,7 @@
   const panels = { settings: $("settings-box"), log: $("log-box") };
   const panelButtons = { settings: $("btn-settings"), log: $("btn-log") };
 
-  /** 設定・学習記録のパネルを開閉する(同時に開くのは1つだけ) */
+  /** 設定・判断の記録のパネルを開閉する(同時に開くのは1つだけ) */
   function togglePanel(name, open) {
     for (const [key, box] of Object.entries(panels)) {
       const show = key === name ? (open ?? box.classList.contains("hidden")) : false;
@@ -274,7 +274,7 @@
     box.classList.toggle("hidden", box.childElementCount === 0);
   }
 
-  // ---------- 学習レベル ----------
+  // ---------- 経験レベル ----------
 
   const levelSelect = /** @type {HTMLSelectElement} */ ($("level"));
   levelSelect.addEventListener("change", () => vscode.postMessage({ type: "setLevel", level: levelSelect.value }));
@@ -297,8 +297,8 @@
       return;
     }
     box.append(
-      el("h4", { text: "はじめに: 学習レベルを選んでください" }),
-      el("div", { class: "muted", text: "扱う内容の深さ・用語の説明・解説の細かさを合わせます。あとから上の「学習レベル」でいつでも変えられます。" }),
+      el("h4", { text: "はじめに: 経験レベルを選んでください" }),
+      el("div", { class: "muted", text: "扱う内容の深さ・用語の説明・解説の細かさを合わせます。あとから上の「経験レベル」でいつでも変えられます。" }),
     );
     for (const l of levels) {
       const btn = el("button", { class: "level-choice secondary" }, el("strong", { text: l.label }), el("span", { text: l.description }));
@@ -785,6 +785,10 @@
     if (c.reason) {
       body.append(el("div", { class: "muted", text: c.reason }));
     }
+    if (c.stages && c.stages.length > 0) {
+      // 大きな依頼は段階に分け、1段階ずつ依頼全体が完成するまで進める
+      body.append(section(`段階の分け方(この順に1段階ずつ、依頼全体が完成するまで進めます)`, stageList(c.stages.map((st) => ({ ...st, status: "todo" })))));
+    }
 
     const inputs = c.questions.map((q, qi) => {
       const set = el("fieldset", { class: "mcq clarify-q" }, el("legend", { text: `決めること ${qi + 1}` }), el("div", { class: "clarify-question", text: q.question }));
@@ -807,8 +811,9 @@
       return { radios, note };
     });
 
-    const submit = el("button", { text: "この方針で進める" });
-    const skip = el("button", { class: "secondary", text: "確認せずに進める", title: "依頼の内容のまま、こちらの判断で進めます" });
+    const hasQuestions = c.questions.length > 0;
+    const submit = el("button", { text: hasQuestions ? "この方針で進める" : "この分け方で進める" });
+    const skip = el("button", { class: hasQuestions ? "secondary" : "secondary hidden", text: "確認せずに進める", title: "依頼の内容のまま、こちらの判断で進めます" });
     const footer = el("span", { class: "muted" });
     const disable = (note) => {
       inputs.forEach((q) => {
@@ -828,7 +833,7 @@
         const option = q.radios.findIndex((r) => r.checked);
         return { option: option >= 0 ? option : undefined, text: q.note.value.trim() };
       });
-      if (!skipped && answers.every((a) => a.option === undefined && !a.text)) {
+      if (!skipped && hasQuestions && answers.every((a) => a.option === undefined && !a.text)) {
         footer.textContent = "どれかを選ぶか、補足を書いてください(このまま進めるなら「確認せずに進める」)";
         return;
       }
@@ -836,15 +841,17 @@
       disable(skipped ? "確認せずに進めました" : "この方針で進めました");
       const summary = skipped
         ? "確認せずに進める"
-        : c.questions
-            .map((q, qi) => {
-              const a = answers[qi];
-              const picked = a.option !== undefined ? q.options[a.option].label : "";
-              const text = [picked, a.text].filter(Boolean).join(" / ");
-              return text ? `${q.question} → ${text}` : "";
-            })
-            .filter(Boolean)
-            .join("\n");
+        : !hasQuestions
+          ? "この分け方で進める"
+          : c.questions
+              .map((q, qi) => {
+                const a = answers[qi];
+                const picked = a.option !== undefined ? q.options[a.option].label : "";
+                const text = [picked, a.text].filter(Boolean).join(" / ");
+                return text ? `${q.question} → ${text}` : "";
+              })
+              .filter(Boolean)
+              .join("\n");
       addMessage("user", summary);
       vscode.postMessage({ type: "clarifyAnswer", id, answers, skip: skipped });
     };
@@ -852,6 +859,133 @@
     skip.onclick = () => answer(true);
     body.append(el("div", { class: "card-foot" }, submit, skip, footer));
     openClarify = { disable };
+    append(root);
+    scrollToStart(root);
+  }
+
+  // ---------- 段階に分けた依頼 ----------
+
+  const STAGE_NOTE = { unapplied: "(反映せずに進めた)", skipped: "(飛ばした)" };
+
+  /** 段階の地図(済んだ・今の・残りの段階) */
+  function stageList(stages) {
+    const list = el("ol", { class: "step-map stage-map" });
+    for (const st of stages) {
+      const cls = st.status === "current" ? "current" : st.status === "todo" ? "todo" : st.status === "skipped" ? "skipped" : "done";
+      const li = el("li", { class: cls, title: st.goal || "" }, document.createTextNode(`${st.label}${STAGE_NOTE[st.status] || ""}`));
+      if (st.goal) {
+        li.append(el("span", { class: "muted stage-goal", text: ` — ${st.goal}` }));
+      }
+      list.append(li);
+    }
+    return list;
+  }
+
+  /**
+   * 依頼ごとの「次へ進む」操作(最新の1つ)。押したら処理が終わるまで止め、
+   * 進めなかったとき(取り消し・エラー)は stageIdle で押せる状態に戻す。
+   * @type {Map<string, { buttons: HTMLButtonElement[], note: HTMLElement }>}
+   */
+  const stageControls = new Map();
+
+  function registerStageControl(campaignId, buttons, note) {
+    settleStage(campaignId, "");
+    stageControls.set(campaignId, { buttons, note });
+    for (const b of buttons) {
+      const onclick = b.onclick;
+      b.onclick = (e) => {
+        if (state.busy) {
+          note.textContent = "前の処理が終わってから押してください";
+          return;
+        }
+        buttons.forEach((x) => (x.disabled = true));
+        note.textContent = "準備しています...";
+        onclick && onclick.call(b, e);
+      };
+    }
+  }
+
+  /** 前の段階の操作を締める(次の段階が届いた・完成した) */
+  function settleStage(campaignId, text) {
+    const c = stageControls.get(campaignId);
+    if (!c) {
+      return;
+    }
+    c.buttons.forEach((b) => (b.disabled = true));
+    c.note.textContent = text;
+    stageControls.delete(campaignId);
+  }
+
+  function onStageIdle(m) {
+    const c = stageControls.get(m.campaignId);
+    if (c) {
+      c.buttons.forEach((b) => (b.disabled = false));
+      c.note.textContent = "";
+    }
+  }
+
+  /** 段階を計画できなかった(中止・エラーを含む): 計画し直すか、飛ばして次へ */
+  function renderStageBlocked(m) {
+    settleStage(m.campaignId, "→ 続きは下に表示しました");
+    const title = m.label ? `段階 ${m.index + 1}/${m.total}「${m.label}」を計画できませんでした` : "完成の確認を終えられませんでした";
+    const { root, body } = card("clarify", title);
+    body.append(el("div", { class: "warn", text: m.reason }));
+    body.append(
+      el(
+        "div",
+        { class: "muted" },
+        document.createTextNode(
+          m.canSkip
+            ? "今のコードで調べ直して計画し直すか、この段階を飛ばして次へ進めます(飛ばした内容は、残りの段階を見直すときに扱います)。"
+            : "もう一度、依頼全体が完成したかを確かめられます。",
+        ),
+      ),
+    );
+    const retry = el("button", { text: m.canSkip ? "この段階を計画し直す" : "もう一度確かめる" });
+    retry.onclick = () => vscode.postMessage({ type: "stageRetry", campaignId: m.campaignId });
+    const buttons = [retry];
+    if (m.canSkip) {
+      const skip = el("button", { class: "secondary", text: "飛ばして次へ" });
+      skip.onclick = () => vscode.postMessage({ type: "stageSkip", campaignId: m.campaignId });
+      buttons.push(skip);
+    }
+    const note = el("span", { class: "muted" });
+    body.append(el("div", { class: "card-foot" }, ...buttons, note));
+    registerStageControl(m.campaignId, buttons, note);
+    append(root);
+    scrollToStart(root);
+  }
+
+  /** 依頼全体の完成(または段階の上限に達した) */
+  function renderCampaignDone(m) {
+    settleStage(m.campaignId, "→ 完成を確かめました");
+    const { root, body } = card("lesson", m.complete ? "依頼した変更が完成しました" : "段階の上限に達しました");
+    if (m.understanding) {
+      body.append(section("依頼", el("div", { class: "goal", text: m.understanding })));
+    }
+    if (m.reason) {
+      body.append(el("div", { class: "muted", text: m.reason }));
+    }
+    body.append(section(`進めた段階(${m.stages.length})`, stageList(m.stages)));
+    if (m.criteria && m.criteria.length > 0) {
+      const list = el("ol", { class: "criteria" });
+      m.criteria.forEach((c) => list.append(el("li", { text: c })));
+      body.append(section("依頼全体の受け入れ条件(動かして確かめましょう)", list));
+    }
+    if (m.files.length > 0) {
+      body.append(section(`変えたファイル(${m.files.length})`, el("div", { class: "overall", text: m.files.join("\n") })));
+    }
+    if (!m.complete && m.remaining.length > 0) {
+      body.append(
+        el("div", {
+          class: "warn-box",
+          text: `⚠ 1つの依頼で進める段階は${m.limit}までです。残りの段階:\n${m.remaining.map((r) => `・${r}`).join("\n")}\n続けるときは、残りの内容で依頼し直してください。`,
+        }),
+      );
+    }
+    if (m.stages.some((st) => st.status !== "applied")) {
+      body.append(el("div", { class: "muted", text: "反映せずに進めた・飛ばした段階があります。ファイルの内容を確かめてください。" }));
+    }
     append(root);
     scrollToStart(root);
   }
@@ -869,11 +1003,22 @@
   function renderLesson(l) {
     const total = l.steps.length;
     const progressText = el("span", { class: "badge quiet" });
-    const { root, body } = card("lesson", "変更の組み立て", el("span", { class: "spacer" }), progressText);
+    const title = l.stage ? `変更の組み立て(段階 ${l.stage.index + 1}/${l.stage.total})` : "変更の組み立て";
+    const { root, body } = card("lesson", title, el("span", { class: "spacer" }), progressText);
     const bar = el("div");
     body.append(el("div", { class: "progress", title: "進み具合" }, bar));
     const flow = chain();
     body.append(flow);
+    if (l.stage) {
+      settleStage(l.stage.campaignId, "→ 続きは下に表示しました");
+      flow.append(
+        thought(
+          "依頼全体をどう分けたか",
+          el("div", { class: "muted", text: `大きな依頼なので、${l.stage.total}段階に分けて1段階ずつ、依頼全体が完成するまで進めます。今回は${l.stage.index + 1}段階目です。` }),
+          stageList(l.stage.roadmap),
+        ).node,
+      );
+    }
     if (l.goal) {
       flow.append(thought("要件をどう理解したか", el("p", { class: "goal", text: l.goal })).node);
     }
@@ -1180,6 +1325,28 @@
     };
     box.append(el("div", { class: "card-foot" }, apply, revert, test), testBox);
     entry.final = { apply, revert, test, testBox, canTest: !!f.canTest };
+    if (f.stage) {
+      // 段階に分けた依頼: この段階を終えたら、依頼全体が完成するまで次の段階へ
+      const s = f.stage;
+      const next = el("button", { text: s.next ? `次の段階へ進む(${s.index + 2}/${s.total}: ${s.next})…` : "依頼全体が完成したか確かめる…" });
+      next.title = "反映していなければ、反映して進むか、そのまま進むかを選べます";
+      next.onclick = () => vscode.postMessage({ type: "stageNext", campaignId: s.campaignId });
+      const note = el("span", { class: "muted" });
+      box.append(
+        el(
+          "div",
+          { class: "stage-next" },
+          el("div", {
+            class: "muted",
+            text: s.next
+              ? `段階 ${s.index + 1}/${s.total}「${s.label}」の変更をたどりました。反映したら、次の段階へ進みます。進む前に、依頼全体の受け入れ条件と見比べて残りの段階を見直します。`
+              : `段階 ${s.index + 1}/${s.total}「${s.label}」の変更をたどりました。予定した段階はこれで最後です。依頼全体の受け入れ条件と見比べて、足りなければ段階を足して続けます。`,
+          }),
+          el("div", { class: "card-foot" }, next, note),
+        ),
+      );
+      registerStageControl(s.campaignId, [next], note);
+    }
     entry.body.append(box);
   }
 
@@ -1309,6 +1476,17 @@
         break;
       case "showLog":
         togglePanel("log", true);
+        break;
+      case "stageIdle":
+        onStageIdle(m);
+        break;
+      case "stageBlocked":
+        setLive("");
+        renderStageBlocked(m);
+        break;
+      case "campaignDone":
+        setLive("");
+        renderCampaignDone(m);
         break;
     }
   });

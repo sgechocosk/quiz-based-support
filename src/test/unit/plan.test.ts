@@ -608,7 +608,7 @@ test("変更計画: 起点の変更 → 参照で呼び出し元を見つけ型�
   // 採点
   const item = first.item!;
   const right = item.blanks.map((b) => (b.choices ?? []).findIndex((c) => c.code === b.answer));
-  const graded = await gradeItem(item, right, [1]);
+  const graded = gradeItem(item, right, [1]);
   assert.ok(graded.grades.every((g) => g.correct));
   assert.equal(graded.records[0]!.hintsUsed, 1);
   assert.equal(gradeQuestion(q, q.correct).correct, true);

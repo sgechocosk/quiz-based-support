@@ -1,4 +1,4 @@
-import { checkItemRefs, distractorRules, leakRules, parseJson, QUIZ_SCHEMA, removeAnswerLeaks, type RunHooks } from "./agent";
+import { checkItemRefs, distractorRules, leakRules, QUIZ_SCHEMA, removeAnswerLeaks, type RunHooks } from "./agent";
 import { eliminationHint } from "./choices";
 import { declarationsOf } from "./declarations";
 import { diffStat } from "./diff";
@@ -19,7 +19,7 @@ import {
   type BlankGrade,
   type RawItem,
 } from "./quiz";
-import { makeRng, numberLines, sha1, shuffle, splitLines } from "./text";
+import { makeRng, numberLines, parseJson, sha1, shuffle, splitLines } from "./text";
 import type { McqQuestion, QuizItem } from "./types";
 
 /**
@@ -66,7 +66,7 @@ export const STEP_QUIZ_SCHEMA = {
 
 export function stepQuizSystemPrompt(level: LearnerLevel = "intermediate"): string {
   return [
-    "あなたはプログラミング学習アシスタントです。実装の手順(ステップ)ごとに、変更後のコードの「考えどころ」を穴埋めにした問題を作ります。",
+    "あなたはコードの理解を支援するアシスタントです。実装の手順(ステップ)ごとに、変更後のコードの「考えどころ」を穴埋めにした問題を作ります。",
     "変更後のコードは確定済みです。書き換えずに、空欄にする場所だけを指定します。空欄は選択式(正解1つ + 誤答3つ)。",
     "出力は指定のJSONスキーマに厳密に従ってください。",
     "",
@@ -81,7 +81,7 @@ export function stepQuizSystemPrompt(level: LearnerLevel = "intermediate"): stri
     "- line: 変更後のコード(行番号付きで示す)の中での行番号(1始まり)。",
     "- target: その行に逐語で含まれる、空欄にする部分(1行以内・60文字以内)。行全体ではなく、条件式・呼び出し・引数・代入値など意味のある単位。",
     "- 少なくとも1つは、変更・追加した行(差分の + の行)に置く。「なぜその場所をそう変えるのか」「何に合わせるのか」が問われる箇所を選ぶ。",
-    "- 個数と難しさは下の【学習者のレベル】に従う(ただし1ステップあたり最大4個)。",
+    "- 個数と難しさは下の【利用者のレベル】に従う(ただし1ステップあたり最大4個)。",
     "",
     ...distractorRules(),
     "",
@@ -160,7 +160,9 @@ export function whyText(step: PlanStep, plan: ChangePlan): string {
 
 export function lessonGoal(plan: ChangePlan): string {
   const what = plan.spec.understanding || plan.spec.query;
-  return `「${what}」を${plan.steps.length}ステップで実装します。各ステップで「なぜその場所を変えるのか」と「変えたら次にどこを確認するのか」を考えます。`;
+  const stage = plan.spec.stage;
+  const head = stage ? `依頼全体を${stage.total}段階に分けたうちの${stage.index + 1}段階目「${stage.label}」です。` : "";
+  return `${head}「${what}」を${plan.steps.length}ステップで実装します。各ステップで「なぜその場所を変えるのか」と「変えたら次にどこを確認するのか」を考えます。`;
 }
 
 export function overallText(plan: ChangePlan): string {
@@ -194,7 +196,7 @@ export function placeLabel(site: Pick<Site, "path" | "symbol">): string {
 
 /**
  * 予想問題の誤答に使う場所の候補: 計画・調査で出てきたファイルの関数・メソッド(と、関数の無いファイル)。
- * 学習者が今のコードベースで探せる場所にするため、変更前の内容から作る(これから作る関数は含めない)。
+ * 利用者が今のコードベースで探せる場所にするため、変更前の内容から作る(これから作る関数は含めない)。
  */
 async function placePool(plan: ChangePlan, deps: LessonDeps): Promise<string[]> {
   const paths = new Set<string>([
@@ -564,15 +566,15 @@ export interface GradedBlank extends BlankGrade {
   notes: string[];
 }
 
-/** 穴埋めの採点(選んだ選択肢の番号。未選択は -1)と、学習記録に残す内容 */
-export async function gradeItem(
+/** 穴埋めの採点(選んだ選択肢の番号。未選択は -1)と、判断の記録に残す内容 */
+export function gradeItem(
   item: QuizItem,
   chosen: number[],
   hintsUsed: number[] = [],
-): Promise<{ grades: GradedBlank[]; records: BlankResult[] }> {
+): { grades: GradedBlank[]; records: BlankResult[] } {
   const picks = item.blanks.map((_, k) => chosen[k] ?? -1);
   const answers = item.blanks.map((b, k) => b.choices?.[picks[k]!]?.code ?? "");
-  const grades = await gradeBlanks(item, answers);
+  const grades = gradeBlanks(item, answers);
   const answerList = item.blanks.map((b) => b.answer);
   return {
     grades: grades.map((g, k) => {
