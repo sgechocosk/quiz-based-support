@@ -10,6 +10,8 @@
   --radius: 4px;
   --border: var(--vscode-editorWidget-border, var(--vscode-panel-border, rgba(128, 128, 128, 0.35)));
   --subtle-border: var(--vscode-panel-border, rgba(128, 128, 128, 0.25));
+  /* 区切りをはっきり見せたい枠(テーマの文字色を薄めて、どのテーマでも見えるようにする) */
+  --strong-border: color-mix(in srgb, var(--vscode-foreground) 40%, transparent);
   --card-bg: var(--vscode-editorWidget-background, var(--vscode-sideBar-background));
   --muted: var(--vscode-descriptionForeground);
   --ok: var(--vscode-testing-iconPassed, #3fb950);
@@ -125,9 +127,6 @@ details.fold-box { font-size: 12px; }
 details.fold-box > summary { cursor: pointer; color: var(--vscode-textLink-foreground); padding: 1px 0; }
 details.fold-box > summary:hover { text-decoration: underline; }
 details.fold-box > *:not(summary) { margin-top: 4px; }
-details.section-fold > summary { cursor: pointer; font-size: 11px; font-weight: 600; color: var(--muted); padding: 1px 0; }
-details.section-fold > summary:hover { color: var(--vscode-foreground); }
-details.section-fold > *:not(summary) { margin-top: 4px; }
 
 /* 引用ブロック(課題・読みどころ・なぜ) */
 .task { white-space: pre-wrap; padding: 4px 8px; border-radius: 0 var(--radius) var(--radius) 0; background: var(--vscode-textBlockQuote-background); border-left: 3px solid var(--vscode-textBlockQuote-border, var(--accent)); }
@@ -198,6 +197,7 @@ fieldset.mcq legend { font-size: 11px; font-weight: 600; color: var(--muted); pa
 .mcq .why:empty { display: none; }
 
 /* ---------- 要件の確認 ---------- */
+fieldset.clarify-q { border-color: var(--strong-border); }
 .clarify-question { font-weight: 600; }
 .clarify-q label { align-items: flex-start; font-family: inherit; font-size: inherit; }
 .clarify-q label input { margin-top: 3px; }

@@ -468,11 +468,13 @@ export function stepPayload(lesson: Lesson, index: number): Record<string, unkno
   const s = ls.step;
   const answers = ls.item?.blanks.map((b) => b.answer) ?? [];
   const hides = (text: string): boolean => answers.some((a) => revealsAnswer(text, a));
-  // 穴埋めにしなかった編集は差分のまま見せる(穴埋めの答えが見えてしまうものは答え合わせの後に回す)
+  // 穴埋めにしなかった編集は差分のまま見せる(穴埋めの答えが見えてしまうものは答え合わせの後に回す)。
+  // edit は files の番号(コードの上に、その場所へのリンクを出すため)
   const diffs = s.edits
-    .filter((_, i) => !ls.item || i !== ls.editIndex)
-    .filter((e) => !hides(e.after))
-    .map((e) => ({ path: e.path, created: e.created, diff: compactDiff(e.before, e.after) }));
+    .map((e, i) => ({ e, i }))
+    .filter(({ i }) => !ls.item || i !== ls.editIndex)
+    .filter(({ e }) => !hides(e.after))
+    .map(({ e, i }) => ({ edit: i, path: e.path, created: e.created, diff: compactDiff(e.before, e.after) }));
   return {
     index,
     number: s.number,
@@ -489,6 +491,8 @@ export function stepPayload(lesson: Lesson, index: number): Record<string, unkno
       text: e.created ? "" : (splitLines(e.before)[0] ?? "").trim(),
     })),
     item: ls.item ? itemPayload(ls.item, 0) : undefined,
+    // 穴埋めにした編集の files の番号
+    itemEdit: ls.item ? ls.editIndex : undefined,
     diffs,
     question: ls.question
       ? { prompt: ls.question.prompt, options: ls.question.options, multi: ls.question.correct.length > 1, hint: ls.question.hint }
