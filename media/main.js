@@ -164,7 +164,7 @@
     const hint = el(
       "div",
       { id: "empty-hint", class: "empty-hint" },
-      el("strong", { text: "エンジニアの考え方で、コードと変更を分解する" }),
+      el("strong", { text: "コードと変更を、考える順序で分解する" }),
       el("div", { text: "下の入力欄に、知りたい仕組みや実装したいことを書いてください。" }),
     );
     const list = el("ul");

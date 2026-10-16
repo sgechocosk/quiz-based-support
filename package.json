@@ -1,7 +1,7 @@
 {
   "name": "quiz-based-support",
   "displayName": "コード思考サポート",
-  "description": "要件からコードの変更までを、プロのエンジニアの考える順序で分解して理解する。",
+  "description": "要件からコードの変更までを、考える順序で分解して理解する。",
   "version": "0.1.0",
   "publisher": "local-dev",
   "engines": {
