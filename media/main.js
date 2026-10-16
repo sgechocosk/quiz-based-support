@@ -1048,10 +1048,10 @@
     scrollToStart(root);
   }
 
-  /** 進み具合(確かめ終えたステップ数) */
+  /** 進み具合。バーは確かめ終えたステップ数、文字は今いるステップの位置(done 番目まで終えて、次は done+1 番目) */
   function setProgress(entry, done) {
     entry.bar.style.width = `${Math.round((done / entry.total) * 100)}%`;
-    entry.progressText.textContent = done >= entry.total ? "すべて確認済み" : `${done}/${entry.total} ステップ`;
+    entry.progressText.textContent = done >= entry.total ? "すべて確認済み" : `ステップ ${done + 1}/${entry.total}`;
   }
 
   function renderLessonStep(entry, s) {
