@@ -78,36 +78,3 @@ export function maskAnswers(text: string, answers: string[]): string {
   }
   return out;
 }
-
-/**
- * 答えの「形」だけを示すヒント(識別子・リテラルを伏せ、記号と構文キーワードだけ残す)。
- * 例: `await this.cache.get(key)` → `await this.___.___(___)`
- */
-export function answerSkeleton(answer: string): string {
-  const tokens = answer.match(/"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|`(?:\\.|[^`\\])*`|\d[\d_.]*|[A-Za-z_$][\w$]*|\s+|\S/g) ?? [];
-  let words = 0;
-  const shape = tokens
-    .map((t) => {
-      if (/^\s+$/.test(t)) {
-        return " ";
-      }
-      if (/^[A-Za-z_$]/.test(t)) {
-        if (TRIVIAL_WORDS.has(t)) {
-          return t;
-        }
-        words++;
-        return "___";
-      }
-      if (/^["'`\d]/.test(t)) {
-        words++;
-        return /^\d/.test(t) ? "(数値)" : "(文字列)";
-      }
-      return t;
-    })
-    .join("")
-    .replace(/(___)(\s*___)+/g, "___");
-  if (squash(shape) === "___" || words <= 1) {
-    return `答えは${words <= 1 ? "1つの語(名前や値)" : "短い式"}です。前後の行で、その位置にどんな種類の値が必要かを考えてみましょう。`;
-  }
-  return `答えの形: ${shape}(___ の部分を前後のコードから考える)`;
-}

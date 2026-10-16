@@ -149,8 +149,11 @@ export class LearnerLog {
     await this.store.update(KEY, this.data);
   }
 
-  /** 選択式問題など、復習カードにしない結果を概念別の統計にだけ反映する。 */
-  async recordConceptOnly(results: Array<{ concept: string; correct: boolean }>): Promise<void> {
+  /** 選択式問題など、復習カードにしない結果を概念別の統計にだけ反映する。newSession は record と同じ */
+  async recordConceptOnly(results: Array<{ concept: string; correct: boolean }>, newSession = false): Promise<void> {
+    if (newSession) {
+      this.data.totals.sessions++;
+    }
     for (const r of results) {
       this.data.totals.blanks++;
       if (r.correct) {

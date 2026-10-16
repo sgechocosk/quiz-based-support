@@ -7,6 +7,7 @@ import {
   QuizAgent,
   requirementText,
   requiresChange,
+  STAGE_SIZE,
   type AgentResult,
   type Clarification,
   type Investigation,
@@ -49,10 +50,18 @@ import {
   type ProjectRule,
 } from "./core/patterns";
 import { ChangePlanner, PlanError } from "./core/planner";
-import type { RequirementSpec } from "./core/planTypes";
+import type { RequirementSpec, StagePlan } from "./core/planTypes";
 import type { KeyValueStore, TypeChecker } from "./core/ports";
 import { buildStructureQuestions } from "./core/questions";
 import { applyItemToText, compactDiff, resolveBlanks } from "./core/quiz";
+import {
+  changedFocus,
+  MAX_STAGES,
+  reviewProgress,
+  stageSpec,
+  statusLabel,
+  type StageResult,
+} from "./core/stages";
 import { makeRng, sha1, splitLines } from "./core/text";
 import type { Choice, McqQuestion, QuizItem } from "./core/types";
 import {
@@ -101,6 +110,42 @@ interface LessonSession {
   finished: boolean;
   applied: boolean;
   score: { correct: number; total: number };
+  /** 判断の記録に「取り組んだ回数」として数えたか(1つの手順は、最初に記録したときに1回だけ数える) */
+  logged: boolean;
+  /** 段階に分けて進めている依頼の一部なら、その依頼 */
+  campaignId?: string;
+}
+
+/**
+ * 大きな依頼を段階に分けて、依頼全体が完成するまで進める(段階ごとに 調べ直す → 計画 → たどる → 反映 を回す)。
+ * 次の段階へ進む前に、依頼全体の受け入れ条件と済んだ段階を見比べて、残りの段階を見直す。
+ */
+interface Campaign {
+  id: string;
+  query: string;
+  /** 依頼全体の要件 */
+  overall: RequirementSpec;
+  /** 済んだ段階 + 今の段階 + 残りの段階 */
+  stages: StagePlan[];
+  /** 今の段階(0始まり)。stages の長さ以上なら、完成の確認待ち */
+  current: number;
+  done: StageResult[];
+  /** 最新の調査(次の段階はこれを今の内容で調べ直して使う) */
+  inv: Investigation;
+  /** 今の段階の手順(計画できなかったときは undefined) */
+  lessonId?: string;
+}
+
+/** 保持する出題・手順・依頼の数(古いものから捨てる) */
+const KEEP = { quizzes: 20, lessons: 20, campaigns: 10 };
+
+/** Map に入れ、上限を超えたら古いものから捨てる */
+function remember<T>(map: Map<string, T>, key: string, value: T, limit: number): void {
+  map.delete(key);
+  map.set(key, value);
+  while (map.size > limit) {
+    map.delete(map.keys().next().value!);
+  }
 }
 
 function readConfig() {
@@ -110,7 +155,7 @@ function readConfig() {
     embeddingModel: c.get<string>("embeddingModel", "text-embedding-3-small"),
     reasoningEffort: c.get<string>("reasoningEffort", "auto"),
     baseUrl: c.get<string>("baseUrl", "https://api.openai.com/v1"),
-    maxAgentSteps: c.get<number>("maxAgentSteps", 8),
+    maxAgentSteps: c.get<number>("maxAgentSteps", 20),
     minSimilarity: c.get<number>("minSimilarity", 0.2),
     structureQuestions: c.get<boolean>("structureQuestions", true),
     autoEmbedMaxTokens: c.get<number>("autoEmbedMaxTokens", 100_000),
@@ -139,7 +184,11 @@ function reviewChoices(card: ReviewCard): Choice[] {
  */
 function friendlyStatus(text: string): string {
   const tool = /^調査 (\d+): /.exec(text);
-  return tool ? `関連コードを調査中...(${tool[1]})` : text;
+  if (tool) {
+    return `関連コードを調査中...(${tool[1]})`;
+  }
+  // 調べることの一覧は長いので、テストモードでだけそのまま出す
+  return text.startsWith("調べること: ") ? "調べることを決めました。関連コードを調査中..." : text;
 }
 
 function errorMessage(error: unknown, fallback: string): string {
@@ -158,6 +207,7 @@ export class ChatSidebarProvider
   private readonly log: LearnerLog;
   private readonly sessions = new Map<string, QuizSession>();
   private readonly lessons = new Map<string, LessonSession>();
+  private readonly campaigns = new Map<string, Campaign>();
   private pendingPlan?: SyncPlan;
   /** 回答待ちの要件確認(最新の1件だけ。新しい質問をすると無効になる) */
   private pendingClarify?: {
@@ -260,11 +310,11 @@ export class ChatSidebarProvider
 <body>
 <div id="app">
   <header id="toolbar">
-    <label for="level" class="toolbar-label">学習レベル</label>
+    <label for="level" class="toolbar-label">経験レベル</label>
     <select id="level" title="解説の細かさ・用語・扱う内容の深さが変わります"></select>
     <span class="spacer"></span>
     <button id="test-badge" class="badge test hidden" title="テストモード: API 実行前の確認・トークン数・内部の情報を表示中(クリックで設定を開く)">テスト</button>
-    <button id="btn-log" class="toolbar-btn" title="これまでの判断の記録と振り返り" aria-expanded="false">学習記録</button>
+    <button id="btn-log" class="toolbar-btn" title="これまでの判断の記録と振り返り" aria-expanded="false">判断の記録</button>
     <button id="btn-settings" class="toolbar-btn" title="APIキー・索引・テストモード" aria-expanded="false">設定</button>
   </header>
   <section id="settings-box" class="panel hidden" aria-label="設定">
@@ -478,7 +528,7 @@ export class ChatSidebarProvider
     });
   }
 
-  /** 利用者が学習レベルを一度でも選んだか(未選択なら初回に選んでもらう) */
+  /** 利用者が経験レベルを一度でも選んだか(未選択なら初回に選んでもらう) */
   private levelChosen(): boolean {
     const i = vscode.workspace
       .getConfiguration("quizSupport")
@@ -522,6 +572,15 @@ export class ChatSidebarProvider
           break;
         case "lessonTest":
           await this.handleLessonTest(String(m.lessonId ?? ""));
+          break;
+        case "stageNext":
+          await this.handleStageNext(String(m.campaignId ?? ""));
+          break;
+        case "stageRetry":
+          await this.handleStageRetry(String(m.campaignId ?? ""));
+          break;
+        case "stageSkip":
+          await this.handleStageSkip(String(m.campaignId ?? ""));
           break;
         case "setTestMode":
           await vscode.workspace
@@ -619,7 +678,7 @@ export class ChatSidebarProvider
         this.post({ type: "clarify", id, clarification });
         return;
       }
-      await this.presentLesson(services, agent, inv, spec, text, hooks);
+      await this.proceed(services, agent, inv, spec, text, hooks);
     });
   }
 
@@ -657,15 +716,34 @@ export class ChatSidebarProvider
           hooks,
         );
       }
-      await this.presentLesson(
-        services,
-        agent,
-        pending.inv,
-        spec,
-        pending.query,
-        hooks,
-      );
+      await this.proceed(services, agent, pending.inv, spec, pending.query, hooks);
     });
+  }
+
+  /** 要件が決まったら、段階があれば1段階ずつ依頼全体が完成するまで、無ければ1回の手順で進める */
+  private async proceed(
+    services: Services,
+    agent: QuizAgent,
+    inv: Investigation,
+    spec: RequirementSpec,
+    query: string,
+    hooks: RunHooks,
+  ): Promise<void> {
+    if (spec.stages && spec.stages.length >= 2) {
+      const campaign: Campaign = {
+        id: crypto.randomUUID(),
+        query,
+        overall: spec,
+        stages: spec.stages,
+        current: 0,
+        done: [],
+        inv,
+      };
+      remember(this.campaigns, campaign.id, campaign, KEEP.campaigns);
+      await this.continueCampaign(services, agent, campaign, hooks, false);
+      return;
+    }
+    await this.presentLesson(services, agent, inv, spec, query, hooks);
   }
 
   // ---------- 実装の手順(変更計画) ----------
@@ -765,7 +843,7 @@ export class ChatSidebarProvider
     return lesson;
   }
 
-  private showLesson(lesson: Lesson, query: string): void {
+  private showLesson(lesson: Lesson, query: string, campaign?: Campaign): LessonSession {
     const { plan } = lesson;
     const session: LessonSession = {
       id: crypto.randomUUID(),
@@ -775,8 +853,10 @@ export class ChatSidebarProvider
       finished: false,
       applied: false,
       score: { correct: 0, total: 0 },
+      logged: false,
+      campaignId: campaign?.id,
     };
-    this.lessons.set(session.id, session);
+    remember(this.lessons, session.id, session, KEEP.lessons);
     this.post({
       type: "lesson",
       lesson: {
@@ -790,6 +870,7 @@ export class ChatSidebarProvider
           label: ls.display.label,
         })),
         step: stepPayload(lesson, 0),
+        stage: campaign ? this.stageView(campaign) : undefined,
       },
     });
     // 計画を作るときの注意は内部の情報なので、テストモードでだけ出す
@@ -798,6 +879,7 @@ export class ChatSidebarProvider
         this.status(`⚠ ${w}`);
       }
     }
+    return session;
   }
 
   /** 1ステップの答え合わせ → 判断の記録を見せて、次のステップ(最後ならまとめ)を渡す */
@@ -823,11 +905,12 @@ export class ChatSidebarProvider
 
     let grades: unknown[] = [];
     if (ls.item) {
-      const graded = await gradeItem(ls.item, picks, hints);
+      const graded = gradeItem(ls.item, picks, hints);
       grades = graded.grades;
       session.score.correct += graded.grades.filter((g) => g.correct).length;
       session.score.total += graded.grades.length;
-      await this.log.record(graded.records, Date.now(), index === 0);
+      await this.log.record(graded.records, Date.now(), !session.logged);
+      session.logged = true;
     }
     let question: ReturnType<typeof gradeQuestion> | undefined;
     if (ls.question) {
@@ -836,9 +919,11 @@ export class ChatSidebarProvider
       if (question.correct) {
         session.score.correct++;
       }
-      await this.log.recordConceptOnly([
-        { concept: ls.question.concept, correct: question.correct },
-      ]);
+      await this.log.recordConceptOnly(
+        [{ concept: ls.question.concept, correct: question.correct }],
+        !session.logged,
+      );
+      session.logged = true;
     }
     session.current++;
     const hasNext = session.current < session.lesson.steps.length;
@@ -867,6 +952,7 @@ export class ChatSidebarProvider
             score: session.score,
             canTest: !!cfg.testCommand,
             testCommand: cfg.testCommand,
+            stage: this.nextStageView(session),
           },
     });
     await this.pushState();
@@ -892,14 +978,7 @@ export class ChatSidebarProvider
       return;
     }
     const { plan } = session.lesson;
-    const moved = await changedSince(services.ws, plan.files, "original");
-    if (moved.length > 0) {
-      this.fail(
-        new Error(
-          `計画を作ったあとに次のファイルが変更されたため、反映を中止しました: ${moved.join(", ")}\nもう一度依頼すると、今の内容で計画し直します。`,
-        ),
-        "",
-      );
+    if (await this.movedSincePlan(session, services)) {
       return;
     }
     const created = plan.files.filter((f) => f.original === null).length;
@@ -921,24 +1000,46 @@ export class ChatSidebarProvider
     if (choice !== "反映する") {
       return;
     }
-    if (!(await applyPlanFiles(services.ws, plan.files, "apply"))) {
-      throw new Error("編集を適用できませんでした。");
+    if (!(await this.applyLessonFiles(session, services))) {
+      return;
     }
-    session.applied = true;
     const first = plan.files.find((f) => f.original !== null) ?? plan.files[0];
     if (first) {
       await vscode.window.showTextDocument(services.ws.uriOf(first.path), {
         preview: false,
       });
     }
-    this.post({
-      type: "lessonApplied",
-      lessonId,
-      canTest: !!readConfig().testCommand,
-    });
     this.status(
       `✅ ${plan.files.length}ファイルに反映しました(保存はまだしていません)。`,
     );
+  }
+
+  /** 計画を作ったあとにファイルが変わっていたら、理由を表示して true */
+  private async movedSincePlan(session: LessonSession, services: Services): Promise<boolean> {
+    const moved = await changedSince(services.ws, session.lesson.plan.files, "original");
+    if (moved.length > 0) {
+      this.fail(
+        new Error(
+          `計画を作ったあとに次のファイルが変更されたため、反映を中止しました: ${moved.join(", ")}\nもう一度依頼すると、今の内容で計画し直します。`,
+        ),
+        "",
+      );
+    }
+    return moved.length > 0;
+  }
+
+  /** 手順で計画したファイルをすべて反映する(確認ダイアログは呼び出し側で出す) */
+  private async applyLessonFiles(session: LessonSession, services: Services): Promise<boolean> {
+    if (!(await applyPlanFiles(services.ws, session.lesson.plan.files, "apply"))) {
+      throw new Error("編集を適用できませんでした。");
+    }
+    session.applied = true;
+    this.post({
+      type: "lessonApplied",
+      lessonId: session.id,
+      canTest: !!readConfig().testCommand,
+    });
+    return true;
   }
 
   private async handleLessonRevert(lessonId: string): Promise<void> {
@@ -1021,6 +1122,272 @@ export class ChatSidebarProvider
       this.busy = false;
       this.abort = undefined;
       await this.pushState();
+    }
+  }
+
+  // ---------- 段階に分けた依頼(依頼全体が完成するまで回す) ----------
+
+  /** 依頼全体の中での今の段階(画面の「段階の地図」用) */
+  private stageView(campaign: Campaign): Record<string, unknown> {
+    return {
+      campaignId: campaign.id,
+      index: campaign.current,
+      total: campaign.stages.length,
+      label: campaign.stages[campaign.current]?.label ?? "",
+      roadmap: campaign.stages.map((s, i) => ({
+        label: s.label,
+        goal: s.goal,
+        status:
+          i < campaign.current
+            ? (campaign.done[i]?.status ?? "applied")
+            : i === campaign.current
+              ? "current"
+              : "todo",
+      })),
+    };
+  }
+
+  /** 手順を終えたときの、次の段階への案内(今の段階の手順でなければ undefined) */
+  private nextStageView(session: LessonSession): Record<string, unknown> | undefined {
+    const campaign = session.campaignId ? this.campaigns.get(session.campaignId) : undefined;
+    if (!campaign || campaign.lessonId !== session.id) {
+      return undefined;
+    }
+    return {
+      campaignId: campaign.id,
+      index: campaign.current,
+      total: campaign.stages.length,
+      label: campaign.stages[campaign.current]?.label ?? "",
+      next: campaign.stages[campaign.current + 1]?.label,
+    };
+  }
+
+  /**
+   * 今の段階を進める。review: 先に済んだ段階と依頼全体の受け入れ条件を見比べて、残りの段階を見直す。
+   * 残りが無ければ完成として締めくくる。計画できない・中止された・API のエラーでも依頼は止めず、計画し直す/飛ばすを選べるようにする。
+   */
+  private async continueCampaign(
+    services: Services,
+    agent: QuizAgent,
+    campaign: Campaign,
+    hooks: RunHooks,
+    review: boolean,
+  ): Promise<void> {
+    campaign.lessonId = undefined;
+    try {
+      let reason = "";
+      if (review) {
+        const cfg = readConfig();
+        const r = await reviewProgress(
+          this.client,
+          { level: cfg.level, maxPlaces: STAGE_SIZE.places, maxLines: STAGE_SIZE.lines },
+          campaign.overall,
+          campaign.done,
+          campaign.stages.slice(campaign.current),
+          hooks,
+        );
+        campaign.stages = [...campaign.stages.slice(0, campaign.current), ...r.remaining];
+        reason = r.reason;
+      }
+      if (campaign.current >= campaign.stages.length || campaign.current >= MAX_STAGES) {
+        this.finishCampaign(campaign, reason);
+        return;
+      }
+      const spec = stageSpec(campaign.overall, campaign.stages, campaign.current, campaign.done);
+      if (campaign.done.length > 0) {
+        // 前の段階の変更が入った今のコードで調べ直す(行番号・内容が変わっているため)
+        campaign.inv = await agent.investigateStage(
+          campaign.inv,
+          spec,
+          campaign.done.flatMap((d) => d.focus),
+          hooks,
+        );
+      }
+      const lesson = await this.buildPlanLesson(services, campaign.inv, spec, hooks);
+      campaign.lessonId = this.showLesson(lesson, campaign.query, campaign).id;
+    } catch (error) {
+      this.post({
+        type: "stageBlocked",
+        campaignId: campaign.id,
+        index: campaign.current,
+        total: campaign.stages.length,
+        label: campaign.stages[campaign.current]?.label ?? "",
+        canSkip: campaign.current < campaign.stages.length,
+        reason: hooks.signal?.aborted
+          ? "中止しました。"
+          : errorMessage(error, "この段階を計画できませんでした。"),
+      });
+    }
+  }
+
+  /** 依頼全体が完成した(または段階の上限に達した)ときのまとめ */
+  private finishCampaign(campaign: Campaign, reason: string): void {
+    const remaining = campaign.stages.slice(campaign.current);
+    this.post({
+      type: "campaignDone",
+      campaignId: campaign.id,
+      query: campaign.query,
+      understanding: campaign.overall.understanding,
+      criteria: campaign.overall.criteria,
+      stages: campaign.done.map((d) => ({
+        label: d.label,
+        status: d.status,
+        statusText: statusLabel(d.status),
+        files: d.files,
+      })),
+      complete: remaining.length === 0,
+      remaining: remaining.map((s) => s.label),
+      limit: MAX_STAGES,
+      reason,
+      files: [...new Set(campaign.done.flatMap((d) => d.files))],
+    });
+  }
+
+  /** 段階を1つ終えたことを記録し、残りを見直して次の段階へ進む */
+  private async advanceCampaign(services: Services, campaign: Campaign, result: StageResult): Promise<void> {
+    campaign.done.push(result);
+    campaign.current++;
+    await this.withAgent(services, (agent, hooks) =>
+      this.continueCampaign(services, agent, campaign, hooks, true),
+    );
+  }
+
+  /** 今の段階を終えて次へ(反映していなければ、反映して進むか、そのまま進むかを選んでもらう) */
+  private async handleStageNext(campaignId: string): Promise<void> {
+    const campaign = this.campaigns.get(campaignId);
+    let advanced = false;
+    try {
+      const session = campaign?.lessonId ? this.lessons.get(campaign.lessonId) : undefined;
+      if (!campaign || !session) {
+        this.fail(new Error("この依頼の段階は失効しました。もう一度依頼してください。"), "");
+        return;
+      }
+      if (!session.finished) {
+        this.fail(new Error("先にこの段階のステップを最後まで確かめてください。"), "");
+        return;
+      }
+      const services = await this.readyServices();
+      if (!services) {
+        return;
+      }
+      const stage = campaign.stages[campaign.current]!;
+      const name = `${campaign.current + 1}段階目「${stage.label}」`;
+      const following = campaign.stages[campaign.current + 1];
+      const then = following
+        ? `次の段階「${following.label}」の前に、依頼全体の受け入れ条件と見比べて残りの段階を見直し、今のファイルの内容で調べ直します。`
+        : "予定した段階はこれで最後です。依頼全体の受け入れ条件と見比べて、完成したかを確かめます(足りなければ段階を足して続けます)。";
+      let status: StageResult["status"];
+      if (session.applied) {
+        const choice = await vscode.window.showWarningMessage(
+          `${name}を終えて進みます。`,
+          { modal: true, detail: `反映した変更を保存してから進みます。\n${then}` },
+          "保存して進む",
+        );
+        if (choice !== "保存して進む") {
+          return;
+        }
+        status = "applied";
+      } else {
+        const choice = await vscode.window.showWarningMessage(
+          `${name}の変更は、まだファイルに入っていません。`,
+          {
+            modal: true,
+            detail: [
+              "反映して進む: 計画した変更をファイルに反映・保存してから進みます。",
+              "反映せずに進む: 自分で書いた変更など、今のファイルの内容のまま進みます。",
+              "",
+              then,
+            ].join("\n"),
+          },
+          "反映して進む",
+          "反映せずに進む",
+        );
+        if (!choice) {
+          return;
+        }
+        if (choice === "反映して進む") {
+          if ((await this.movedSincePlan(session, services)) || !(await this.applyLessonFiles(session, services))) {
+            return;
+          }
+          status = "applied";
+        } else {
+          status = "unapplied";
+        }
+      }
+      if (this.busy) {
+        this.status("前の処理が終わるまでお待ちください。");
+        return;
+      }
+      const { plan } = session.lesson;
+      if (status === "applied") {
+        // 次の段階の型検査はディスクの内容を読むので、反映した変更を保存しておく
+        await savePlanFiles(services.ws, plan.files);
+      }
+      advanced = true;
+      await this.advanceCampaign(services, campaign, {
+        label: stage.label,
+        goal: stage.goal,
+        status,
+        summary: session.lesson.overall,
+        files: plan.files.map((f) => f.path),
+        focus: changedFocus(plan.files),
+      });
+    } finally {
+      if (!advanced && campaign) {
+        this.post({ type: "stageIdle", campaignId: campaign.id });
+      }
+    }
+  }
+
+  /** 計画できなかった段階を、今の内容で調べ直して計画し直す(完成の確認で止まっていたら、確認をやり直す) */
+  private async handleStageRetry(campaignId: string): Promise<void> {
+    const campaign = this.campaigns.get(campaignId);
+    let started = false;
+    try {
+      if (!campaign || campaign.lessonId) {
+        return;
+      }
+      const services = await this.readyServices();
+      if (!services) {
+        return;
+      }
+      started = true;
+      await this.withAgent(services, (agent, hooks) =>
+        this.continueCampaign(services, agent, campaign, hooks, campaign.current >= campaign.stages.length),
+      );
+    } finally {
+      if (!started && campaign) {
+        this.post({ type: "stageIdle", campaignId: campaign.id });
+      }
+    }
+  }
+
+  /** 計画できなかった段階を飛ばして次へ(飛ばした内容は、残りの段階の見直しで扱う) */
+  private async handleStageSkip(campaignId: string): Promise<void> {
+    const campaign = this.campaigns.get(campaignId);
+    let advanced = false;
+    try {
+      const stage = campaign?.stages[campaign.current];
+      if (!campaign || campaign.lessonId || !stage) {
+        return;
+      }
+      const services = await this.readyServices();
+      if (!services) {
+        return;
+      }
+      advanced = true;
+      await this.advanceCampaign(services, campaign, {
+        label: stage.label,
+        goal: stage.goal,
+        status: "skipped",
+        summary: "",
+        files: [],
+        focus: [],
+      });
+    } finally {
+      if (!advanced && campaign) {
+        this.post({ type: "stageIdle", campaignId: campaign.id });
+      }
     }
   }
 
@@ -1166,7 +1533,7 @@ export class ChatSidebarProvider
       overall: result.quiz.overallExplanation,
       graded: false,
     };
-    this.sessions.set(session.id, session);
+    remember(this.sessions, session.id, session, KEEP.quizzes);
     this.post({
       type: "quiz",
       quiz: this.payloadOf(session, query, result.quiz.goal),
@@ -1229,7 +1596,7 @@ export class ChatSidebarProvider
     this.status("確認中...", true);
     const results: BlankResult[] = [];
     const itemResults: Array<{
-      grades: Awaited<ReturnType<typeof gradeItem>>["grades"];
+      grades: ReturnType<typeof gradeItem>["grades"];
       explanation: string;
       canApply: boolean;
       completed?: string;
@@ -1238,7 +1605,7 @@ export class ChatSidebarProvider
     let total = 0;
 
     for (const [i, item] of session.items.entries()) {
-      const graded = await gradeItem(item, picked[i] ?? [], hints[i] ?? []);
+      const graded = gradeItem(item, picked[i] ?? [], hints[i] ?? []);
       correct += graded.grades.filter((g) => g.correct).length;
       total += graded.grades.length;
       const answerList = item.blanks.map((b) => b.answer);
@@ -1432,7 +1799,7 @@ export class ChatSidebarProvider
         "判断が分かれた箇所は、間隔を空けてまた振り返ります。",
       graded: false,
     };
-    this.sessions.set(session.id, session);
+    remember(this.sessions, session.id, session, KEEP.quizzes);
     this.post({
       type: "quiz",
       quiz: this.payloadOf(

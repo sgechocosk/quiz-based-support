@@ -10,6 +10,8 @@
   --radius: 4px;
   --border: var(--vscode-editorWidget-border, var(--vscode-panel-border, rgba(128, 128, 128, 0.35)));
   --subtle-border: var(--vscode-panel-border, rgba(128, 128, 128, 0.25));
+  /* 区切りをはっきり見せたい枠(テーマの文字色を薄めて、どのテーマでも見えるようにする) */
+  --strong-border: color-mix(in srgb, var(--vscode-foreground) 40%, transparent);
   --card-bg: var(--vscode-editorWidget-background, var(--vscode-sideBar-background));
   --muted: var(--vscode-descriptionForeground);
   --ok: var(--vscode-testing-iconPassed, #3fb950);
@@ -51,7 +53,7 @@ button.toolbar-btn { background: none; color: var(--vscode-foreground); border: 
 button.toolbar-btn:hover:not(:disabled) { background: var(--vscode-toolbar-hoverBackground); }
 button.toolbar-btn[aria-expanded="true"] { background: var(--vscode-toolbar-activeBackground, var(--vscode-toolbar-hoverBackground)); border-color: var(--subtle-border); }
 
-/* ---------- 開閉するパネル(設定・索引・学習記録・初回のレベル選択) ---------- */
+/* ---------- 開閉するパネル(設定・索引・判断の記録・初回のレベル選択) ---------- */
 .panel { border: 1px solid var(--border); border-radius: var(--radius); padding: 8px 10px; background: var(--card-bg); display: flex; flex-direction: column; gap: 8px; flex-shrink: 0; max-height: 50vh; overflow-y: auto; }
 .panel h4 { margin: 0; font-size: 13px; }
 .panel-head { display: flex; align-items: center; justify-content: space-between; gap: 6px; }
@@ -73,9 +75,8 @@ button.level-choice span { font-size: 12px; opacity: 0.9; }
 #messages-wrap { position: relative; flex: 1 1 auto; min-height: 0; display: flex; }
 #messages { flex: 1; overflow-y: auto; display: flex; flex-direction: column; gap: 10px; padding: 2px 2px 8px 0; min-height: 0; }
 #jump-latest { position: absolute; right: 10px; bottom: 8px; font-size: 12px; padding: 2px 10px; border-radius: 12px; box-shadow: 0 1px 4px var(--vscode-widget-shadow, rgba(0, 0, 0, 0.3)); }
-.empty-hint { margin: auto 4px; display: flex; flex-direction: column; gap: 6px; color: var(--muted); font-size: 12px; line-height: 1.6; }
-.empty-hint strong { color: var(--vscode-foreground); font-size: 13px; }
-.empty-hint ul { margin: 0; padding-left: 18px; }
+.empty-hint { margin: auto 12px; text-align: center; color: var(--muted); font-size: 12px; line-height: 1.6; }
+.empty-hint span { display: inline-block; }
 
 .message { line-height: 1.55; word-wrap: break-word; }
 .message.user { align-self: flex-end; max-width: 88%; padding: 6px 10px; border-radius: 10px 10px 2px 10px; background: var(--vscode-button-background); color: var(--vscode-button-foreground); white-space: pre-wrap; }
@@ -125,9 +126,6 @@ details.fold-box { font-size: 12px; }
 details.fold-box > summary { cursor: pointer; color: var(--vscode-textLink-foreground); padding: 1px 0; }
 details.fold-box > summary:hover { text-decoration: underline; }
 details.fold-box > *:not(summary) { margin-top: 4px; }
-details.section-fold > summary { cursor: pointer; font-size: 11px; font-weight: 600; color: var(--muted); padding: 1px 0; }
-details.section-fold > summary:hover { color: var(--vscode-foreground); }
-details.section-fold > *:not(summary) { margin-top: 4px; }
 
 /* 引用ブロック(課題・読みどころ・なぜ) */
 .task { white-space: pre-wrap; padding: 4px 8px; border-radius: 0 var(--radius) var(--radius) 0; background: var(--vscode-textBlockQuote-background); border-left: 3px solid var(--vscode-textBlockQuote-border, var(--accent)); }
@@ -198,6 +196,7 @@ fieldset.mcq legend { font-size: 11px; font-weight: 600; color: var(--muted); pa
 .mcq .why:empty { display: none; }
 
 /* ---------- 要件の確認 ---------- */
+fieldset.clarify-q { border-color: var(--strong-border); }
 .clarify-question { font-weight: 600; }
 .clarify-q label { align-items: flex-start; font-family: inherit; font-size: inherit; }
 .clarify-q label input { margin-top: 3px; }
@@ -212,6 +211,12 @@ input.clarify-note { background: var(--vscode-input-background); color: var(--vs
 .step-map li.current { color: var(--vscode-foreground); font-weight: 600; }
 .step-map li.done { color: var(--vscode-foreground); }
 .step-map li.done::marker { content: "✓ "; color: var(--ok); }
+.step-map li.skipped::marker { content: "– "; color: var(--warn); }
+
+/* ---------- 段階に分けた依頼 ---------- */
+ol.stage-map { margin: 0; padding-left: 20px; }
+.stage-goal { font-size: 12px; }
+.stage-next { display: flex; flex-direction: column; gap: 4px; padding-top: 8px; border-top: 1px dashed var(--subtle-border); }
 .progress { height: 3px; border-radius: 2px; background: var(--subtle-border); overflow: hidden; }
 .progress > div { height: 100%; background: var(--accent); transition: width 0.3s; }
 .lesson-steps { display: flex; flex-direction: column; gap: 8px; }

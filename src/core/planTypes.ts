@@ -28,6 +28,31 @@ export interface ContractChange {
   description: string;
 }
 
+/** 大きな依頼を分けた段階(それだけで動作が完結する単位。1段階ずつ、依頼全体が完成するまで進める) */
+export interface StagePlan {
+  label: string;
+  /** この段階を終えると何ができるようになるか */
+  goal: string;
+  /** この段階の受け入れ条件 */
+  criteria: string[];
+}
+
+/** 段階に分けて進めているときの、今回の段階の位置づけ */
+export interface StageContext {
+  /** 0始まり */
+  index: number;
+  total: number;
+  label: string;
+  /** 依頼全体の理解 */
+  overall: string;
+  /** 依頼全体の受け入れ条件 */
+  overallCriteria: string[];
+  /** 済んだ段階(名前と結果の要約) */
+  done: string[];
+  /** 後の段階(今回は手を付けない) */
+  later: string[];
+}
+
 /** 整理・確定した要件 */
 export interface RequirementSpec {
   query: string;
@@ -37,6 +62,10 @@ export interface RequirementSpec {
   contracts: ContractChange[];
   /** ユーザーに確認した内容 */
   answers: ClarifyAnswer[];
+  /** 依頼全体を分けた段階(2つ以上のときだけ。1段階ずつ、依頼全体が完成するまで進める) */
+  stages?: StagePlan[];
+  /** 段階に分けて進めているときの、今回の段階 */
+  stage?: StageContext;
 }
 
 /** 確認が必要な場所(行番号は、変更計画を重ねた現在の内容での位置) */

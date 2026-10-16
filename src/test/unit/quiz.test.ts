@@ -20,7 +20,7 @@ import {
   type RawBlank,
   type RawItem,
 } from "../../core/quiz";
-import { answerSkeleton, maskAnswers, revealsAnswer } from "../../core/leak";
+import { maskAnswers, revealsAnswer } from "../../core/leak";
 import type { KeyValueStore } from "../../core/ports";
 import {
   answersFrom,
@@ -30,6 +30,7 @@ import {
   quizSystemPrompt,
   requirementText,
   requiresChange,
+  specFrom,
 } from "../../core/agent";
 import { coerceLevel } from "../../core/level";
 import { buildChoices, eliminationHint, mutateAnswer, namePool } from "../../core/choices";
@@ -117,7 +118,7 @@ test("read問題: quizCode は実コードから組み立てるので、正解�
     ],
   );
   // <, >, & を含む答えも壊れず採点できる
-  const grades = await gradeBlanks(v.item, ["a<2 && b>0", "a !== b"]);
+  const grades = gradeBlanks(v.item, ["a<2 && b>0", "a !== b"]);
   assert.deepEqual(
     grades.map((g) => g.correct),
     [true, true],
@@ -299,31 +300,20 @@ test("答え漏れ: 答えそのもの・材料の識別子を全部言うヒン
   assert.ok(!revealsAnswer("", "x"));
 });
 
-test("答え漏れ: 伏せ字と、答えの形だけを示すヒント", () => {
+test("答え漏れ: 伏せ字", () => {
   assert.equal(maskAnswers("password.length > 3 を返す", ["password.length > 3"]), "〇〇 を返す");
   assert.ok(!revealsAnswer(maskAnswers("password と length を使う", ["password.length > 3"]), "password.length > 3"));
-  const shape = answerSkeleton("await this.cache.get(key)");
-  assert.match(shape, /await this\.___\.___\(___\)/);
-  assert.ok(!revealsAnswer(shape, "await this.cache.get(key)"));
-  assert.match(answerSkeleton("count"), /1つの語/);
-  assert.match(answerSkeleton('a === "x"'), /___ === \(文字列\)/);
 });
 
-test("意味的採点: 厳密不一致でも判定器が同値と認めれば正解、判定器が落ちても採点は続く", async () => {
+test("照合: 選んだコードが答えと違えば一致しない / 未選択は未入力", () => {
   const v = validateRawItem(raw(), FILE);
   assert.ok(v.ok);
   if (!v.ok) {
     return;
   }
-  const judge = async (cases: Array<{ given: string }>) =>
-    cases.map((c) => ({ equivalent: c.given === "b < 2 === false", reason: "同値" }));
-  const g1 = await gradeBlanks(v.item, ["b < 2 === false", "x"], judge);
-  assert.deepEqual(g1.map((g) => [g.correct, g.via]), [[true, "semantic"], [false, "none"]]);
-  const g2 = await gradeBlanks(v.item, ["zzz", ""], async () => {
-    throw new Error("api down");
-  });
-  assert.deepEqual(g2.map((g) => g.correct), [false, false]);
-  assert.equal(g2[1]!.note, "未入力");
+  const grades = gradeBlanks(v.item, ["b < 2 === false", ""]);
+  assert.deepEqual(grades.map((g) => g.correct), [false, false]);
+  assert.equal(grades[1]!.note, "未入力");
 });
 
 class MemStore implements KeyValueStore {
@@ -472,13 +462,46 @@ test("要件の確認: 複数案があれば質問し、選択肢が2つ未満�
   assert.equal(decideClarification({ decision: "clarify", estimatedFiles: 1, estimatedLines: 5, questions: [{ question: "q", why: "", options: [option("唯一")] }] }), "missing");
 });
 
-test("要件の確認: LLM が proceed と判断しても、見積もりが1回のクイズの規模を超えれば質問する", () => {
-  const byLines = decideClarification({ decision: "proceed", reason: "", understanding: "", estimatedFiles: 2, estimatedLines: LARGE_CHANGE_LINES + 1, questions: [scopeQuestion()] });
-  assert.ok(byLines && byLines !== "missing");
+const stage = (label: string) => ({ label, goal: `${label}ができる`, acceptanceCriteria: [`${label}が動く`] });
+
+test("要件の確認: LLM が proceed と判断しても、見積もりが1回の手順の規模を超えれば段階に分けて確認する", () => {
+  const byLines = decideClarification({
+    decision: "proceed",
+    reason: "",
+    understanding: "",
+    estimatedFiles: 2,
+    estimatedLines: LARGE_CHANGE_LINES + 1,
+    stages: [stage("データ"), stage("処理"), stage("画面")],
+    questions: [],
+  });
+  assert.ok(byLines && byLines !== "missing", "迷う点が無くても、段階の分け方を見せてから進める");
   assert.equal(byLines.large, true);
+  assert.deepEqual(byLines.questions, []);
   assert.match(byLines.reason, /約2ファイル・約61行/);
-  const byFiles = decideClarification({ decision: "proceed", estimatedFiles: 5, estimatedLines: 40, questions: [] });
-  assert.equal(byFiles, "missing", "大きいのに質問が無ければ、範囲を選ぶ質問を作らせる");
+  assert.match(byLines.reason, /3段階に分けて1段階ずつ、依頼全体が完成するまで/);
+  assert.deepEqual(
+    byLines.stages.map((s) => [s.label, s.goal, s.criteria]),
+    [
+      ["データ", "データができる", ["データが動く"]],
+      ["処理", "処理ができる", ["処理が動く"]],
+      ["画面", "画面ができる", ["画面が動く"]],
+    ],
+  );
+  const byFiles = decideClarification({ decision: "proceed", estimatedFiles: 5, estimatedLines: 40, stages: [stage("全部")], questions: [scopeQuestion()] });
+  assert.equal(byFiles, "missing", "大きいのに段階が2つ未満なら、段階を作り直させる");
+  // 小さい依頼では、段階を返してきても段階に分けない
+  const small = decideClarification({ decision: "clarify", estimatedFiles: 1, estimatedLines: 5, stages: [stage("a"), stage("b")], questions: [scopeQuestion()] });
+  assert.ok(small && small !== "missing");
+  assert.deepEqual(small.stages, []);
+});
+
+test("要件の確定: 段階が2つ以上あるときだけ段階を持たせる", () => {
+  assert.equal(specFrom("q", { stages: [stage("a")] }).stages, undefined);
+  assert.deepEqual(
+    specFrom("q", { stages: [stage("a"), { label: " ", goal: "", acceptanceCriteria: [] }, stage("b")] }).stages?.map((s) => s.label),
+    ["a", "b"],
+    "名前の無い段階は捨てる",
+  );
 });
 
 test("要件の確認: 選んだ案と補足を回答にまとめ、出題の要求文に添える", () => {
@@ -592,15 +615,17 @@ test("答え漏れ: 解答前に示す新しい名前は、漏れの判定材料
   assert.ok(revealsAnswer("isExpired(token) を書く", "isExpired(token)", new Set(["isExpired"])), "答えそのものは漏れ");
 });
 
-test("学習レベル: レベルごとに用語・空欄数・解説の方針が変わり、飛躍を避ける指示は共通", () => {
+test("経験レベル: レベルごとに用語・空欄数・解説の方針が変わり、飛躍を避ける指示と言葉づかいは共通", () => {
   const beginner = quizSystemPrompt("auto", "read", "beginner");
   const advanced = quizSystemPrompt("auto", "read", "advanced");
-  assert.match(beginner, /初学者・学生/);
+  assert.match(beginner, /利用者のレベル: 基本/);
   assert.match(beginner, /初出で短く言い換える/);
   assert.match(advanced, /不変条件/);
   assert.ok(!advanced.includes("初出で短く言い換える"));
   for (const p of [beginner, advanced, quizSystemPrompt("auto", "read")]) {
     assert.match(p, /途中の段階を省かない/);
+    assert.match(p, /「学習」「学習者」「学ぶ」「復習」「教材」といった勉強のための言葉を使わない/);
+    assert.ok(!/学習アシスタント|学習者が/.test(p), "プロンプト自体も利用者を「学習者」と呼ばない");
     assert.match(p, /newNames に \{name, role\}/);
   }
   assert.match(quizSystemPrompt("auto", "read"), /実務エンジニア/, "既定は実務レベル");
@@ -683,4 +708,13 @@ test("選択式の問題: 各空欄に正解を含む選択肢が付き、選択
   const none = validateRawItem(raw({ blanks: [blank(5, "return")] }), FILE);
   assert.ok(!none.ok);
   assert.match(none.ok ? "" : none.reason, /選択肢を作れない/);
+});
+
+test("学習記録: 選択式だけの記録でも、1回の取り組みとして数えられる", async () => {
+  const log = new LearnerLog(new MemStore());
+  await log.recordConceptOnly([{ concept: "呼び出し関係", correct: true }], true);
+  await log.recordConceptOnly([{ concept: "呼び出し関係", correct: false }]);
+  const s = log.summary();
+  assert.equal(s.sessions, 1, "最初の記録だけを1回と数える");
+  assert.equal(s.blanks, 2);
 });

@@ -1,20 +1,41 @@
+import {
+  applyReview,
+  checkpointAfter,
+  continueMessage,
+  defaultNeeds,
+  definitionGaps,
+  formatNotes,
+  markKeyLocations,
+  NEED_LABEL,
+  NEEDS_SCHEMA,
+  parseNeeds,
+  planRequest,
+  REVIEW_SCHEMA,
+  reviewRequest,
+  startMessage,
+  type InfoNeed,
+  type RawReview,
+  type ReviewOutcome,
+} from "./investigation";
 import { maskAnswers, revealsAnswer } from "./leak";
 import { levelGuide, levelStyle, type LearnerLevel } from "./level";
-import type { ChatLlm, ChatMessage, LspPort, SyntaxChecker, WorkspacePort } from "./ports";
-import { applyItemToText, compactItem, validateRawItem, type RawItem, type SemanticJudge, type Validation } from "./quiz";
-import { splitLines } from "./text";
+import type { ChatLlm, ChatMessage, LspPort, SyntaxChecker, ToolCall, WorkspacePort } from "./ports";
+import { applyItemToText, compactItem, validateRawItem, type RawItem, type Validation } from "./quiz";
+import { parseJson, splitLines } from "./text";
 import { EvidenceStore, executeTool, normalizeRelPath, TOOL_DEFS, type CodeIndex } from "./tools";
-import type { ContractChange, ContractKind, RequirementSpec } from "./planTypes";
+import type { ContractChange, ContractKind, RequirementSpec, StagePlan } from "./planTypes";
+import { parseStages, STAGES_PROPERTY, stageBrief, stageRules, type RawStage } from "./stages";
 import type { CodeRef, GeneratedQuiz, QuizItem } from "./types";
 
 export type QuizMode = "auto" | "change" | "read";
 
 export interface AgentConfig {
+  /** 調査で呼べるツールの回数の上限(目安ではない。材料が足りたと判断した時点で終える) */
   maxSteps: number;
   minSimilarity: number;
   repoMapChars: number;
   evidenceChars: number;
-  /** 学習者のレベル(解説の細かさ・用語・空欄の難しさ) */
+  /** 利用者のレベル(解説の細かさ・用語・空欄の難しさ) */
   level?: LearnerLevel;
 }
 
@@ -48,6 +69,10 @@ export interface Investigation {
   evidence: EvidenceStore;
   notes: string;
   steps: number;
+  /** 調べること(要求に答えるために知る必要があること)と、それぞれ分かったか */
+  needs: InfoNeed[];
+  /** 実行したツール呼び出し(呼び出しの内容 → 何手目か)。同じ呼び出しの繰り返しで回数を使わないため */
+  calls: Map<string, number>;
 }
 
 export interface ClarifyOption {
@@ -72,9 +97,11 @@ export interface Clarification {
   reason: string;
   estimatedFiles: number;
   estimatedLines: number;
-  /** 1回のクイズで扱える規模を超える見込みか */
+  /** 1回の手順で扱える規模を超える見込みか(超えるなら段階に分けて、依頼全体が完成するまで進める) */
   large: boolean;
   questions: ClarifyQuestion[];
+  /** 依頼全体を分けた段階(large のときだけ。1段階ずつ最後まで進める) */
+  stages: StagePlan[];
   /** 確認前の時点の受け入れ条件(「確認せずに進める」ときはこれを使う) */
   criteria: string[];
   contracts: ContractChange[];
@@ -90,10 +117,20 @@ const INTEGER = { type: "integer" } as const;
 const MAX_ITEMS = 3;
 /** 初回 + 不合格だった問題の作り直し(最大2回) */
 const MAX_QUIZ_ATTEMPTS = 3;
-/** 1回のクイズで扱える変更行数の目安(実装問題は最大 MAX_ITEMS か所・各25行程度) */
+/** 1回の手順で扱える変更行数の目安(これを超える依頼は段階に分ける) */
 export const LARGE_CHANGE_LINES = 60;
+/** 1回の手順(段階)で扱える規模 */
+export const STAGE_SIZE = { places: MAX_ITEMS, lines: LARGE_CHANGE_LINES };
 /** 要件の回答を受けて行う追加調査のツール呼び出し上限 */
-const FOLLOW_UP_STEPS = 3;
+const FOLLOW_UP_STEPS = 6;
+/** 段階ごとに今のコードで調べ直すときのツール呼び出し上限(材料が足りれば上限を待たずに終える) */
+const STAGE_STEPS = 8;
+/** 段階ごとに調べ直すとき、ファイル全体を参照コードにする行数の上限(超えれば変えた行の周りだけ) */
+const STAGE_FILE_LINES = 400;
+/** 1回の調査で「材料が足りたか」を確かめる回数の上限 */
+const MAX_REVIEWS = 3;
+/** 要求の文で検索して、調査の手がかりとして最初に示す候補の数 */
+const SEED_LEADS = 6;
 
 export const QUIZ_SCHEMA = {
   name: "quiz",
@@ -180,15 +217,18 @@ export const QUIZ_SCHEMA = {
 
 export function exploreSystemPrompt(maxSteps: number, repoMap: string): string {
   return [
-    "あなたはコードベース理解を支援する学習アシスタントの「調査担当」です。",
-    "ユーザーの要求に関係するコードをツールで調べて特定してください。この段階ではクイズも回答コードも作りません。",
+    "あなたはコードベースの理解を支援するアシスタントの「調査担当」です。この段階ではクイズも回答コードも作りません。",
+    "経験のあるエンジニアが初めてのコードベースで作業するときと同じように、",
+    "(1) 要求に答える(実装する)には何を知る必要があるかを先に決め、(2) それを1つずつコードで確かめ、(3) 材料がそろったら上限を待たずに調査を終えます。",
     "",
     "【進め方】",
-    "- まず下の「リポジトリ概観」で当たりを付け、search_code(識別子や英語のキーワードを含めると精度が上がる)で探す。名前や文字列を厳密に探すなら grep。",
-    "- 候補が見つかったら read_file で実際のコードを読む。構造や呼び出し関係は outline / find_references / find_definition で確かめる。",
+    "- 当たりを付ける: 下の「リポジトリ概観」と、要求の文で検索した「手がかり」から候補を選ぶ。search_code(識別子や英語のキーワードを含めると精度が上がる)で探し、名前や文字列を厳密に探すなら grep、シンボル名なら find_symbols。",
+    "- 確かめる: 候補は read_file で実際に読む(検索結果の抜粋だけで判断しない)。大きなファイルは outline で構造を見てから、必要な関数の範囲を読む。",
+    "- たどる: 呼び出し関係は find_references / find_definition で確かめる。中心のコードが呼んでいる関数・使っている型の定義も読んでおく(利用者が答えを自力で導く手がかりになり、変更で既存の関数を正しく使う根拠になる)。",
     "- 要求が「〜を追加・修正したい」なら、変更が入る場所と、手本にすべき既存の実装を見つける。「〜はどう動く/どこ?」なら、中心となる処理と呼び出し関係を見つける。",
-    "- 中心のコードが呼んでいる関数・使っている型の定義も read_file で読んでおく(学習者が答えを自力で導くための手がかりとして使う)。",
-    `- ツール呼び出しは最大${maxSteps}回まで。必要十分に調べたら、ツールを呼ばずに「どのファイルの何行目付近が重要で、なぜか(何を受け取り、何を返し、誰から呼ばれるか)」を短い箇条書きで答えて終了する。`,
+    "- 互いに関係しない呼び出し(別々のファイルを読む・別々の名前を探す)は、1回の応答でまとめて呼ぶ。同じ呼び出しを繰り返さない。",
+    `- ツール呼び出しの上限は${maxSteps}回(目安ではない)。調べることがすべて分かったら、ツールを呼ばずに「どのファイルの何行目付近が重要で、なぜか(何を受け取り、何を返し、誰から呼ばれるか)」を短い箇条書きで答えて終える。`,
+    "- 終えるとシステムが材料が足りているかを確かめ、足りなければ何が足りないかを伝えます。",
     "- 行番号は read_file の表示(L数字|)のとおりに引用する。推測で行番号を作らない。",
     "",
     "【リポジトリ概観(ファイル — 主なシンボル。他から参照される順)】",
@@ -222,6 +262,7 @@ export const SCOPE_SCHEMA = {
           additionalProperties: false,
         },
       },
+      stages: STAGES_PROPERTY,
       questions: {
         type: "array",
         items: {
@@ -244,40 +285,45 @@ export const SCOPE_SCHEMA = {
         },
       },
     },
-    required: ["decision", "reason", "understanding", "estimatedFiles", "estimatedLines", "acceptanceCriteria", "contractChanges", "questions"],
+    required: ["decision", "reason", "understanding", "estimatedFiles", "estimatedLines", "acceptanceCriteria", "contractChanges", "stages", "questions"],
     additionalProperties: false,
   },
 } as const;
 
 export function scopeSystemPrompt(level: LearnerLevel = "intermediate"): string {
   return [
-    "あなたはプログラミング学習アシスタントの「要件確認担当」です。ユーザーの実装・修正の依頼と調査済みのコードを読み、要件を整理したうえで、",
+    "あなたはコードの理解と変更を支援するアシスタントの「要件確認担当」です。ユーザーの実装・修正の依頼と調査済みのコードを読み、要件を整理したうえで、",
     "このまま実装の計画に進んでよいか、先にユーザーへ要件を確認すべきかを判断します。",
-    `学習者が1回で手順を追いながら理解できるのは、${MAX_ITEMS}か所・約${LARGE_CHANGE_LINES}行程度の変更までです。要件があいまいなまま進めると、ユーザーの意図と違うコードを「正解」として教えてしまいます。`,
+    `1回の手順で、変更を追いながら理解できるのは${MAX_ITEMS}か所・約${LARGE_CHANGE_LINES}行程度までです。それより大きい依頼は段階に分け、1段階ずつ、依頼全体が完成するまで進めます。`,
+    "要件があいまいなまま進めると、ユーザーの意図と違うコードを「このコードにする」と示してしまいます。",
     "出力は指定のJSONスキーマに厳密に従ってください。",
     "",
     "【先に確認する(decision=\"clarify\")場合】",
     `1. 変更が大きい: ${MAX_ITEMS}つより多いファイル・関数にまたがる、新しいファイル・クラス・画面・設定項目が必要、または変更行が合計でおよそ${LARGE_CHANGE_LINES}行を超える。`,
-    "   → 「今回どの段階から実装するか」を必ず1問含める。選択肢は、それだけで動作が完結する小さな段階にし、依存される側(データ・型・中核の処理)から順に並べる。",
+    "   → stages に、依頼全体を完成させるまでの段階を書く(下の【段階】)。ユーザーには段階の分け方を見せてから進める。",
     "2. 解釈や方針が複数ある: 仕様(入力・出力・境界条件・エラー時の扱い・既存の動作を変えるか)や実装の方針(どこに置くか、既存の仕組みを拡張するか新しく作るか)に",
     "   もっともらしい案が複数あり、どれを選ぶかで完成するコードが大きく変わる。",
     "   → 案ごとに選択肢を作る。",
     "",
     "【確認しない(decision=\"proceed\")場合】",
     "- 変更が小さく、要求からやるべきことが一つに決まる。",
-    "- 迷う点が、新しい名前や細かな書き方など、既存コードの慣習に合わせて出題側で決められることだけ。",
+    "- 迷う点が、新しい名前や細かな書き方など、既存コードの慣習に合わせて決められることだけ。",
     "- 調査済みのコードを読めば答えが決まること(既存の関数・型・手本の実装)は質問しない。",
     "",
     "【質問の作り方】",
-    "- questions は clarify のとき1〜3問、proceed のときは空配列。ユーザーが選択肢を選ぶだけで答えられる形にし、重要な順に並べる。",
+    "- questions は、解釈や方針が複数あるときに1〜3問(変更が大きいだけで迷う点が無ければ空配列でよい)。proceed のときは空配列。ユーザーが選択肢を選ぶだけで答えられる形にし、重要な順に並べる。",
+    "- 「今回どこまで実装するか」は質問しない(段階に分けて、依頼全体を最後まで実装する)。",
     "- options は各質問に2〜4個。label は短い案の名前。detail には、選ぶと何がどう変わるか(触るファイル・関数、動作の違い)を参照コードの名前を使って1〜2文で書く。",
     "- recommended は、既存コードの設計と最も整合する案1つだけを true にする(決められなければすべて false)。",
     "- why: その点を決めないと何があいまいなまま実装されるかを1文で。",
     "- understanding: 依頼をどう理解したかを1〜2文で。reason: 確認が必要な理由(clarify)または不要な理由(proceed)を1文で。",
     "- estimatedFiles / estimatedLines: 依頼を全部実装した場合に変更するファイル数と変更行数(追加+削除)の見積もり。decision に関わらず正直に書く。",
     "",
+    "【段階】",
+    ...stageRules(MAX_ITEMS, LARGE_CHANGE_LINES),
+    "",
     "【要件の整理(decision に関わらず書く)】",
-    "- acceptanceCriteria: 受け入れ条件を1〜5件。「〜のとき〜になる」のように、実装できたかを確かめられる振る舞いで書く(実装方法は書かない)。",
+    "- acceptanceCriteria: 依頼全体の受け入れ条件を1〜5件。「〜のとき〜になる」のように、実装できたかを確かめられる振る舞いで書く(実装方法は書かない)。",
     "  clarify のときは、確認が必要な点を除いた、現時点で確かな条件だけを書く。",
     "- contractChanges: この依頼で変わる「約束」の見込み。kind は signature(関数の引数・戻り値)/ variant(種類の値・メッセージの種類の追加)/",
     "  data(型・保存するデータの形)/ behavior(振る舞い)/ dependency(新しい依存・設定)/ none。subject に対象(関数名・型名・キーなど)、description に変化を1文で。",
@@ -293,6 +339,7 @@ interface RawScope {
   estimatedLines?: number;
   acceptanceCriteria?: string[];
   contractChanges?: Array<{ kind?: string; subject?: string; description?: string }>;
+  stages?: RawStage[];
   questions?: Array<{
     question?: string;
     why?: string;
@@ -302,15 +349,25 @@ interface RawScope {
 
 /**
  * 要件確認の結果を判定する。
- * - 確認が必要(LLM が clarify と判断した、または見積もりが1回のクイズの規模を超える)で、答えられる質問がある → Clarification
- * - 確認が必要なのに答えられる質問が無い → "missing"(質問を作り直させる)
+ * - 変更が大きい(LLM の見積もりが1回の手順の規模を超える)→ 段階に分ける。段階が2つ以上あれば Clarification(質問は無くてもよい)
+ * - 解釈・方針が複数ある(LLM が clarify と判断した)→ 答えられる質問があれば Clarification
+ * - 必要な段階・質問が欠けている → "missing"(作り直させる)
  * - 確認は不要 → undefined
  */
-export function decideClarification(raw: RawScope | undefined): Clarification | "missing" | undefined {
+function estimates(raw: Pick<RawScope, "estimatedFiles" | "estimatedLines"> | undefined): { estimatedFiles: number; estimatedLines: number; large: boolean } {
   const count = (n: unknown) => Math.max(0, Math.round(Number(n) || 0));
   const estimatedFiles = count(raw?.estimatedFiles);
   const estimatedLines = count(raw?.estimatedLines);
-  const large = estimatedFiles > MAX_ITEMS || estimatedLines > LARGE_CHANGE_LINES;
+  return { estimatedFiles, estimatedLines, large: estimatedFiles > MAX_ITEMS || estimatedLines > LARGE_CHANGE_LINES };
+}
+
+/** 見積もりが1回の手順で扱える規模を超えるか(超えるなら段階に分ける) */
+export function isLargeEstimate(raw: Pick<RawScope, "estimatedFiles" | "estimatedLines"> | undefined): boolean {
+  return estimates(raw).large;
+}
+
+export function decideClarification(raw: RawScope | undefined): Clarification | "missing" | undefined {
+  const { estimatedFiles, estimatedLines, large } = estimates(raw);
   if (raw?.decision !== "clarify" && !large) {
     return undefined;
   }
@@ -330,15 +387,16 @@ export function decideClarification(raw: RawScope | undefined): Clarification | 
       questions.push({ question, why: q.why?.trim() ?? "", options });
     }
   }
-  if (questions.length === 0) {
+  const stages = large ? parseStages(raw?.stages) : [];
+  if (large ? stages.length < 2 : questions.length === 0) {
     return "missing";
   }
   const reason =
-    raw?.decision !== "clarify"
-      ? `変更が大きくなる見込み(約${estimatedFiles}ファイル・約${estimatedLines}行)のため、実装する範囲を先に決めます。`
-      : raw.reason?.trim() ?? "";
+    raw?.decision !== "clarify" || !raw.reason?.trim()
+      ? `変更が大きくなる見込み(約${estimatedFiles}ファイル・約${estimatedLines}行)のため、${stages.length}段階に分けて1段階ずつ、依頼全体が完成するまで進めます。`
+      : raw.reason.trim();
   const { criteria, contracts } = specParts(raw);
-  return { understanding: raw?.understanding?.trim() ?? "", reason, estimatedFiles, estimatedLines, large, questions, criteria, contracts };
+  return { understanding: raw?.understanding?.trim() ?? "", reason, estimatedFiles, estimatedLines, large, questions, stages, criteria, contracts };
 }
 
 const CONTRACT_KINDS: ContractKind[] = ["behavior", "signature", "variant", "data", "dependency", "none"];
@@ -360,15 +418,24 @@ function specParts(raw: Pick<RawScope, "acceptanceCriteria" | "contractChanges">
   return { criteria, contracts };
 }
 
-/** 要件の整理の結果を、確定した要件の形にする(受け入れ条件が無ければ依頼文そのものを条件にする) */
-export function specFrom(query: string, raw: Pick<RawScope, "understanding" | "acceptanceCriteria" | "contractChanges"> | undefined, answers: ClarifyAnswer[] = []): RequirementSpec {
+/**
+ * 要件の整理の結果を、確定した要件の形にする(受け入れ条件が無ければ依頼文そのものを条件にする)。
+ * 段階が2つ以上あるときだけ stages を持たせる(1段階ずつ、依頼全体が完成するまで進める)。
+ */
+export function specFrom(
+  query: string,
+  raw: Pick<RawScope, "understanding" | "acceptanceCriteria" | "contractChanges" | "stages"> | undefined,
+  answers: ClarifyAnswer[] = [],
+): RequirementSpec {
   const { criteria, contracts } = specParts(raw);
+  const stages = parseStages(raw?.stages);
   return {
     query,
     understanding: raw?.understanding?.trim() ?? "",
     criteria: criteria.length > 0 ? criteria : [query],
     contracts,
     answers,
+    ...(stages.length >= 2 ? { stages } : {}),
   };
 }
 
@@ -396,7 +463,7 @@ export function requirementText(query: string, answers: ClarifyAnswer[]): string
   return [
     query,
     "",
-    "【ユーザーに確認した要件(これに従って、実装する範囲と仕様を決める。範囲を絞った場合は、その範囲だけを実装問題にする)】",
+    "【ユーザーに確認した要件(これに従って仕様を決める)】",
     ...answers.map((a) => `- ${a.question} → ${a.answer}`),
   ].join("\n");
 }
@@ -410,8 +477,9 @@ export const SPEC_SCHEMA = {
       understanding: STRING,
       acceptanceCriteria: SCOPE_SCHEMA.schema.properties.acceptanceCriteria,
       contractChanges: SCOPE_SCHEMA.schema.properties.contractChanges,
+      stages: STAGES_PROPERTY,
     },
-    required: ["understanding", "acceptanceCriteria", "contractChanges"],
+    required: ["understanding", "acceptanceCriteria", "contractChanges", "stages"],
     additionalProperties: false,
   },
 } as const;
@@ -445,7 +513,7 @@ export function distractorRules(): string[] {
   ];
 }
 
-/** 答え漏れを防ぐ決まり。visible は解答前に学習者に見える項目 */
+/** 答え漏れを防ぐ決まり。visible は解答前に利用者に見える項目 */
 export function leakRules(visible: string): string[] {
   return [
     "【答えを漏らさない(最重要)】",
@@ -464,13 +532,13 @@ export function quizSystemPrompt(mode: QuizMode, intent: QuizIntent = "read", le
       : mode === "change"
         ? "今回はすべて kind=\"change\" にする。"
         : intent === "change"
-          ? "今回の要求は実装・修正の依頼。学習者が穴埋めで実装を完成させる kind=\"change\" を必ず1問以上作る(これが主役)。" +
+          ? "今回の要求は実装・修正の依頼。利用者が穴埋めで実装を完成させる kind=\"change\" を必ず1問以上作る(これが主役)。" +
             "加えて、実装の前に理解しておくべき重要なコードや設計(変更が依存する既存の仕組み・手本になる実装・データ構造・独自の約束事)があれば、kind=\"read\" を最大2問含めてよい。理解の助けにならない読解は入れない。"
           : "今回の要求は仕組みについての質問。kind=\"read\" を中心にする。";
   return [
-    "あなたはプログラミング学習アシスタントです。答えを直接教えるのではなく、調査済みのコードだけを根拠に、",
-    "学習者が「どのファイルのどのコードが、どういう仕組みで動いているか」を自分で考えて理解できる穴埋めクイズを作ります。",
-    "空欄は手入力ではなく選択式(正解1つ + 誤答3つ)。学習者は選択肢を比べながらコードベースを読み、根拠を持って選びます。",
+    "あなたはコードの理解を支援するアシスタントです。答えを直接教えるのではなく、調査済みのコードだけを根拠に、",
+    "利用者が「どのファイルのどのコードが、どういう仕組みで動いているか」を自分で考えて理解できる穴埋めクイズを作ります。",
+    "空欄は手入力ではなく選択式(正解1つ + 誤答3つ)。利用者は選択肢を比べながらコードベースを読み、根拠を持って選びます。",
     "出力は指定のJSONスキーマに厳密に従ってください。",
     "",
     "【問題の種類 kind】",
@@ -483,7 +551,7 @@ export function quizSystemPrompt(mode: QuizMode, intent: QuizIntent = "read", le
     "  newCode では、oldCode のうち変更しない行も一字一句同じに含める。空欄のうち少なくとも1つは変更した行に置く。",
     "",
     "【新しい名前は先に決めて示す(理不尽な問題を作らない)】",
-    "- change で新しく作るメソッド・関数・変数・引数・フィールド・クラスの名前は、あなたが決めて newNames に {name, role} で全部書く(role はその名前の役割を一言で)。これらは解答前に学習者へ表示される。",
+    "- change で新しく作るメソッド・関数・変数・引数・フィールド・クラスの名前は、あなたが決めて newNames に {name, role} で全部書く(role はその名前の役割を一言で)。これらは解答前に利用者へ表示される。",
     "- 新しい名前そのもの(例: 定義行の名前部分)は空欄にしない。空欄にするのは、その名前を使って何をするか(条件・呼び出し・引数・戻り値など)。",
     "- 既存コードに無い関数を呼ぶなら、その定義も newCode に含めて newNames に載せる。参照コードに無い既存関数を想像で呼ばない。",
     "- 名前はプロジェクトの既存の命名規則(大文字小文字・接頭辞・動詞の使い方)に合わせる。read では newNames は空配列。",
@@ -492,13 +560,13 @@ export function quizSystemPrompt(mode: QuizMode, intent: QuizIntent = "read", le
     "【空欄 blanks の指定】",
     "- line: read はファイルの行番号(参照コードの L数字)、change は newCode の中での行番号(1始まり)。",
     "- target: その行に逐語で含まれる、空欄にする部分の文字列(1行以内・60文字以内)。行全体ではなく、条件式・呼び出し・引数・代入値・型など意味のある単位。",
-    "- 個数と難しさは下の【学習者のレベル】に従う。周囲のコードと手がかりから一つに絞れる箇所を選ぶ(同じ意味の書き方が複数ありうる箇所や、根拠なく推測するしかない箇所は避ける)。",
+    "- 個数と難しさは下の【利用者のレベル】に従う。周囲のコードと手がかりから一つに絞れる箇所を選ぶ(同じ意味の書き方が複数ありうる箇所や、根拠なく推測するしかない箇所は避ける)。",
     "",
     ...distractorRules(),
     "",
     ...leakRules("goal・task・refs・concept・2段階ヒント・clueNote"),
     "",
-    "【学習者が導けるための説明】",
+    "【利用者が導けるための説明】",
     "- task(解答前に表示): read なら「この範囲がシステムの中で何を担い、どこから呼ばれ、何を読み取ってほしいか」。",
     "  change なら「何を実現するために、どこを、どう変えるか」という仕様(入力・出力・満たすべき条件・使うべき既存の関数や手本)。答えのコードは書かない。",
     "- refs(解答前に表示, 0〜3件): 読むと理解が進む参照コードの場所(path, line, なぜ見るべきか)。",
@@ -527,8 +595,19 @@ function summarizeArgs(raw: string): string {
   }
 }
 
-export function parseJson<T>(content: string | null | undefined): T {
-  return JSON.parse((content ?? "").replace(/^```json\s*|```\s*$/g, "").trim()) as T;
+/** 同じ呼び出しかどうかを比べるための引数の表記(キーの順序をそろえる) */
+function canonicalArgs(raw: string): string {
+  try {
+    const a = JSON.parse(raw) as Record<string, unknown>;
+    return JSON.stringify(Object.keys(a).sort().map((k) => [k, a[k]]));
+  } catch {
+    return raw.trim();
+  }
+}
+
+function needList(needs: InfoNeed[]): string {
+  const shown = needs.slice(0, 2).map((n) => n.need).join(" / ");
+  return needs.length > 2 ? `${shown} ほか${needs.length - 2}件` : shown;
 }
 
 // ---------- 答え漏れの検出と修正 ----------
@@ -610,7 +689,7 @@ function applyLeakFix(goal: { value: string }, items: QuizItem[], leak: Leak, te
 }
 
 /** LLM で書き直せなかった文章の最終手段(伏せ字・形だけのヒント・汎用タグ) */
-function fallbackText(leak: Leak, items: QuizItem[]): string {
+function fallbackText(leak: Leak): string {
   if (leak.field === "concept") {
     return "コード理解";
   }
@@ -649,7 +728,8 @@ const FIELD_LABEL: Record<LeakField, string> = {
 
 /**
  * 3段構えのエージェント。
- * 1) 調査: LLMがツール(検索・grep・読み取り・LSP)を自分で呼んで関連コードを探す(エージェント型検索)
+ * 1) 調査: 要求に答えるために知る必要があることを決め、LLMがツール(検索・grep・読み取り・LSP)を自分で呼んで確かめる
+ *    (エージェント型検索)。材料が足りたかを項目ごとに確かめ、足りれば上限を待たずに終える(investigation.ts)
  * 2) 要件の確認: 実装依頼で、変更が大きい・解釈や方針が複数ある場合は、出題せずにユーザーへ質問する
  * 3) 出題: 実際に読んだコードだけを根拠に構造化JSONでクイズを作り、実ファイルと突き合わせて検証する
  */
@@ -664,6 +744,8 @@ export class QuizAgent {
 
   async investigate(query: string, mode: QuizMode, hooks: RunHooks = {}): Promise<Investigation> {
     const { index, config } = this.deps;
+    const change = requiresChange(mode, detectIntent(query));
+    const leads = await this.seedLeads(query, hooks);
     const inv: Investigation = {
       query,
       mode,
@@ -671,16 +753,20 @@ export class QuizAgent {
         { role: "system", content: exploreSystemPrompt(config.maxSteps, index.repoMap(config.repoMapChars)) },
         {
           role: "user",
-          content: requiresChange(mode, detectIntent(query))
-            ? `${query}\n\n(これは実装・修正の依頼です。変更を入れる場所と、手本にすべき既存の実装を必ず特定してください)`
-            : query,
+          content: [
+            change ? `${query}\n\n(これは実装・修正の依頼です。変更を入れる場所と、手本にすべき既存の実装を必ず特定してください)` : query,
+            leads ? `\n【手がかり: 要求の文で検索して見つかった候補(まだ読んでいない)】\n${leads}` : "",
+          ].join("\n"),
         },
       ],
       evidence: new EvidenceStore(),
       notes: "",
       steps: 0,
+      needs: [],
+      calls: new Map(),
     };
-    hooks.onStatus?.("関連コードを調査中...");
+    hooks.onStatus?.("調べることを整理中...");
+    await this.planNeeds(inv, change, config.maxSteps, hooks);
     await this.explore(inv, config.maxSteps, hooks);
 
     if (inv.evidence.isEmpty()) {
@@ -723,15 +809,22 @@ export class QuizAgent {
         spec = specFrom(inv.query, raw);
         const verdict = decideClarification(raw);
         if (verdict !== "missing") {
+          // 段階に分けるのは、1回の手順で扱える規模を超えるときだけ
+          if (verdict?.large) {
+            spec.stages = verdict.stages;
+          } else {
+            delete spec.stages;
+          }
           return { spec, clarification: verdict };
         }
         messages.push(
           { role: "assistant", content: res.content ?? "" },
           {
             role: "user",
-            content:
-              "確認が必要な依頼(変更が大きい、または案が複数ある)ですが、選択肢が2つ以上ある質問がありません。" +
-              "decision=\"clarify\" とし、ユーザーが選ぶだけで答えられる質問(各2〜4個の選択肢)を1〜3問作って、JSON全体を出し直してください。",
+            content: isLargeEstimate(raw)
+              ? "変更が大きい見込みですが、段階が2つ以上ありません。依頼全体を完成させるまでの段階を stages に2つ以上書いて、JSON全体を出し直してください。"
+              : "確認が必要な依頼(案が複数ある)ですが、選択肢が2つ以上ある質問がありません。" +
+                "decision=\"clarify\" とし、ユーザーが選ぶだけで答えられる質問(各2〜4個の選択肢)を1〜3問作って、JSON全体を出し直してください。",
           },
         );
       }
@@ -741,6 +834,7 @@ export class QuizAgent {
       }
       // 判定に失敗しても、計画そのものは止めない
     }
+    delete spec.stages;
     return { spec };
   }
 
@@ -756,10 +850,107 @@ export class QuizAgent {
         "ユーザーに要件を確認し、次の回答を得ました。",
         ...answers.map((a) => `- ${a.question} → ${a.answer}`),
         "この要件で変更が入る場所と手本になる実装のうち、まだ読んでいないものがあれば追加で調べてください。",
-        "最後に、この要件に関係する重要な場所を、前回と同じ形式の箇条書きでまとめ直してください。",
+        "調べ終えたら、ツールを呼ばずに、この要件に関係する重要な場所を前回と同じ形式の箇条書きでまとめ直してください(システムが、材料が足りているかをもう一度確かめます)。",
       ].join("\n"),
     });
     await this.explore(inv, FOLLOW_UP_STEPS, hooks);
+  }
+
+  /**
+   * 段階に分けて進めているとき、次の段階の前に今のコードで調べ直す。
+   * 前の段階の変更で内容が変わったファイルは今の内容で読み直し(focus: 変えた行の周り)、変わっていない行は前の調査の内容を使う。
+   * 調査の会話は新しく始める(前の段階の古い行番号を引きずらないため)。
+   */
+  async investigateStage(
+    base: Investigation,
+    spec: RequirementSpec,
+    focus: Array<{ path: string; lines: number[] }>,
+    hooks: RunHooks = {},
+  ): Promise<Investigation> {
+    const { index, config } = this.deps;
+    const which = spec.stage ? `${spec.stage.index + 1}段階目「${spec.stage.label}」` : "次の段階";
+    hooks.onStatus?.(`今のコードで、${which}に関係する場所を調べ直しています...`);
+    const evidence = await this.refreshEvidence(base.evidence, focus);
+    const budget = Math.max(1, Math.min(config.maxSteps, STAGE_STEPS));
+    const inv: Investigation = {
+      query: base.query,
+      mode: "change",
+      messages: [
+        { role: "system", content: exploreSystemPrompt(budget, index.repoMap(config.repoMapChars)) },
+        {
+          role: "user",
+          content: [
+            base.query,
+            "",
+            stageBrief(spec),
+            `今回の段階の受け入れ条件:\n${spec.criteria.map((c, i) => `${i + 1}. ${c}`).join("\n")}`,
+            focus.length > 0 ? `前の段階で変えたファイル(今の内容は読み込み済み): ${focus.map((f) => f.path).join(", ")}` : "",
+            evidence.paths().length > 0 ? `これまでに読んだファイル: ${evidence.paths().join(", ")}` : "",
+            "(これは実装・修正の依頼です。今回の段階で変更を入れる場所と、手本にすべき既存の実装を必ず特定してください。前の段階の変更で行番号が変わっているので、行番号は read_file で読み直して確かめてください)",
+          ]
+            .filter(Boolean)
+            .join("\n"),
+        },
+      ],
+      evidence,
+      notes: "",
+      steps: 0,
+      needs: [],
+      calls: new Map(),
+    };
+    // 前の段階で読んだ行も根拠に使えるので、今回の段階に必要なことが既に読んだ範囲で分かれば、調べずに終えられる
+    await this.planNeeds(inv, true, budget, hooks);
+    await this.explore(inv, budget, hooks);
+    inv.notes ||= base.notes;
+    return inv;
+  }
+
+  /** 前の調査で読んだ行を、今の内容に合わせて作り直す(変わったファイルは読み直す) */
+  private async refreshEvidence(base: EvidenceStore, focus: Array<{ path: string; lines: number[] }>): Promise<EvidenceStore> {
+    const out = new EvidenceStore();
+    const read = async (path: string): Promise<string[] | undefined> => {
+      try {
+        return splitLines(await this.deps.ws.readText(path));
+      } catch {
+        return undefined; // 消えたファイル
+      }
+    };
+    // 小さいファイルは全体を、大きいファイルは手がかりの行の前後だけを入れる
+    const addAround = (path: string, lines: string[], centers: number[]): void => {
+      const keep: number[] = [];
+      if (lines.length <= STAGE_FILE_LINES || centers.length === 0) {
+        keep.push(...lines.slice(0, STAGE_FILE_LINES).map((_, i) => i + 1));
+      } else {
+        const set = new Set<number>();
+        for (const c of [...centers].sort((a, b) => a - b)) {
+          for (let n = Math.max(1, c - 20); n <= Math.min(lines.length, c + 20) && set.size < STAGE_FILE_LINES; n++) {
+            set.add(n);
+          }
+        }
+        keep.push(...set);
+      }
+      out.addAll(path, keep.map((n): [number, string] => [n, lines[n - 1]!]));
+    };
+    for (const { path, lines: seen } of base.entries()) {
+      const now = await read(path);
+      if (!now) {
+        continue;
+      }
+      const same = [...seen].every(([n, text]) => now[n - 1] === text);
+      if (same) {
+        out.addAll(path, seen);
+      } else {
+        addAround(path, now, [...seen.keys()]);
+      }
+    }
+    // 前の段階で変えたファイルは、変えた行の周りを最新として加える
+    for (const f of focus) {
+      const now = await read(f.path);
+      if (now) {
+        addAround(f.path, now, f.lines);
+      }
+    }
+    return out;
   }
 
   /** 確認した内容で、受け入れ条件と変わる約束を確定する(失敗したら確認前の内容に回答を添えて使う) */
@@ -775,11 +966,13 @@ export class QuizAgent {
           {
             role: "system",
             content: [
-              "あなたはプログラミング学習アシスタントの「要件確認担当」です。ユーザーの依頼と、確認して得た回答から、実装の要件を確定します。",
-              "回答で範囲を絞った場合は、その範囲だけを要件にします。質問はもうしません。出力は指定のJSONスキーマに厳密に従ってください。",
-              "- understanding: 確定した要件を1〜2文で。",
-              "- acceptanceCriteria: 受け入れ条件を1〜5件。「〜のとき〜になる」のように、実装できたかを確かめられる振る舞いで書く。",
+              "あなたはコードの理解と変更を支援するアシスタントの「要件確認担当」です。ユーザーの依頼と、確認して得た回答から、実装の要件を確定します。",
+              "質問はもうしません。出力は指定のJSONスキーマに厳密に従ってください。",
+              "- understanding: 確定した要件(依頼全体)を1〜2文で。",
+              "- acceptanceCriteria: 依頼全体の受け入れ条件を1〜5件。「〜のとき〜になる」のように、実装できたかを確かめられる振る舞いで書く。",
               "- contractChanges: 変わる約束の見込み(kind / subject / description)。",
+              ...stageRules(MAX_ITEMS, LARGE_CHANGE_LINES),
+              "  確認前の段階があれば、回答をふまえて見直す(回答で選んだ案に合わせて段階を足す・入れ替える)。",
               `- ${levelStyle(config.level ?? "intermediate")}`,
             ].join("\n"),
           },
@@ -789,6 +982,7 @@ export class QuizAgent {
               `【ユーザーの要求】\n${inv.query}`,
               `\n【確認した内容】\n${answers.map((a) => `- ${a.question} → ${a.answer}`).join("\n")}`,
               prior.criteria.length > 0 ? `\n【確認前の受け入れ条件】\n${prior.criteria.map((c, i) => `${i + 1}. ${c}`).join("\n")}` : "",
+              prior.stages ? `\n【確認前の段階】\n${prior.stages.map((st, i) => `${i + 1}. ${st.label}: ${st.goal}`).join("\n")}` : "",
               inv.notes ? `\n【調査メモ】\n${inv.notes}` : "",
             ].join("\n"),
           },
@@ -797,7 +991,12 @@ export class QuizAgent {
         signal: hooks.signal,
         purpose: "要件の確定",
       });
-      return specFrom(inv.query, parseJson<RawScope>(res.content), answers);
+      const spec = specFrom(inv.query, parseJson<RawScope>(res.content), answers);
+      // 大きな依頼の段階を書き忘れたときは、確認前の段階で最後まで進める(1回に詰め込まない)
+      if (!spec.stages && prior.stages) {
+        spec.stages = prior.stages;
+      }
+      return spec;
     } catch (error) {
       if (hooks.signal?.aborted) {
         throw error;
@@ -830,32 +1029,169 @@ export class QuizAgent {
     return { ws, lsp, index, evidence, minSimilarity: config.minSimilarity };
   }
 
-  /** 調査の会話を続け、ツール呼び出しが budget 回に達するか LLM がまとめを返したら終える。 */
-  private async explore(inv: Investigation, budget: number, hooks: RunHooks): Promise<void> {
-    const { llm } = this.deps;
-    const status = hooks.onStatus ?? (() => undefined);
-    const ctx = this.toolContext(inv.evidence);
-    const limit = inv.steps + budget;
-    for (let turn = 0; turn <= budget; turn++) {
-      const exhausted = inv.steps >= limit;
-      const res = await llm.chat({
-        messages: inv.messages,
-        tools: exhausted ? undefined : TOOL_DEFS,
+  /** 要求の文そのもので検索した候補(場所と名前だけ。読んだことにはしない)。検索できなければ空文字 */
+  private async seedLeads(query: string, hooks: RunHooks): Promise<string> {
+    const { index, config } = this.deps;
+    if (!index.hasChunks()) {
+      return "";
+    }
+    try {
+      const { hits } = await index.search(query, { k: SEED_LEADS, minSimilarity: config.minSimilarity });
+      return hits
+        .map(({ chunk: c }) => {
+          const label = [c.kind, c.symbols.slice(0, 3).join(",")].filter(Boolean).join(" ");
+          return `- ${c.file}:${c.startLine}-${c.endLine}${label ? `(${label})` : ""}`;
+        })
+        .join("\n");
+    } catch (error) {
+      if (hooks.signal?.aborted) {
+        throw error;
+      }
+      return "";
+    }
+  }
+
+  /** 調べることを決める(調査の会話の続きで、ツールを使わずに答えさせる)。決められなければ既定の項目で調べる */
+  private async planNeeds(inv: Investigation, change: boolean, budget: number, hooks: RunHooks): Promise<void> {
+    const request: ChatMessage = { role: "user", content: planRequest(change) };
+    let needs: InfoNeed[] | undefined;
+    try {
+      const res = await this.deps.llm.chat({
+        messages: [...inv.messages, request],
+        jsonSchema: NEEDS_SCHEMA,
         signal: hooks.signal,
-        purpose: exhausted ? "調査のまとめ" : `関連コードの調査(${inv.steps + 1}手目〜)`,
+        purpose: "調べることの整理",
       });
-      if (res.toolCalls.length === 0 || exhausted) {
-        inv.notes = res.content?.trim() ? res.content : inv.notes;
-        inv.messages.push({ role: "assistant", content: res.content ?? "" });
-        return;
+      needs = parseNeeds(parseJson(res.content), change);
+      inv.messages.push(request, { role: "assistant", content: res.content ?? "" });
+    } catch (error) {
+      if (hooks.signal?.aborted) {
+        throw error;
       }
-      inv.messages.push({ role: "assistant", content: res.content, toolCalls: res.toolCalls });
-      for (const call of res.toolCalls) {
+    }
+    inv.needs = needs ?? defaultNeeds(change);
+    hooks.onStatus?.(`調べること: ${inv.needs.map((n) => `${NEED_LABEL[n.kind]}(${n.need})`).join(" / ")}`);
+    inv.messages.push({ role: "user", content: startMessage(inv.needs, budget) });
+  }
+
+  /**
+   * 調査の会話を続ける。終えるのは次のとき:
+   * - 調査担当がツールを呼ばずに終え、材料の確認で「足りた」と判断された
+   * - 一定の回数を調べたところで材料を確認し、足りていた(上限まで使い切らない)
+   * - ツール呼び出しが budget 回に達した / 材料の確認を MAX_REVIEWS 回した / 前の確認のあと何も調べずに終えた
+   * 足りなければ、まだ分かっていない項目を伝えて続けさせる。
+   */
+  private async explore(inv: Investigation, budget: number, hooks: RunHooks): Promise<void> {
+    const status = hooks.onStatus ?? (() => undefined);
+    const change = requiresChange(inv.mode, detectIntent(inv.query));
+    const limit = inv.steps + budget;
+    let checkpoint = inv.steps + checkpointAfter(inv.needs.filter((n) => n.status === "open").length);
+    let reviews = 0;
+    let reviewedAt = -1;
+    let assessed = inv.needs.some((n) => n.status !== "open");
+    let lastText = "";
+    let summary = "";
+    // ツールを呼ばない・同じ呼び出しを繰り返すだけの応答が続いても必ず終わるよう、応答の回数にも上限を設ける
+    for (let turn = 0; turn < budget + MAX_REVIEWS + 2; turn++) {
+      let stopped = false;
+      if (inv.steps < limit) {
+        const res = await this.deps.llm.chat({
+          messages: inv.messages,
+          tools: TOOL_DEFS,
+          signal: hooks.signal,
+          purpose: `関連コードの調査(${inv.steps + 1}手目〜)`,
+        });
+        if (res.toolCalls.length === 0) {
+          lastText = res.content?.trim() || lastText;
+          inv.messages.push({ role: "assistant", content: res.content ?? "" });
+          stopped = true;
+        } else {
+          inv.messages.push({ role: "assistant", content: res.content, toolCalls: res.toolCalls });
+          await this.runTools(inv, res.toolCalls, limit, status);
+          if (inv.steps < limit && inv.steps < checkpoint) {
+            continue;
+          }
+        }
+      }
+      // ここに来るのは: 調査担当が自分で終えた / 確認する回数まで調べた / 上限に達した
+      if (stopped && inv.steps === reviewedAt) {
+        break; // 足りないと伝えても何も調べずに終えた: これ以上続けても進まない
+      }
+      const final = inv.steps >= limit;
+      reviews++;
+      reviewedAt = inv.steps;
+      status(final ? "集めた材料を整理中..." : "集めた材料で足りるかを確認中...");
+      const outcome = await this.review(inv, { change, final, remaining: limit - inv.steps }, hooks);
+      if (!outcome) {
+        break; // 確認できなければ、調査担当の判断で終える
+      }
+      assessed = true;
+      summary = outcome.summary || summary;
+      if (outcome.sufficient || final || reviews >= MAX_REVIEWS) {
+        if (!outcome.sufficient) {
+          status(`材料の確認: 調べきれなかったこと — ${needList(outcome.open)}`);
+        }
+        break;
+      }
+      status(`材料の確認: まだ分からないこと — ${needList(outcome.open)}。追加で調査します`);
+      inv.messages.push({ role: "user", content: continueMessage(outcome, limit - inv.steps) });
+      checkpoint = inv.steps + checkpointAfter(outcome.open.length);
+    }
+    // 一度も確認できていなければ、項目の状態は分からないので、調査担当のまとめだけを使う
+    inv.notes = assessed ? formatNotes(inv.needs, summary || lastText) : lastText || inv.notes;
+    markKeyLocations(inv.needs, inv.evidence);
+  }
+
+  /**
+   * ツールを実行する。上限を超える分は実行せず、同じ呼び出しの繰り返しは回数に数えずに知らせる。
+   * 最後に残りの回数とまだ分かっていない項目を添えて、予算を意識させる。
+   */
+  private async runTools(inv: Investigation, calls: ToolCall[], limit: number, status: (s: string) => void): Promise<void> {
+    const ctx = this.toolContext(inv.evidence);
+    for (const call of calls) {
+      const key = `${call.name}:${canonicalArgs(call.arguments)}`;
+      const done = inv.calls.get(key);
+      let result: string;
+      if (done !== undefined) {
+        result = `この呼び出しは調査 ${done} で実行済みです(結果はその応答にあります)。別の調べ方をするか、分かったならツールを呼ばずに終えてください。`;
+      } else if (inv.steps >= limit) {
+        result = "ツール呼び出しの上限に達したため、実行しませんでした。";
+      } else {
         inv.steps++;
+        inv.calls.set(key, inv.steps);
         status(`調査 ${inv.steps}: ${call.name}(${summarizeArgs(call.arguments)})`);
-        const result = await executeTool(call.name, call.arguments, ctx);
-        inv.messages.push({ role: "tool", toolCallId: call.id, content: result });
+        result = await executeTool(call.name, call.arguments, ctx);
       }
+      inv.messages.push({ role: "tool", toolCallId: call.id, content: result });
+    }
+    const open = inv.needs.filter((n) => n.status === "open").map((n) => n.id);
+    const last = inv.messages[inv.messages.length - 1]!;
+    last.content += `\n\n(残りのツール呼び出し: ${limit - inv.steps}回${open.length > 0 ? `。まだ確かめていない項目: ${open.join(", ")}` : ""})`;
+  }
+
+  /** 材料が足りたかを、項目ごとに判断させる(会話の続きで、ツールを使わずに答えさせる)。失敗したら undefined */
+  private async review(
+    inv: Investigation,
+    opts: { change: boolean; final: boolean; remaining: number },
+    hooks: RunHooks,
+  ): Promise<ReviewOutcome | undefined> {
+    const gaps = definitionGaps(inv.needs, inv.evidence, this.deps.index);
+    const request: ChatMessage = { role: "user", content: reviewRequest(inv.needs, { ...opts, gaps }) };
+    try {
+      const res = await this.deps.llm.chat({
+        messages: [...inv.messages, request],
+        jsonSchema: REVIEW_SCHEMA,
+        signal: hooks.signal,
+        purpose: opts.final ? "調査のまとめ" : "集めた材料で足りるかの確認",
+      });
+      const outcome = applyReview(inv.needs, parseJson<RawReview>(res.content), inv.evidence, opts);
+      inv.messages.push(request, { role: "assistant", content: res.content ?? "" });
+      return outcome;
+    } catch (error) {
+      if (hooks.signal?.aborted) {
+        throw error;
+      }
+      return undefined;
     }
   }
 
@@ -948,7 +1284,7 @@ export class QuizAgent {
             "",
             ...(missingChange
               ? [
-                  "これは実装・修正の依頼なので、学習者が穴埋めで実装する kind=\"change\" の問題が必要ですが、まだ1問もありません。",
+                  "これは実装・修正の依頼なので、利用者が穴埋めで実装する kind=\"change\" の問題が必要ですが、まだ1問もありません。",
                   "変更を入れる範囲を参照コードから選んで oldCode に逐語で写し、newCode に変更後のコードを全部書き、変更した行に空欄を置いた change 問題を必ず含めてください。",
                 ]
               : []),
@@ -1070,7 +1406,7 @@ export async function removeAnswerLeaks(
           {
             role: "system",
             content: [
-              "あなたはプログラミング学習クイズの編集者です。以下の文章は、解答前に学習者へ見せるのに、答え(空欄に入るコード)を漏らしています。",
+              "あなたはコードの理解を支援する文章の編集者です。以下の文章は、解答前に利用者へ見せるのに、答え(空欄に入るコード)を漏らしています。",
               "各 id について、答えのコード片も、答えに含まれる識別子の組み合わせも使わずに、同じ役割の文章へ書き直してください。",
               "答えを言う代わりに、関わる概念・見るべき場所・考え方・答えの形(言葉で)を示します。日本語で、元と同じくらいの長さにします。",
               levelStyle(level),
@@ -1113,56 +1449,8 @@ export async function removeAnswerLeaks(
     }
     leaks = findLeaks(goal.value, quiz.items);
     for (const leak of leaks) {
-      applyLeakFix(goal, quiz.items, leak, fallbackText(leak, quiz.items));
+      applyLeakFix(goal, quiz.items, leak, fallbackText(leak));
     }
   }
   quiz.goal = goal.value;
-}
-
-const JUDGE_SCHEMA = {
-  name: "judge",
-  schema: {
-    type: "object",
-    properties: {
-      results: {
-        type: "array",
-        items: {
-          type: "object",
-          properties: { index: { type: "integer" }, equivalent: { type: "boolean" }, reason: STRING },
-          required: ["index", "equivalent", "reason"],
-          additionalProperties: false,
-        },
-      },
-    },
-    required: ["results"],
-    additionalProperties: false,
-  },
-} as const;
-
-/** 厳密一致しなかった回答が「文脈上、同じ動作になるか」をLLMに判定させる(任意機能)。 */
-export function makeSemanticJudge(llm: ChatLlm): SemanticJudge {
-  return async (cases) => {
-    const res = await llm.chat({
-      messages: [
-        {
-          role: "system",
-          content:
-            "あなたはプログラミング課題の採点者です。穴埋めの回答が、模範解答と『その文脈で同じ動作・同じ意味になるか』を判定します。変数名だけの違いや等価な書き換えは equivalent=true。動作が変わる、または別の意味になるなら false。迷ったら false。reason は日本語で1文。",
-        },
-        {
-          role: "user",
-          content: cases
-            .map((c, i) => `#${i}\n文脈(___BLANK___が穴):\n${c.context}\n模範解答: ${c.expected}\n回答: ${c.given}`)
-            .join("\n\n"),
-        },
-      ],
-      jsonSchema: JUDGE_SCHEMA,
-      purpose: "採点の補助(表記ゆれの判定)",
-    });
-    const parsed = JSON.parse(res.content ?? "{}") as { results?: Array<{ index: number; equivalent: boolean; reason: string }> };
-    return cases.map((_, i) => {
-      const r = parsed.results?.find((x) => x.index === i);
-      return { equivalent: r?.equivalent === true, reason: r?.reason ?? "" };
-    });
-  };
 }

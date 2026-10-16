@@ -1,7 +1,7 @@
 import * as assert from "node:assert/strict";
 import * as path from "node:path";
 import { test, type TestContext } from "node:test";
-import { answersFrom, makeSemanticJudge, QuizAgent, type AgentConfig } from "../../core/agent";
+import { answersFrom, QuizAgent, type AgentConfig } from "../../core/agent";
 import { IndexManager } from "../../core/indexer";
 import { OpenAiClient } from "../../core/llm";
 import { applyItemToText, gradeBlanks } from "../../core/quiz";
@@ -9,7 +9,7 @@ import { buildStructureQuestions } from "../../core/questions";
 import { EvidenceStore, executeTool, normalizeRelPath, type ToolContext } from "../../core/tools";
 import { makeRng } from "../../core/text";
 import { FakeLsp } from "./helpers/fakeLsp";
-import { msg, startFakeOpenAi } from "./helpers/fakeOpenAi";
+import { investigationReply, msg, startFakeOpenAi } from "./helpers/fakeOpenAi";
 import { makeTempDir, NodeWorkspace, writeFiles } from "./helpers/nodeWorkspace";
 import { TsCompilerParser } from "./helpers/tsAst";
 
@@ -52,11 +52,12 @@ const FILES = {
 
 const CONFIG: AgentConfig = { maxSteps: 6, minSimilarity: 0.05, repoMapChars: 1500, evidenceChars: 12000 };
 
-async function setup(t: TestContext, handler: Parameters<typeof startFakeOpenAi>[0]) {
+/** fakeInvestigation: 調べることの整理・材料の確認には既定の応答を返す(false ならハンドラが答える) */
+async function setup(t: TestContext, handler: Parameters<typeof startFakeOpenAi>[0], { fakeInvestigation = true } = {}) {
   const root = await makeTempDir();
   await writeFiles(root, FILES);
   const ws = new NodeWorkspace(root);
-  const server = await startFakeOpenAi(handler);
+  const server = await startFakeOpenAi((req, n) => (fakeInvestigation ? investigationReply(req.body) : undefined) ?? handler(req, n));
   t.after(() => server.close());
   const client = new OpenAiClient({
     apiKey: async () => "sk-test",
@@ -150,9 +151,6 @@ test("通し: 調査(検索→読み取り)→出題→検証(行ずれ補正・
       retryPrompt = b.messages[b.messages.length - 1].content;
       return { json: msg(JSON.stringify({ goal: "", overallExplanation: "", items: [hallucinated] })) };
     }
-    if (b.response_format?.json_schema?.name === "judge") {
-      return { json: msg(JSON.stringify({ results: [{ index: 0, equivalent: true, reason: "同値" }] })) };
-    }
     throw new Error("想定外のリクエスト");
   });
   const statuses: string[] = [];
@@ -180,14 +178,13 @@ test("通し: 調査(検索→読み取り)→出題→検証(行ずれ補正・
   assert.deepEqual(item.blanks[1]!.clue, { path: "src/app.ts", line: 4, note: "ここから呼ばれる" });
   assert.deepEqual(item.refs, [{ path: "src/app.ts", line: 4, note: "login の呼び出し元" }]);
 
-  // 採点: 厳密一致 + 空白差は正解、不一致は判定器で救済
-  const judge = makeSemanticJudge(client);
-  const grades = await gradeBlanks(item, ["boolean", "3 < password.length"], judge);
+  // 照合: 空白の違いは同じ、書き方が違えば一致しない
+  const grades = gradeBlanks(item, ["boolean", "3 < password.length"]);
   assert.deepEqual(
     grades.map((g) => [g.correct, g.via]),
     [
       [true, "exact"],
-      [true, "semantic"],
+      [false, "none"],
     ],
   );
 
@@ -298,7 +295,7 @@ test("実装依頼: 重要な読解は2問まで含められ、新しい名前�
       return { json: msg(null, [{ name: "read_file", args: { path: "src/auth.ts" } }]) };
     }
     if (b.response_format.json_schema.name === "leak_fix") {
-      assert.match(b.messages[0].content, /読み手は初学者です/);
+      assert.match(b.messages[0].content, /読み手はプログラミングの基本から確かめている人です/);
       return { json: msg(JSON.stringify({ fixes: [] })) };
     }
     system = b.messages[0].content;
@@ -306,7 +303,7 @@ test("実装依頼: 重要な読解は2問まで含められ、新しい名前�
   });
   const agent = new QuizAgent({ llm: client, ws, index, config: { ...CONFIG, maxSteps: 1, level: "beginner" } });
   const r = await agent.run("パスワード判定を関数に切り出したい", "auto");
-  assert.match(system, /学習者のレベル: 初学者・学生/);
+  assert.match(system, /利用者のレベル: 基本/);
   assert.deepEqual(
     r.quiz.items.map((i) => i.kind),
     ["read", "read", "change"],
@@ -403,13 +400,15 @@ test("要件の確認: 複数案がある実装依頼は計画に進まずに質
   const statuses: string[] = [];
   const hooks = { onStatus: (s: string) => statuses.push(s) };
   const inv = await agent.investigate("パスワードのチェックを強化したい", "auto", hooks);
-  assert.equal(inv.notes, "- src/auth.ts の 1-3 行目が中心(login)");
+  assert.equal(inv.notes, "- src/auth.ts の 1-3 行目が中心(login)\n\n【調査で確かめた場所】\n- [変更する場所] src/auth.ts:1-8 — 読んだ");
 
   const { spec: prior, clarification: c } = await agent.organize(inv, hooks);
   assert.ok(c, "複数案があるので、計画に進まずに質問する");
   assert.match(scopeSystem, /変更が大きい/);
   assert.match(scopeSystem, /解釈や方針が複数ある/);
   assert.match(scopeSystem, /acceptanceCriteria/);
+  assert.match(scopeSystem, /1段階ずつ、依頼全体が完成するまで進めます/, "大きな依頼は段階に分けて最後まで進める");
+  assert.match(scopeSystem, /「今回どこまで実装するか」は質問しない/);
   assert.match(scopeUser, /パスワードのチェックを強化したい/);
   assert.match(scopeUser, /L2\|\s+return password\.length > 3/, "調査で読んだコードを根拠に判断させる");
   assert.deepEqual(prior.criteria, ["弱いパスワードではログインできない"], "確認前の受け入れ条件も持っておく(確認せずに進めるとき用)");
@@ -428,7 +427,7 @@ test("要件の確認: 複数案がある実装依頼は計画に進まずに質
   assert.ok(statuses.some((s) => s.includes("追加で調査")));
   assert.equal(inv.steps, 2, "回答後の追加調査は同じ調査の続きとして数える");
   assert.ok(inv.evidence.paths().includes("src/app.ts"), "回答後に読んだコードも根拠に加わる");
-  assert.equal(inv.notes, "- src/app.ts の handleSubmit から login が呼ばれる");
+  assert.match(inv.notes, /^- src\/app\.ts の handleSubmit から login が呼ばれる\n\n【調査で確かめた場所】/);
 
   const spec = await agent.finalizeSpec(inv, prior, answers, hooks);
   assert.match(specUser, /最低文字数を増やす.*補足: 9文字以上/);
@@ -459,8 +458,8 @@ test("要件の確認: 小さな依頼・仕組みの質問では確認しない
     if (next === "proceed") {
       return { json: msg(JSON.stringify({ decision: "proceed", reason: "小さい", understanding: "u", estimatedFiles: 1, estimatedLines: 3, questions: [] })) };
     }
-    if (next === "large-without-questions") {
-      return { json: msg(JSON.stringify({ decision: "proceed", reason: "", understanding: "u", estimatedFiles: 6, estimatedLines: 240, questions: [] })) };
+    if (next === "large-without-stages") {
+      return { json: msg(JSON.stringify({ decision: "proceed", reason: "", understanding: "u", estimatedFiles: 6, estimatedLines: 240, stages: [], questions: [] })) };
     }
     return {
       json: msg(
@@ -470,13 +469,18 @@ test("要件の確認: 小さな依頼・仕組みの質問では確認しない
           understanding: "u",
           estimatedFiles: 6,
           estimatedLines: 240,
+          acceptanceCriteria: ["新しいログインで入れる"],
+          stages: [
+            { label: "判定関数", goal: "新しい判定で login が動く", acceptanceCriteria: ["login が新しい条件で判定する"] },
+            { label: "画面", goal: "画面から新しいログインを使える", acceptanceCriteria: ["handleSubmit から使える"] },
+          ],
           questions: [
             {
-              question: "今回どの段階から実装しますか?",
-              why: "1回で全部は扱えない",
+              question: "セッションはどこに保存しますか?",
+              why: "保存先で作るコードが変わる",
               options: [
-                { label: "判定関数だけ", detail: "src/auth.ts", recommended: true },
-                { label: "画面まで", detail: "src/app.ts", recommended: false },
+                { label: "メモリ", detail: "src/auth.ts", recommended: true },
+                { label: "ファイル", detail: "src/util.ts", recommended: false },
               ],
             },
           ],
@@ -497,11 +501,15 @@ test("要件の確認: 小さな依頼・仕組みの質問では確認しない
   assert.equal(small.clarification, undefined, "小さく一つに決まる依頼はそのまま計画に進む");
   assert.deepEqual(small.spec.criteria, ["ログイン機能を作り直したい"], "受け入れ条件が無ければ依頼文そのものを条件にする");
 
-  scopes.push("large-without-questions", "clarify");
-  const c = (await agent.organize(change)).clarification;
-  assert.ok(c, "大きいのに質問が無ければ作り直させて、質問する");
+  scopes.push("large-without-stages", "clarify");
+  const organized = await agent.organize(change);
+  const c = organized.clarification;
+  assert.ok(c, "大きいのに段階が無ければ作り直させて、段階の分け方を見せる");
   assert.equal(c.large, true);
-  assert.equal(c.questions[0]!.question, "今回どの段階から実装しますか?");
+  assert.deepEqual(c.stages.map((s) => s.label), ["判定関数", "画面"]);
+  assert.deepEqual(organized.spec.stages?.map((s) => s.label), ["判定関数", "画面"], "依頼全体の要件に段階を持たせ、最後の段階まで進める");
+  assert.deepEqual(organized.spec.criteria, ["新しいログインで入れる"], "受け入れ条件は依頼全体のもの");
+  assert.equal(c.questions[0]!.question, "セッションはどこに保存しますか?");
   assert.equal(scopeCalls, 3);
 
   scopes.push("broken");
