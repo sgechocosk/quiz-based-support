@@ -92,6 +92,24 @@ export interface ChatLlm {
   chat(request: ChatRequest): Promise<ChatResult>;
 }
 
+/** はい/いいえで答えられる問い(Decisions API の predicate) */
+export interface PredicateRequest {
+  /** 判断の材料になる文 */
+  input: string;
+  /** 応答で問いを見分ける名前 */
+  name: string;
+  /** 問いの内容 */
+  instructions: string;
+  signal?: AbortSignal;
+  /** 何のための呼び出しか(API 実行前の確認画面に表示する) */
+  purpose?: string;
+}
+
+export interface DecisionLlm {
+  /** 条件が真である確率(0〜1)。答えを拒まれたら undefined */
+  predicate(request: PredicateRequest): Promise<number | undefined>;
+}
+
 /** 構文チェック(tree-sitter)。判定不能なら undefined。 */
 export interface SyntaxChecker {
   /** true: エラー無し / false: 構文エラーあり / undefined: 判定不能 */

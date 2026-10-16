@@ -3,10 +3,9 @@ import * as path from "node:path";
 import * as vscode from "vscode";
 import {
   answersFrom,
-  detectIntent,
+  investigationRequiresChange,
   QuizAgent,
   requirementText,
-  requiresChange,
   STAGE_SIZE,
   type AgentResult,
   type Clarification,
@@ -661,7 +660,7 @@ export class ChatSidebarProvider
     this.pendingClarify = undefined;
     await this.withAgent(services, async (agent, hooks) => {
       const inv = await agent.investigate(text, mode, hooks);
-      if (!requiresChange(mode, detectIntent(text))) {
+      if (!investigationRequiresChange(inv)) {
         // 仕組みの質問: 読解のクイズ
         await this.presentQuiz(
           services,
@@ -1397,7 +1396,7 @@ export class ChatSidebarProvider
     if (!readConfig().testMode || this.approveRest) {
       return;
     }
-    const kind = info.kind === "chat" ? "チャット" : "埋め込み";
+    const kind = info.kind === "chat" ? "チャット" : info.kind === "decision" ? "判定" : "埋め込み";
     const choice = await vscode.window.showWarningMessage(
       `OpenAI API を呼び出します: ${info.purpose}`,
       {
@@ -1483,6 +1482,7 @@ export class ChatSidebarProvider
     try {
       const agent = new QuizAgent({
         llm: this.client,
+        decider: this.client,
         ws: services.ws,
         lsp: services.lsp,
         index: services.index,

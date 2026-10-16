@@ -54,3 +54,24 @@ test("明示指定はそのまま送り、default は送らず、無関係な400
   assert.equal(b2.length, 1);
   assert.equal(b2[0].reasoning_effort, undefined);
 });
+
+test("Decisions API: predicate を /decisions に送り、確率を返す。refusal は undefined", async () => {
+  const sent: Array<{ url: string; body: any }> = [];
+  let reply: any = { answers: [{ type: "predicate", name: "q", probability: 0.83 }] };
+  const fetchImpl = (async (url: any, init: any) => {
+    sent.push({ url: String(url), body: JSON.parse(init.body) });
+    return new Response(JSON.stringify(reply), { status: 200 });
+  }) as unknown as typeof fetch;
+  const c = client(fetchImpl, "auto");
+  assert.equal(await c.predicate({ input: "ログアウトを追加したい", name: "q", instructions: "依頼か?" }), 0.83);
+  assert.equal(sent[0]!.url, "http://x/v1/decisions");
+  assert.deepEqual(sent[0]!.body, {
+    model: "gpt-6-luna",
+    input: "ログアウトを追加したい",
+    questions: [{ type: "predicate", name: "q", instructions: "依頼か?" }],
+  });
+  reply = { answers: [{ type: "refusal", name: "q" }] };
+  assert.equal(await c.predicate({ input: "x", name: "q", instructions: "?" }), undefined);
+  reply = { answers: [] };
+  await assert.rejects(c.predicate({ input: "x", name: "q", instructions: "?" }), /答えがありません/);
+});
