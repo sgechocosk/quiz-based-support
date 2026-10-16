@@ -628,10 +628,15 @@
       const out = group.result;
       out.replaceChildren();
       out.className = `result ${g.correct ? "ok" : "ng"}`;
-      const actual = it.kind === "change" ? "このコードにする" : "実際のコード";
-      out.append(document.createTextNode(g.correct ? "✓ 判断が一致" : g.note === "未選択" ? `– 未選択 → ${actual}: ` : `✗ 判断が異なる → ${actual}: `));
-      if (!g.correct) {
-        out.append(el("code", { text: g.expected }));
+      // 合っていれば短く伝える。違った・選ばなかったときは判定を出さず、なぜそのコードになるかへ読み進めてもらう
+      // (違ったことは、コード中の枠と候補の色で分かる)
+      if (g.correct) {
+        out.append(document.createTextNode("✓ 合っています"));
+      } else if (g.why) {
+        out.append(el("code", { text: g.expected }), document.createTextNode(" になる理由"));
+      } else {
+        // 理由が無いときは、入るコードだけを示す
+        out.append(document.createTextNode(`${it.kind === "change" ? "このコードにする" : "実際のコード"}: `), el("code", { text: g.expected }));
       }
       if (g.why) {
         out.append(el("div", { class: "why-blank", text: g.why }));
