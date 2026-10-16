@@ -1,4 +1,4 @@
-import type { ChatLlm, ChatMessage, ChatRequest, ChatResult, Embedder, ToolCall } from "./ports";
+import type { ChatLlm, ChatMessage, ChatRequest, ChatResult, DecisionLlm, Embedder, PredicateRequest, ToolCall } from "./ports";
 import { estimateTokens } from "./text";
 
 export class LlmError extends Error {
@@ -13,7 +13,7 @@ export class LlmError extends Error {
 
 /** API を呼ぶ直前に知らせる内容(実行前の確認に使う) */
 export interface ApiRequestInfo {
-  kind: "chat" | "embedding";
+  kind: "chat" | "embedding" | "decision";
   model: string;
   /** 何のための呼び出しか */
   purpose: string;
@@ -87,26 +87,29 @@ function toWire(m: ChatMessage): WireMessage {
   return wire;
 }
 
+/** Decisions API が対応しているモデル(現在はこれだけ) */
+export const DECISION_MODEL = "gpt-6-luna";
+
 const RETRYABLE = new Set([408, 409, 429, 500, 502, 503, 504]);
 
 /**
- * OpenAI互換API(Chat Completions / Embeddings)を fetch で直接呼ぶ薄いクライアント。
+ * OpenAI互換API(Chat Completions / Embeddings / Decisions)を fetch で直接呼ぶ薄いクライアント。
  * baseUrl を変えれば Azure/OpenRouter/Ollama 等の互換エンドポイントも使える。
  */
-export class OpenAiClient implements ChatLlm, Embedder {
+export class OpenAiClient implements ChatLlm, Embedder, DecisionLlm {
   /** ツール利用時に reasoning_effort=none が必要と判明したモデル */
   private readonly needsNoneWithTools = new Set<string>();
   /** 見積もりを実測値に合わせる補正係数(実測 ÷ 見積もり の移動平均) */
-  private readonly ratio = { chat: 1, embedding: 1 };
+  private readonly ratio = { chat: 1, embedding: 1, decision: 1 };
 
   constructor(private readonly o: OpenAiOptions) {}
 
   /** 見積もり(補正後)。確認画面に出す数 */
-  private calibrated(kind: "chat" | "embedding", raw: number): number {
+  private calibrated(kind: ApiRequestInfo["kind"], raw: number): number {
     return Math.max(1, Math.round(raw * this.ratio[kind]));
   }
 
-  private learn(kind: "chat" | "embedding", raw: number, actual: number | undefined): void {
+  private learn(kind: ApiRequestInfo["kind"], raw: number, actual: number | undefined): void {
     if (!actual || actual <= 0 || raw <= 0) {
       return;
     }
@@ -244,6 +247,42 @@ export class OpenAiClient implements ChatLlm, Embedder {
     }));
     const finishReason = typeof json?.choices?.[0]?.finish_reason === "string" ? (json.choices[0].finish_reason as string) : undefined;
     return { content: message.content ?? null, toolCalls, finishReason };
+  }
+
+  async predicate(request: PredicateRequest): Promise<number | undefined> {
+    const raw = 3 + estimateTokens(request.input) + estimateTokens(request.instructions) + MESSAGE_OVERHEAD;
+    const info: ApiRequestInfo = {
+      kind: "decision",
+      model: DECISION_MODEL,
+      purpose: request.purpose ?? "判定",
+      inputTokens: this.calibrated("decision", raw),
+    };
+    await this.gate(info, request.signal);
+    const json = await this.post(
+      "/decisions",
+      {
+        model: DECISION_MODEL,
+        input: request.input,
+        questions: [{ type: "predicate", name: request.name, instructions: request.instructions }],
+      },
+      request.signal,
+    );
+    const actual = Number(json?.usage?.input_tokens) || undefined;
+    this.learn("decision", raw, actual);
+    this.o.afterResponse?.({ ...info, actualInputTokens: actual });
+    const answers = (json?.answers ?? []) as Array<{ type?: string; name?: string; probability?: unknown }>;
+    const answer = answers.find((a) => a?.name === request.name);
+    if (!answer) {
+      throw new LlmError(`Decisions API の応答に「${request.name}」の答えがありません。`);
+    }
+    if (answer.type === "refusal") {
+      return undefined;
+    }
+    const p = Number(answer.probability);
+    if (answer.type !== "predicate" || !Number.isFinite(p) || p < 0 || p > 1) {
+      throw new LlmError(`Decisions API の応答の形が想定と違います(type=${String(answer.type)})。`);
+    }
+    return p;
   }
 
   async embed(texts: string[], signal?: AbortSignal, purpose?: string): Promise<number[][]> {

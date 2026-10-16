@@ -19,7 +19,7 @@ import {
 } from "./investigation";
 import { maskAnswers, revealsAnswer } from "./leak";
 import { levelGuide, levelStyle, type LearnerLevel } from "./level";
-import type { ChatLlm, ChatMessage, LspPort, SyntaxChecker, ToolCall, WorkspacePort } from "./ports";
+import type { ChatLlm, ChatMessage, DecisionLlm, LspPort, SyntaxChecker, ToolCall, WorkspacePort } from "./ports";
 import { applyItemToText, compactItem, validateRawItem, type RawItem, type Validation } from "./quiz";
 import { parseJson, splitLines } from "./text";
 import { EvidenceStore, executeTool, normalizeRelPath, TOOL_DEFS, type CodeIndex } from "./tools";
@@ -41,6 +41,8 @@ export interface AgentConfig {
 
 export interface AgentDeps {
   llm: ChatLlm;
+  /** 「自動で判断」のときに、質問か実装の依頼かを判定する(無ければ言い回しで判定する) */
+  decider?: DecisionLlm;
   ws: WorkspacePort;
   lsp?: LspPort;
   index: CodeIndex & { repoMap(budgetChars: number): string };
@@ -64,6 +66,8 @@ export interface AgentResult {
 export interface Investigation {
   query: string;
   mode: QuizMode;
+  /** 質問か実装の依頼かの判定(調査の始めに1回だけ行う) */
+  intent?: QuizIntent;
   /** 調査の会話(回答を受けた追加調査はこの続きで行う) */
   messages: ChatMessage[];
   evidence: EvidenceStore;
@@ -489,9 +493,57 @@ export type QuizIntent = "change" | "read";
 const CHANGE_WORDS =
   /追加|実装|作りたい|作って|作成|作る|修正|直し|直す|直せ|変更|変えたい|変えて|対応させ|対応したい|導入|組み込|改善|強化|改修|リファクタ|削除し|消したい|置き換|ようにしたい|ようにする|ようにして|にしたい|にして欲|にしてほし|できるようにし|欲しい|ほしい|書きたい|書いて|加えたい|入れたい|\b(add|implement|fix|create|build|support|refactor|change|remove|replace)\b/i;
 
-/** 質問文が「実装・修正の依頼」か「仕組みの質問」かを判定する。 */
+/** 質問文が「実装・修正の依頼」か「仕組みの質問」かを、言い回しで判定する(Decisions API が使えないときの代わり)。 */
 export function detectIntent(query: string): QuizIntent {
   return CHANGE_WORDS.test(query) ? "change" : "read";
+}
+
+const INTENT_QUESTION =
+  "この文は、コードを新しく書く・追加する・修正する・変更する・削除するなど、ソースコードを書き換えることの依頼ですか?" +
+  "既存のコードの仕組み・動き・場所・理由を知りたいだけの質問なら「いいえ」です。";
+
+/**
+ * 「自動で判断」のとき、質問文が実装・修正の依頼かを Decisions API で判定する。
+ * 「自動で判断」以外・判定に使う API が無い・失敗した・答えを拒まれたときは、言い回しで判定する。
+ */
+export async function decideIntent(
+  query: string,
+  mode: QuizMode,
+  decider: DecisionLlm | undefined,
+  hooks: RunHooks = {},
+): Promise<QuizIntent> {
+  if (mode !== "auto" || !decider) {
+    return detectIntent(query);
+  }
+  hooks.onStatus?.("質問か実装の依頼かを判定中...");
+  try {
+    const p = await decider.predicate({
+      input: query,
+      name: "code_change_request",
+      instructions: INTENT_QUESTION,
+      signal: hooks.signal,
+      purpose: "質問か実装の依頼かの判定",
+    });
+    if (p !== undefined) {
+      return p >= 0.5 ? "change" : "read";
+    }
+  } catch (error) {
+    if (hooks.signal?.aborted) {
+      throw error;
+    }
+    // 互換エンドポイントで Decisions API が無い場合なども、出題そのものは止めない
+  }
+  return detectIntent(query);
+}
+
+/** 調査の判定結果(調査より前に作られたものは言い回しで判定する) */
+function intentOf(inv: Investigation): QuizIntent {
+  return inv.intent ?? detectIntent(inv.query);
+}
+
+/** この調査が実装・修正の依頼として進むか */
+export function investigationRequiresChange(inv: Investigation): boolean {
+  return requiresChange(inv.mode, intentOf(inv));
 }
 
 /** 実装問題(change)を最低1問必須にするか */
@@ -744,11 +796,13 @@ export class QuizAgent {
 
   async investigate(query: string, mode: QuizMode, hooks: RunHooks = {}): Promise<Investigation> {
     const { index, config } = this.deps;
-    const change = requiresChange(mode, detectIntent(query));
+    const intent = await decideIntent(query, mode, this.deps.decider, hooks);
+    const change = requiresChange(mode, intent);
     const leads = await this.seedLeads(query, hooks);
     const inv: Investigation = {
       query,
       mode,
+      intent,
       messages: [
         { role: "system", content: exploreSystemPrompt(config.maxSteps, index.repoMap(config.repoMapChars)) },
         {
@@ -786,7 +840,7 @@ export class QuizAgent {
    */
   async organize(inv: Investigation, hooks: RunHooks = {}): Promise<{ spec: RequirementSpec; clarification?: Clarification }> {
     const { llm, config } = this.deps;
-    if (!requiresChange(inv.mode, detectIntent(inv.query))) {
+    if (!investigationRequiresChange(inv)) {
       return { spec: specFrom(inv.query, undefined) };
     }
     hooks.onStatus?.("要件を整理し、変更の規模と仕様の決め方が複数ないかを確認中...");
@@ -875,6 +929,7 @@ export class QuizAgent {
     const inv: Investigation = {
       query: base.query,
       mode: "change",
+      intent: "change",
       messages: [
         { role: "system", content: exploreSystemPrompt(budget, index.repoMap(config.repoMapChars)) },
         {
@@ -1083,7 +1138,7 @@ export class QuizAgent {
    */
   private async explore(inv: Investigation, budget: number, hooks: RunHooks): Promise<void> {
     const status = hooks.onStatus ?? (() => undefined);
-    const change = requiresChange(inv.mode, detectIntent(inv.query));
+    const change = investigationRequiresChange(inv);
     const limit = inv.steps + budget;
     let checkpoint = inv.steps + checkpointAfter(inv.needs.filter((n) => n.status === "open").length);
     let reviews = 0;
@@ -1198,7 +1253,7 @@ export class QuizAgent {
   private async generateQuiz(inv: Investigation, requirement: string, hooks: RunHooks): Promise<GeneratedQuiz> {
     const { llm, config } = this.deps;
     const { mode, notes, evidence } = inv;
-    const intent = detectIntent(inv.query);
+    const intent = intentOf(inv);
     const knownText = evidence.allText();
     const needChange = requiresChange(mode, intent);
     const messages: ChatMessage[] = [

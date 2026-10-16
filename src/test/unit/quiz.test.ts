@@ -25,6 +25,7 @@ import type { KeyValueStore } from "../../core/ports";
 import {
   answersFrom,
   decideClarification,
+  decideIntent,
   detectIntent,
   LARGE_CHANGE_LINES,
   quizSystemPrompt,
@@ -717,4 +718,34 @@ test("学習記録: 選択式だけの記録でも、1回の取り組みとし�
   const s = log.summary();
   assert.equal(s.sessions, 1, "最初の記録だけを1回と数える");
   assert.equal(s.blanks, 2);
+});
+
+test("意図判定: 「自動で判断」のときだけ Decisions API を使い、使えなければ言い回しで判定する", async () => {
+  const calls: string[] = [];
+  const decider = (p: number | undefined | Error) => ({
+    predicate: async (r: { input: string }) => {
+      calls.push(r.input);
+      if (p instanceof Error) {
+        throw p;
+      }
+      return p;
+    },
+  });
+  // 言い回しでは「質問」になる依頼も、API の判定に従う
+  assert.equal(await decideIntent("ログインにOTPを足して", "auto", decider(0.9)), "change");
+  assert.equal(await decideIntent("なぜこの修正が必要だった?", "auto", decider(0.1)), "read");
+  assert.equal(calls.length, 2);
+  // 「自動で判断」以外では呼ばない
+  calls.length = 0;
+  assert.equal(await decideIntent("ログアウト機能を追加したい", "read", decider(0.9)), "change");
+  assert.equal(await decideIntent("ログイン処理はどう動く?", "change", decider(0.9)), "read");
+  assert.equal(calls.length, 0);
+  // API が無い・失敗・拒否のときは言い回しで判定する
+  assert.equal(await decideIntent("ログアウト機能を追加したい", "auto", undefined), "change");
+  assert.equal(await decideIntent("ログアウト機能を追加したい", "auto", decider(new Error("404"))), "change");
+  assert.equal(await decideIntent("ログイン処理はどう動く?", "auto", decider(undefined)), "read");
+  // 中止は判定の失敗として扱わない
+  const ac = new AbortController();
+  ac.abort();
+  await assert.rejects(decideIntent("x", "auto", decider(new Error("中止しました。")), { signal: ac.signal }), /中止/);
 });
