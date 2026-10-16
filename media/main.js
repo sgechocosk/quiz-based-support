@@ -507,7 +507,7 @@
         }
         if (i < parts.length - 1) {
           const n = slots.length + 1;
-          const slot = el("span", { class: "slot", text: `［ ${n} ］`, title: `判断 ${n}: 下の候補から選んでください`, tabIndex: 0 });
+          const slot = el("span", { class: "slot", text: `［ ${n} ］`, title: `要所 ${n}: 下の候補から選んでください`, tabIndex: 0 });
           slots.push(slot);
           row.append(slot);
         }
@@ -581,7 +581,7 @@
       const group = el(
         "div",
         { class: "blank-group" },
-        el("div", { class: "hint-head" }, el("span", { class: "blank-no", text: `判断 ${k + 1}` }), el("span", { class: "concept", text: blank.concept }), steps.length ? hintBtn : null),
+        el("div", { class: "hint-head" }, el("span", { class: "blank-no", text: `要所 ${k + 1}` }), el("span", { class: "concept", text: blank.concept }), steps.length ? hintBtn : null),
         list,
         text,
         result,
@@ -700,7 +700,7 @@
       const left = entry.items.reduce((n, it) => n + it.picked.filter((p) => p < 0).length, 0);
       if (left > 0 && !unanswered.textContent) {
         // 1回目は知らせるだけ。もう一度押せば選ばないまま確かめる
-        unanswered.textContent = `まだ選んでいない判断が${left}か所あります(もう一度押すとこのまま確かめます)`;
+        unanswered.textContent = `まだ選んでいない要所が${left}か所あります(もう一度押すとこのまま確かめます)`;
         return;
       }
       entry.graded = true;
@@ -741,7 +741,7 @@
       markItemGrades(it, res.grades);
       res.grades.forEach((g, k) => {
         if (!g.correct) {
-          revisit.push(`${it.concepts[k] || "判断"}(${it.path.split("/").pop()} の判断 ${k + 1})`);
+          revisit.push(`${it.concepts[k] || "要所"}(${it.path.split("/").pop()} の要所 ${k + 1})`);
         }
       });
       if (res.explanation) {
@@ -1100,10 +1100,10 @@
     block.append(el("div", { class: "step-body" }, flow));
 
     if (s.why) {
-      flow.append(thought("なぜこの変更が要るか", el("div", { class: "task", text: s.why })).node);
+      flow.append(thought("変更の理由", el("div", { class: "task", text: s.why })).node);
     }
     if (s.contract) {
-      flow.append(thought("何の約束が変わるか", el("div", { class: "contract", text: s.contract })).node);
+      flow.append(thought("変わる仕様", el("div", { class: "contract", text: s.contract })).node);
     }
     const state = { answered: false, item: null, q: null, reveal: null, btn: null, block, summary };
     const how = thought(s.item ? "変更するコード" : "変更の内容");
