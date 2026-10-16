@@ -156,23 +156,15 @@
     live.classList.toggle("hidden", !text);
   }
 
-  /** 何も無いときの案内 */
+  /** 何も無いときの案内(画面の中央に、入力欄への誘導だけを出す) */
   function renderEmptyHint() {
     if (messages.childElementCount > 0) {
       return;
     }
-    const hint = el(
-      "div",
-      { id: "empty-hint", class: "empty-hint" },
-      el("strong", { text: "コードと変更を、考える順序で分解する" }),
-      el("div", { text: "下の入力欄に、知りたい仕組みや実装したいことを書いてください。" }),
+    // 狭いときは「、」の後でだけ折り返す(単語の途中で切らない)
+    messages.append(
+      el("div", { id: "empty-hint", class: "empty-hint" }, el("span", { text: "下の入力欄に、" }), el("span", { text: "知りたい仕組みや実装したいことを書いてください。" })),
     );
-    const list = el("ul");
-    for (const t of ["仕組みの質問 → 実際のコードを、判断のポイントごとに読み解く", "実装・修正の依頼 → 要件から変更までを、考える順に1ステップずつ"]) {
-      list.append(el("li", { text: t }));
-    }
-    hint.append(list);
-    messages.append(hint);
   }
 
   /** 見出し・本文・操作に分けたカード(AI の返答はすべてこの形) */

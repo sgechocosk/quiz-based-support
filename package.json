@@ -46,7 +46,7 @@
         {
           "type": "webview",
           "id": "quiz-support-chat",
-          "name": "要件から変更まで"
+          "name": "コード思考"
         }
       ]
     },
