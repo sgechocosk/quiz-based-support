@@ -9,6 +9,9 @@ import {
   AUTO_CALLS_PER_MINUTE,
   codeNames,
   contextNames,
+  draftIntent,
+  looksSecret,
+  mentionsCodeName,
   missingParts,
   nameExists,
   parseRefine,
@@ -158,11 +161,11 @@ test("書き直しで補った名前に、定義の場所を添える(書きか�
 test("書き直し案の確認: 案に無い要素・〔〕の無い問い・同じ選択肢を捨て、無い名前・書きかけに無い数値・進め方の食い違いは直させる", () => {
   const { proposal, problems } = parseRefine(
     {
-      instruction: "`onLessonTest` で、テストが失敗したときに〔表示する内容〕も出すようにしたい。",
+      instruction: "`onLessonTest` で、テストの〔表示する内容〕も出すようにしたい。",
       intent: "change",
       parts: [
         { kind: "location", text: "`onLessonTest` で" },
-        { kind: "condition", text: "テストが失敗したときに" },
+        { kind: "behavior", text: "も出すようにしたい" },
         { kind: "scope", text: "成功したときは変えない" },
         { kind: "bogus", text: "x" },
       ],
@@ -185,13 +188,14 @@ test("書き直し案の確認: 案に無い要素・〔〕の無い問い・同
     NAMES,
   );
   assert.deepEqual(problems, []);
-  assert.deepEqual(proposal!.parts.map((p) => p.kind), ["location", "condition"]);
+  assert.deepEqual(proposal!.parts.map((p) => p.kind), ["location", "behavior"]);
   assert.equal(proposal!.questions.length, 1);
   assert.deepEqual(proposal!.questions[0]!.options.map((o) => o.label), ["終了コード", "失敗したテスト名"]);
 
   const bad = parseRefine({ instruction: "`handleLogout` を足したい", intent: "change", parts: [], questions: [] }, "ログアウト", "read", NAMES);
   assert.deepEqual(bad.proposal!.unknownNames, ["handleLogout"]);
-  assert.equal(bad.problems.length, 2);
+  assert.equal(bad.problems.length, 1);
+  assert.equal(bad.nameProblems.length, 1, "名前の指摘は別に返す(索引が無いときは作り直しの理由にしない)");
   assert.deepEqual(parseRefine({ instruction: " " }, "x", "auto", NAMES).problems, ["instruction が空です。"]);
   assert.match(parseRefine({ instruction: "5回失敗したらロックしたい", intent: "change" }, "ログインをロックしたい", "auto", NAMES).problems[0]!, /数値/);
 });
@@ -263,7 +267,7 @@ test("続きの候補: 新しい書きかけが来たら前の要求を中止す
 
 test("書き直し案: 名前の誤りは1回だけ作り直させ、残ったら見つからない名前として返す", async () => {
   const good = {
-    instruction: "`onLessonTest` で、テストが失敗したときに〔表示する内容〕も出すようにしたい。",
+    instruction: "`onLessonTest` で、テストの〔表示する内容〕も出すようにしたい。",
     intent: "change",
     parts: [{ kind: "location", text: "`onLessonTest` で" }],
     questions: [],
@@ -342,12 +346,12 @@ test("API: 呼び出しごとの推論強度を送り、拒まれたら設定ど
   await c.chat(req);
   assert.equal(bodies.length, 2);
   assert.equal(bodies[0].reasoning_effort, "none");
-  assert.equal(bodies[1].reasoning_effort, undefined);
+  assert.equal(bodies[1].reasoning_effort, "minimal", "none を拒まれたら minimal を試す");
   assert.equal(bodies[0].prompt_cache_key, "qbs");
   assert.equal(infos[0]!.channel, "assist-auto");
   await c.chat(req);
-  assert.equal(bodies.length, 3, "拒まれたモデルには最初から送らない");
-  assert.equal(bodies[2].reasoning_effort, undefined);
+  assert.equal(bodies.length, 3, "none を拒まれたモデルには最初から minimal を送る");
+  assert.equal(bodies[2].reasoning_effort, "minimal");
 
   base = "http://localhost:11434/v1";
   effort = "default";
@@ -454,4 +458,101 @@ test("使われない状態が続いても止めずに(利用者が決めるこ�
   assert.ok(!a.rarelyUsed(), "スイッチを入れ直すと数え直す");
   a.recordSend("トークンは token=abcdef123456 です", { shown: 0, accepted: 0, refined: false });
   assert.ok(!JSON.stringify(store.get("promptAssist.v1")).includes("abcdef123456"));
+});
+
+// ---------- レビューで見つかった問題の再発防止 ----------
+
+test("依頼の種類: 「教えてください」は読み解き、「並べ替えたい」「止めたい」は変更。どちらの言い方でも候補を捨てない", () => {
+  assert.equal(draftIntent("`IndexManager.commit` の流れを教えてください", "auto"), "read");
+  assert.equal(draftIntent("一覧を名前順に並べ替えたい", "auto"), "change");
+  assert.deepEqual(missingParts("索引の更新の仕組みを説明してください", "auto"), []);
+  assert.equal(rejectCompletion("`IndexManager.commit` がどこから呼ばれるか", "教えてください", "read", NAMES), undefined);
+  assert.equal(rejectCompletion("`handleAsk` が何をしているか", "説明してください", "auto", NAMES), undefined);
+  assert.equal(rejectCompletion("一覧を", "名前順に並べ替えたい", "change", NAMES), undefined);
+  assert.equal(rejectCompletion("`prepare` のログを", "止めたい", "change", NAMES), undefined);
+  assert.deepEqual(missingParts("認証のフローを理解したい", "auto"), []);
+});
+
+test("書きかけの繰り返しの除去は、語の途中で切らない(the → theme)", () => {
+  assert.equal(stripEcho("Add a dark mode toggle to the", " theme settings panel"), " theme settings panel");
+  assert.equal(stripEcho("How is the index", " indexed after saving?"), " indexed after saving?");
+});
+
+test("名前: フォルダは実在として認め、拡張子もフォルダとしての一致も無い a/b(true/false)は名前として確かめない", () => {
+  const names = fakeNames(["IndexManager"], ["src/core/indexer.ts"]);
+  const withDirs: NameSource = { ...names, hasPath: (p) => p === "src/core" || names.hasPath(p) };
+  const ctx = contextNames("src/core/indexer.ts — IndexManager");
+  assert.ok(ctx.has("src/core"));
+  assert.ok(nameExists("src/core", withDirs, "", ctx));
+  assert.ok(nameExists("true/false", withDirs, "", ctx));
+  assert.ok(!mentionsCodeName("TypeScript の型エラーを直したい", NAMES), "製品名は名前として数えない");
+  assert.ok(mentionsCodeName("indexmanager の流れ", NAMES), "大文字小文字の違いは許す");
+});
+
+test("秘密らしい文字列: 環境変数の形も送らない", () => {
+  for (const t of ["OPENAI_API_KEY=abcdef123456", "DB_PASSWORD: hunter2hunter2", "AWS_SECRET_ACCESS_KEY=abcd/efgh+ijkl"]) {
+    assert.ok(looksSecret(t), t);
+  }
+  assert.ok(!looksSecret("ログイン処理の流れを知りたい"));
+});
+
+test("続きの候補: 出力の上限で切れたら truncated として覚え、読めない応答が続いたら止める", async () => {
+  let reply: ChatResult = { content: '{"completion":"はど', toolCalls: [], finishReason: "length" };
+  const requests: ChatRequest[] = [];
+  const a = new PromptAssistant({
+    llm: { chat: async (r) => (requests.push(r), reply) },
+    index: () => NAMES,
+    store: memoryStore(),
+    workspaceId: "/ws",
+  });
+  assert.equal((await a.complete("IndexManager の流れ", "auto")).reason, "truncated");
+  await a.complete("IndexManager の流れ", "auto");
+  assert.equal(requests.length, 1, "切れた結果も覚える");
+  reply = { content: "not json", toolCalls: [] };
+  for (let i = 0; i < 3; i++) {
+    await a.complete(`IndexManager の流れ ${i}`, "auto");
+  }
+  assert.equal(a.autoBlock(), "config");
+});
+
+test("書き直し案: 意図を守る規則(条件・別の依頼・文言・種類の反転)と、読み解きの〔 〕の置き場所も直させる。索引が無くても名前以外は作り直す", async () => {
+  const p = (instruction: string, intent: string, questions: any[] = []) => parseRefine({ instruction, intent, parts: [], questions }, "テストの表示を直したい", "auto", NAMES).problems;
+  assert.ok(p("テストが失敗したときの表示を直したい", "change").some((x) => x.includes("条件")));
+  assert.ok(p("テストの表示を直し、あわせてログも直したい", "change").some((x) => x.includes("別の依頼")));
+  assert.ok(p("テストの表示を「失敗」にしたい", "change").some((x) => x.includes("文言")));
+  assert.ok(p("テストの表示はどう動く?", "read").some((x) => x.includes("変更の依頼のまま")));
+  const read = parseRefine(
+    { instruction: "〔対象〕はどう動く?", intent: "read", parts: [], questions: [{ slot: "〔対象〕", question: "?", options: [{ label: "a", fill: "a" }, { label: "b", fill: "b" }] }] },
+    "流れ",
+    "read",
+    NAMES,
+  );
+  assert.ok(read.problems.some((x) => x.includes("括弧の補足")));
+
+  const { llm, requests } = fakeLlm((_r, n) =>
+    n === 1 ? { instruction: "`zzz` が失敗したときに表示したい", intent: "change", parts: [], questions: [] } : { instruction: "`zzz` の表示を直したい", intent: "change", parts: [], questions: [] },
+  );
+  const noIndex = new PromptAssistant({ llm, index: () => undefined, store: memoryStore(), workspaceId: "/ws" });
+  const out = await noIndex.refine("テストの表示を直したい", "auto");
+  assert.equal(requests.length, 2, "索引が無くても、名前以外の指摘では作り直す");
+  assert.deepEqual(out.unknownNames, ["zzz"]);
+});
+
+test("API: none を拒むモデルには minimal を試し、強度ごとに覚える(依頼を整えるの low は送り続ける)", async () => {
+  const bodies: any[] = [];
+  const fetchImpl = (async (_url: any, init: any) => {
+    const body = JSON.parse(init.body);
+    bodies.push(body);
+    if (body.reasoning_effort === "none") {
+      return new Response(JSON.stringify({ error: { message: "reasoning_effort 'none' is not supported" } }), { status: 400 });
+    }
+    return new Response(JSON.stringify({ choices: [{ message: { role: "assistant", content: "{}" } }] }), { status: 200 });
+  }) as unknown as typeof fetch;
+  const c = new OpenAiClient({ apiKey: async () => "k", baseUrl: () => "https://api.openai.com/v1", model: () => "m", embeddingModel: () => "e", reasoningEffort: () => "auto", fetchImpl, sleep: async () => {} });
+  await c.chat({ messages: [{ role: "user", content: "x" }], reasoningEffort: "none" });
+  assert.deepEqual(bodies.map((b) => b.reasoning_effort), ["none", "minimal"]);
+  await c.chat({ messages: [{ role: "user", content: "x" }], reasoningEffort: "none" });
+  assert.equal(bodies[2].reasoning_effort, "minimal", "以後は最初から minimal");
+  await c.chat({ messages: [{ role: "user", content: "x" }], reasoningEffort: "low" });
+  assert.equal(bodies[3].reasoning_effort, "low");
 });

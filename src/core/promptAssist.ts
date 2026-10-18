@@ -75,8 +75,10 @@ const SECRET_PATTERNS = [
   /-----BEGIN [A-Z ]*PRIVATE KEY-----/,
   /:\/\/[^\s/:@]+:[^\s/@]+@/,
   /\bBearer\s+[\w.~+/-]{16,}/i,
-  /\b(password|passwd|pwd|secret|token|api[_-]?key)\s*[:=]\s*\S{6,}/i,
+  /(?<![A-Za-z0-9])(password|passwd|pwd|secret|token|api[_-]?key)\s*[:=]\s*\S{6,}/i,
+  /\b[A-Z0-9_]*(KEY|SECRET|TOKEN|PASSWORD|PASSWD)[A-Z0-9_]*\s*[:=]\s*\S{6,}/,
   /\b[A-Za-z0-9]{40,}\b/,
+  /[A-Za-z0-9+/]{40,}={0,2}/,
 ];
 
 /** API キーなど秘密の情報らしい文字列を含むか(含めば自動では送らない) */
@@ -152,9 +154,19 @@ export function contextNames(...texts: string[]): Set<string> {
     for (const m of text.matchAll(/[A-Za-z_$][\w$]*/g)) {
       out.add(m[0]);
     }
-    for (const m of text.matchAll(/[\w.$-]+(?:\/[\w.$-]+)+|[\w$-]+\.[A-Za-z0-9]{1,5}\b/g)) {
-      out.add(m[0]);
-      out.add(m[0].slice(m[0].lastIndexOf("/") + 1));
+    // パス・ファイル名は空白などで区切った語ごとに見る(長い1語でも時間がかからないように)
+    for (const word of text.split(/[^\w.$/-]+/)) {
+      const w = word.replace(/^[./-]+|[./-]+$/g, "");
+      if (!w.includes("/") && !/\.[A-Za-z0-9]{1,5}$/.test(w)) {
+        continue;
+      }
+      out.add(w);
+      const segs = w.split("/");
+      out.add(segs[segs.length - 1]!);
+      // 親のフォルダも(「`src/core` の〜」のように書けるように)
+      for (let i = 1; i < segs.length; i++) {
+        out.add(segs.slice(0, i).join("/"));
+      }
     }
   }
   return out;
@@ -171,10 +183,31 @@ export function nameExists(name: string, names: NameCheck, draft = "", context?:
   }
   if (bare.includes("/") || (FILE_EXT.test(bare) && !/\s/.test(bare))) {
     const base = bare.slice(bare.lastIndexOf("/") + 1);
+    if (!FILE_EXT.test(bare) && !names.hasPath(bare)) {
+      // 拡張子もフォルダとしての一致も無い a/b(true/false・ON/OFF など)はコードの名前として扱わない
+      return true;
+    }
     return names.hasPath(bare) && (!context || context.has(bare) || context.has(base));
   }
   const parts = bare.split(/[^A-Za-z0-9_$]+/).filter((p) => p.length >= 2);
   return parts.every((p) => draft.includes(p) || (names.knowsWord(p) && (!context || context.has(p))));
+}
+
+/** 利用者の文に、索引に実在する名前が入っているか(記録用。製品名・部分の無い語は数えず、大文字小文字の違いは許す) */
+export function mentionsCodeName(text: string, names: NameCheck): boolean {
+  // 小文字だけで書いた名前(indexmanager など)も、普通の英単語と紛れにくい長さなら数える
+  const plain = (text.replace(/`[^`]*`/g, " ").match(/\b[A-Za-z_$][\w$]{5,}\b/g) ?? []).filter((w) => !isCodeLike(w));
+  return [...codeNames(text), ...plain].some((name) => {
+    const bare = name.replace(/\(\)$/, "");
+    if (COMMON_NAMES.has(bare.toLowerCase())) {
+      return false;
+    }
+    if (bare.includes("/") || FILE_EXT.test(bare)) {
+      return names.hasPath(bare);
+    }
+    const parts = bare.split(/[^A-Za-z0-9_$]+/).filter((p) => p.length >= 2);
+    return parts.length > 0 && parts.every((p) => names.knowsWord(p, false));
+  });
 }
 
 /** 文の中の、索引に無い(context を渡したときは文脈に無い)名前 */
@@ -188,10 +221,15 @@ export function unknownNames(text: string, names: NameCheck, draft = "", context
 const RESULT_WORDS =
   /ように|になる|になって|にする|にして|にしたい|表示|返す|返る|返して|出す|出る|出して|保存|される|されない|できる|できない|しない|止ま|止め|残す|残る|消え|増え|減|追加|加え|足し|入れ|作り|作成|削除|消し|消す|外し|置き換|分け|まとめ|\b(show|return|save|add|remove|delete|create|rename)\b/i;
 /** 読み解きの依頼で「何を知りたいか」が書かれているとみなす言い回し */
-const VIEWPOINT_WORDS = /どう|どこ|なぜ|何を|なに|何が|何の|流れ|呼ばれ|呼び出|仕組み|役割|違い|いつ|どの|どんな|理由|意味|使われ|使い方|\b(how|where|why|what|when|which)\b/i;
+const VIEWPOINT_WORDS =
+  /どう|どこ|なぜ|何を|なに|何が|何の|流れ|フロー|処理|動き|動作|挙動|構造|関係|呼ばれ|呼び出|仕組み|役割|違い|いつ|どの|どんな|理由|意味|使われ|使い方|\b(how|where|why|what|when|which|flow)\b/i;
 
-/** 「〜したい」の形でも、知る・読むための言い回し(読み解きの質問) */
-const READ_WISH = /(知り|理解し|読み|読み解き|確認し|調べ|把握し|見)たい/;
+/** 願いや頼みの形でも、知る・読むための言い回し(読み解きの質問) */
+const READ_WISH = /(知り|理解し|読み|読み解き|確認し|調べ|把握し|見)たい|(教え|説明し|解説し|調べ|見せ|示し)て(ください|ほしい|欲しい|もらえ|くれ)/;
+/** 変更の依頼とはっきり分かる言い回し */
+const CLEAR_CHANGE = /追加|削除|変更|修正|実装|作成|置き換|ように(したい|して|する)|にしたい|を直|直したい|\b(add|remove|delete|fix|implement|change|create)\b/i;
+/** 読み解きの質問とはっきり分かる言い回し */
+const CLEAR_READ = /[?？]|どう|なぜ|どこ|何を|教えて|説明して|解説して|知りたい|理解したい|\b(how|why|where)\b/i;
 
 /**
  * 書きかけが変更の依頼か読み解きの質問か(進め方が決まっていればそれに従う)。
@@ -201,10 +239,14 @@ export function draftIntent(draft: string, mode: QuizMode): "read" | "change" {
   if (mode !== "auto") {
     return mode;
   }
+  if (READ_WISH.test(draft) && !CLEAR_CHANGE.test(draft)) {
+    return "read";
+  }
   if (detectIntent(draft) === "change") {
     return "change";
   }
-  return /(し|って|て)(たい|ほしい|欲しい|ください)/.test(draft) && !READ_WISH.test(draft) ? "change" : "read";
+  // 「並べ替えたい」「止めたい」「〜てほしい」のような願いの形は、知る・読むための言い回しでなければ変更の依頼
+  return /たい|ほしい|欲しい|ください/.test(draft) && !READ_WISH.test(draft) ? "change" : "read";
 }
 
 /**
@@ -311,8 +353,9 @@ export function stripEcho(draft: string, completion: string): string {
     c = c.slice(d.length);
   } else {
     // 書きかけの末尾をそのまま繰り返した(3文字以下の重なりは偶然の一致がありうるので残す)
+    // 重なりの直後が英数字の続き(the → theme など)なら、繰り返しではなく別の語なので削らない
     for (let k = Math.min(d.length, c.length); k >= 4; k--) {
-      if (d.endsWith(c.slice(0, k))) {
+      if (d.endsWith(c.slice(0, k)) && !/[A-Za-z0-9_]/.test(c.charAt(k))) {
         c = c.slice(k);
         break;
       }
@@ -327,16 +370,25 @@ export function stripEcho(draft: string, completion: string): string {
 
 /** 書きかけがすでに示している依頼の種類(問いのしるし・依頼の言い回しが無ければ undefined) */
 function shownIntent(draft: string): "read" | "change" | undefined {
-  if (draftIntent(draft, "auto") === "change") {
-    return "change";
+  if (CLEAR_READ.test(draft) || READ_WISH.test(draft)) {
+    return CLEAR_CHANGE.test(draft) ? undefined : "read";
   }
-  return /[?？]|どう|なぜ|どこ|何を|なに|いつ|どの|どんな/.test(draft) || READ_WISH.test(draft) ? "read" : undefined;
+  return CLEAR_CHANGE.test(draft) || draftIntent(draft, "auto") === "change" ? "change" : undefined;
 }
 
-/** 候補が、書きかけ(または進め方)の示す依頼の種類を逆にするか */
+/**
+ * 候補が、書きかけ(または進め方)の示す依頼の種類を逆にするか。
+ * 言い回しの判定は自然な文で両方向に誤るので、逆の種類をはっきり示す言い回しを候補が新しく足したときだけとする
+ */
 function flipsIntent(draft: string, completion: string, mode: QuizMode): boolean {
   const before = mode === "auto" ? shownIntent(draft) : mode;
-  return before !== undefined && draftIntent(draft + completion, "auto") !== before;
+  if (before === "read") {
+    return CLEAR_CHANGE.test(completion);
+  }
+  if (before === "change") {
+    return CLEAR_READ.test(completion) || READ_WISH.test(completion);
+  }
+  return false;
 }
 
 /** 別の依頼を足す言い回し */
@@ -548,10 +600,10 @@ export function parseRefine(
   mode: QuizMode,
   names: NameCheck,
   context?: Set<string>,
-): { proposal?: RefineProposal; problems: string[] } {
+): { proposal?: RefineProposal; problems: string[]; nameProblems: string[] } {
   const instruction = str(raw?.instruction).replace(/\s*\n+\s*/g, " ");
   if (!instruction) {
-    return { problems: ["instruction が空です。"] };
+    return { problems: ["instruction が空です。"], nameProblems: [] };
   }
   const problems: string[] = [];
   if (instruction.length > MAX_INSTRUCTION_CHARS) {
@@ -561,8 +613,18 @@ export function parseRefine(
     problems.push("書きかけに無い数値が入っています。利用者が決めることなので「〔…〕」にして questions で尋ねてください。");
   }
   const unknown = unknownNames(instruction, names, draft, context);
-  if (unknown.length > 0) {
-    problems.push(`コードに無い名前があります: ${unknown.join(", ")}。【構成】【候補】にある実在の名前に直すか、名前を使わずに書いてください。`);
+  const nameProblems =
+    unknown.length > 0 ? [`コードに無い名前があります: ${unknown.join(", ")}。【構成】【候補】にある実在の名前に直すか、名前を使わずに書いてください。`] : [];
+  // 意図を守る規則(続きの候補と同じ): 〔 〕の外で、書きかけに無い条件・別の依頼・「」の文言を足さない
+  const fixed = instruction.replace(/〔[^〔〕]*〕/g, "");
+  if (newWords(CONDITION_WORDS, draft, fixed)) {
+    problems.push("書きかけに無い条件(「〜とき」「〜以上」など)が入っています。条件は利用者が決めることなので「〔…〕」にして questions で尋ねてください。");
+  }
+  if (EXTRA_REQUEST.test(fixed) && !EXTRA_REQUEST.test(draft)) {
+    problems.push("書きかけに無い別の依頼(「あわせて」「さらに」など)が入っています。依頼は1つのまま整えてください。");
+  }
+  if ((fixed.match(/「[^」]+」/g) ?? []).some((q) => !draft.includes(q.slice(1, -1)))) {
+    problems.push("書きかけに無い画面の文言(「」で囲んだ文)が入っています。「〔…〕」にして questions で尋ねてください。");
   }
   const intent = raw?.intent === "read" || raw?.intent === "change" ? raw.intent : draftIntent(instruction, mode);
   const kinds = new Set<string>(Object.keys(PART_LABEL));
@@ -590,6 +652,16 @@ export function parseRefine(
       break;
     }
   }
+  const shown = mode === "auto" && !/〔したいこと〕/.test(instruction) ? shownIntent(draft) : undefined;
+  if (shown && shown !== intent) {
+    problems.push(
+      shown === "read" ? "書きかけは読み解きの質問です。変更の依頼にせず、質問のまま整えてください。" : "書きかけは変更の依頼です。質問にせず、変更の依頼のまま整えてください。",
+    );
+  }
+  if (intent === "read" && questions.some((q) => !new RegExp(`[((][^()()]*${q.slot.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}[^()()]*[))]`).test(instruction))) {
+    // 答えないときに〔 〕を除けるよう、読み解きの〔 〕は文末の補足に置かせる
+    problems.push("読み解きの質問の「〔…〕」は、「(特に〔知りたいこと〕)」のように文末の括弧の補足に置いてください。");
+  }
   if (mode === "read" && intent === "change") {
     problems.push("進め方は「仕組みを読み解く」です。変更の依頼ではなく、読み解きの質問に整えてください。");
   } else if (mode === "change" && intent === "read") {
@@ -600,7 +672,7 @@ export function parseRefine(
   } else if (intent === "read" && detectIntent(instruction.replace(/〔[^〔〕]*〕/g, "")) === "change") {
     problems.push("読み解きの質問に、変更の依頼と受け取られる言い回し(追加・変更・修正・〜したい など)が入っています。問いの形(「〜はどう動く?」)にしてください。");
   }
-  return { proposal: { instruction, intent, parts, questions, unknownNames: unknown, nameRefs: [] }, problems };
+  return { proposal: { instruction, intent, parts, questions, unknownNames: unknown, nameRefs: [] }, problems, nameProblems };
 }
 
 // ---------- 状態(結果の記憶・間隔・記録) ----------
@@ -718,6 +790,8 @@ export class PromptAssistant {
   private readonly durations: number[] = [];
   /** 候補を表示できなかった自動の呼び出しが続いた数 */
   private callsWithoutShow = 0;
+  /** 読めない応答が続いた数 */
+  private unreadable = 0;
 
   constructor(private readonly deps: AssistantDeps) {}
 
@@ -778,6 +852,7 @@ export class PromptAssistant {
     this.failures = 0;
     this.durations.length = 0;
     this.callsWithoutShow = 0;
+    this.unreadable = 0;
     if (fromToggle) {
       this.update((s) => {
         s.unusedStreak = 0;
@@ -787,6 +862,7 @@ export class PromptAssistant {
 
   private onSuccess(ms: number): void {
     this.failures = 0;
+    this.unreadable = 0;
     this.pausedUntil = 0;
     this.durations.push(ms);
     if (this.durations.length > 3) {
@@ -814,7 +890,8 @@ export class PromptAssistant {
     // 手がかりから文書(README・CHANGELOG など)を除く。日本語の書きかけでは文書が上位を占め、名前の手がかりにならない
     const hits = index?.hasChunks() ? index.lexicalSearch(draft, LEADS * 3).filter((h) => !DOC_FILE.test(h.chunk.file)).slice(0, LEADS) : [];
     const leads = leadsText(hits);
-    return { repoMap, recent: this.load().recent, leads, names: contextNames(repoMap, leads, draft) };
+    const recent = this.load().recent;
+    return { repoMap, recent, leads, names: contextNames(repoMap, leads, draft, ...recent) };
   }
 
   private suppress(reason: string, missing: string[] = []): CompletionOutcome {
@@ -901,18 +978,30 @@ export class PromptAssistant {
         maxOutputTokens: 200,
         retries: 0,
       });
-      this.onSuccess(this.now() - started);
-      const raw = parseJson<{ completion?: unknown }>(res.content);
-      const completion = stripEcho(draft, typeof raw.completion === "string" ? raw.completion : "");
-      const reason = res.finishReason === "length" ? "truncated" : rejectCompletion(draft, completion, mode, names, ctx.names);
-      outcome = reason ? this.suppress(reason, missing) : { completion, missing };
+      if (res.finishReason === "length") {
+        // 出力の上限で切れた(途中の JSON は読めない)
+        this.onSuccess(this.now() - started);
+        outcome = this.suppress("truncated", missing);
+      } else {
+        const raw = parseJson<{ completion?: unknown }>(res.content);
+        this.onSuccess(this.now() - started);
+        const completion = stripEcho(draft, typeof raw.completion === "string" ? raw.completion : "");
+        const reason = rejectCompletion(draft, completion, mode, names, ctx.names);
+        outcome = reason ? this.suppress(reason, missing) : { completion, missing };
+      }
       this.callsWithoutShow = outcome.completion ? 0 : this.callsWithoutShow + 1;
     } catch (error) {
       if (controller.signal.aborted) {
         return { completion: "", reason: "aborted", missing: [] };
       }
       // 失敗(互換エンドポイントの非対応・ネットワーク・読めない応答)は、候補を出さないだけにする。続けば止める
-      if (!(error instanceof SyntaxError)) {
+      this.callsWithoutShow++;
+      if (error instanceof SyntaxError) {
+        // 読めない応答が続く(JSON スキーマに従わないモデル・エンドポイント)なら、設定の問題として止める
+        if (++this.unreadable >= 3) {
+          this.stopped = "config";
+        }
+      } else {
         this.onFailure(error);
       }
       return this.suppress("error", missing);
@@ -956,12 +1045,12 @@ export class PromptAssistant {
       } catch {
         raw = undefined;
       }
-      const { proposal, problems } = parseRefine(raw, draft, mode, names, index ? ctx.names : undefined);
+      const parsed = parseRefine(raw, draft, mode, names, index ? ctx.names : undefined);
+      const proposal = parsed.proposal;
+      // 索引が無い間は名前を確かめられないので、名前の指摘だけは作り直しの理由にしない(見つからなかった名前として示す)
+      const problems = index ? [...parsed.nameProblems, ...parsed.problems] : parsed.problems;
       if (proposal && index) {
         proposal.nameRefs = addedNameRefs(proposal.instruction, draft, index);
-      }
-      if (proposal && !index) {
-        return proposal;
       }
       if (proposal) {
         last = proposal;
@@ -984,7 +1073,7 @@ export class PromptAssistant {
   recordSend(query: string, assist: SendAssist): void {
     const assisted = assist.accepted > 0 || assist.refined;
     const index = this.deps.index();
-    const named = !!index && codeNames(query).some((n) => nameExists(n, index));
+    const named = !!index && mentionsCodeName(query, index);
     this.cancel();
     this.lastSend = { query, assisted };
     this.update((s) => {
