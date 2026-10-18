@@ -136,6 +136,11 @@
           "default": true,
           "description": "実装の手順を作るとき、ワークスペースの tsconfig.json / jsconfig.json を使って型検査し、変更で新しく生じた型エラーも確認事項にする(信頼済みのワークスペースではその TypeScript、それ以外は VS Code 同梱の TypeScript を使用)。"
         },
+        "quizSupport.inputAssist": {
+          "type": "boolean",
+          "default": true,
+          "description": "入力中の候補。入力が止まったときに、書きかけの続き(OpenAI API で作る)と関数名・ファイル名(索引から)の候補を薄い文字で表示し、Tab で入れられるようにします。続きの候補を作るため、送信前の書きかけ・最近の依頼・コードの構成と関連する場所を API に送ります。テストモードの間は表示しません。オフにしても「依頼を整える」は使えます(サイドバーの「設定」→「入力中の候補」でも切り替えられます)。"
+        },
         "quizSupport.testCommand": {
           "type": "string",
           "default": "",
