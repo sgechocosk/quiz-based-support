@@ -75,6 +75,6 @@ test("決めることの答えを入れる: 答えたものは置き換え、答
   const read = "`IndexManager` の更新はどう流れる?(特に〔知りたいこと〕)";
   assert.equal(ui.composeInstruction(read, [{ slot: "〔知りたいこと〕" }], [undefined], false, "read"), "`IndexManager` の更新はどう流れる?");
   assert.equal(ui.composeInstruction(read, [{ slot: "〔知りたいこと〕" }], [{ text: "呼び出し元" }], false, "read"), "`IndexManager` の更新はどう流れる?(特に呼び出し元)");
-  assert.equal(ui.composeInstruction("〔対象〕の流れはどう動く?", [], [], false, "read"), "の流れはどう動く?");
+  assert.equal(ui.composeInstruction("〔対象〕の流れはどう動く?", [], [], false, "read"), `対象${ui.UNDECIDED}の流れはどう動く?`, "文の中の〔 〕は除かない");
   assert.equal(ui.composeInstruction("〔したいこと〕", [{ slot: "〔したいこと〕" }], [undefined], false, "read"), `したいこと${ui.UNDECIDED}`);
 });

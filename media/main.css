@@ -270,7 +270,9 @@ details.lesson-step > .card-foot { padding: 0 8px 8px 32px; }
 button.name-chip { padding: 0 6px; font-family: var(--code-font); font-size: 11px; background: var(--vscode-badge-background); color: var(--vscode-badge-foreground); }
 button.name-chip:hover:not(:disabled) { background: var(--vscode-badge-background); outline: 1px solid var(--accent); }
 .sr-only { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; }
-.refine-card { border: 1px solid var(--border); border-left: 3px solid var(--accent); border-radius: var(--radius); background: var(--card-bg); padding: 6px 8px; display: flex; flex-direction: column; gap: 6px; max-height: 45vh; overflow-y: auto; }
+.refine-card { border: 1px solid var(--border); border-left: 3px solid var(--accent); border-radius: var(--radius); background: var(--card-bg); padding: 6px 8px; display: flex; flex-direction: column; gap: 6px; max-height: 40vh; overflow-y: auto; }
+/* カードを開いている間は入力欄の高さを抑え、送信の行と会話が画面から押し出されないようにする */
+#input-area:has(#assist-box:not(.hidden)) #query-mirror { max-height: 20vh; }
 .refine-head { display: flex; align-items: center; justify-content: space-between; gap: 6px; }
 .refine-body { display: flex; flex-direction: column; gap: 6px; }
 .refine-text { white-space: pre-wrap; padding: 4px 6px; border: 1px dashed var(--subtle-border); border-radius: var(--radius); }

@@ -162,9 +162,8 @@
     }
     const undecided = (text) => text.replace(/〔([^〔〕]+)〕/g, (_m, inner) => `${inner}${UNDECIDED}`);
     if (intent === "read") {
-      const removed = out
-        .replace(/[((][^()()〔〕]*〔[^〔〕]+〕[^()()〔〕]*[))]/g, "")
-        .replace(/〔[^〔〕]+〕/g, "")
+      // 括弧の補足に入った〔 〕だけを除く。文の中の〔 〕は除くと主語や目的語が抜けるので「まだ決めていない」にする
+      const removed = undecided(out.replace(/[((][^()()〔〕]*〔[^〔〕]+〕[^()()〔〕]*[))]/g, ""))
         .replace(/[ \t]{2,}/g, " ")
         .replace(/[、,]\s*(?=[。?？!！]|$)/g, "")
         .trim();
