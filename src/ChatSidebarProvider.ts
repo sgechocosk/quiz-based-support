@@ -351,7 +351,7 @@ export class ChatSidebarProvider
     </div>
     <label class="setting setting-toggle">
       <input type="checkbox" id="input-assist">
-      <div class="setting-text"><div class="setting-name">入力中の候補</div><div class="muted">入力が止まったときに、書きかけの続きや関数名の候補を薄い文字で出します(Tab で入れる)。続きの候補を作るため、書きかけと関連するコードの場所を OpenAI API に送ります。オフにしても「依頼を整える」は使えます。</div><div id="input-assist-test" class="muted hidden">テストモードの間は出しません。</div><div id="input-assist-note" class="warn hidden"></div></div>
+      <div class="setting-text"><div class="setting-name">入力中の候補</div><div class="muted">入力が止まったときに、書きかけの続きや関数名の候補を薄い文字で出します(Tab で入れる)。続きの候補を作るため、送信前の書きかけ・最近の依頼・コードの構成(ファイルと主な名前)・関連する場所を OpenAI API に送ります。オフにしても「依頼を整える」は使えます。</div><div id="input-assist-test" class="muted hidden">テストモードの間は出しません。</div><div id="input-assist-note" class="warn hidden"></div></div>
     </label>
     <label class="setting setting-toggle" title="開発・検証向けの表示です">
       <input type="checkbox" id="test-mode">
@@ -626,6 +626,8 @@ export class ChatSidebarProvider
           await vscode.commands.executeCommand("quiz-based-support.setApiKey");
           break;
         case "ask":
+          // 送ったら、整えている途中の依頼は要らない
+          this.refineAbort?.abort();
           this.assistant?.recordSend(String(m.query ?? "").trim(), sendAssistFrom(m.assist));
           await this.handleAsk(String(m.query ?? ""), this.coerceMode(m.mode));
           break;
@@ -644,17 +646,24 @@ export class ChatSidebarProvider
         case "refine":
           await this.handleRefine(m);
           break;
-        case "setInputAssist":
+        case "refineCancel":
+          this.refineAbort?.abort();
+          break;
+        case "setInputAssist": {
           this.assistant?.resetPause(true);
-          await vscode.workspace
-            .getConfiguration("quizSupport")
-            .update(
-              "inputAssist",
-              m.value === true,
-              vscode.ConfigurationTarget.Global,
-            );
+          // ワークスペースの設定で決めていれば、そちらを書き換える(ユーザー設定だけ変えても効かないため)
+          const c = vscode.workspace.getConfiguration("quizSupport");
+          const i = c.inspect<boolean>("inputAssist");
+          const target =
+            i?.workspaceFolderValue !== undefined
+              ? vscode.ConfigurationTarget.WorkspaceFolder
+              : i?.workspaceValue !== undefined
+                ? vscode.ConfigurationTarget.Workspace
+                : vscode.ConfigurationTarget.Global;
+          await c.update("inputAssist", m.value === true, target);
           await this.pushState();
           break;
+        }
         case "clarifyAnswer":
           await this.handleClarifyAnswer(m);
           break;
@@ -691,6 +700,7 @@ export class ChatSidebarProvider
           break;
         case "cancel":
           this.abort?.abort();
+          this.refineAbort?.abort();
           break;
         case "grade":
           await this.handleGrade(m);
@@ -729,6 +739,8 @@ export class ChatSidebarProvider
           break;
         case "resetLog":
           await this.log.reset();
+          // 入力補助の最近の依頼と記録も消す
+          this.assistant?.reset();
           await this.pushState();
           break;
       }
@@ -752,7 +764,7 @@ export class ChatSidebarProvider
       this.post({ type: "suggestion", id, draft, completion, missing });
     const cfg = readConfig();
     const assistant = this.assistant;
-    if (!cfg.inputAssist || cfg.testMode || !this.apiKey || !assistant || !this.view?.visible) {
+    if (!cfg.inputAssist || cfg.testMode || this.busy || !this.apiKey || !assistant || !this.view?.visible) {
       reply("", []);
       return;
     }
@@ -793,6 +805,10 @@ export class ChatSidebarProvider
     const draft = String(m.draft ?? "").trim();
     const fail = (text: string) => this.post({ type: "refined", id, draft, error: text });
     if (!draft) {
+      return;
+    }
+    if (draft.length > 2000) {
+      fail("書きかけが長すぎます(2000文字まで)。ログやコードは要点だけにしてから整えてください。");
       return;
     }
     if (!this.apiKey) {
