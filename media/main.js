@@ -30,7 +30,14 @@
   const messages = $("messages");
   const live = $("live");
   const jumpBtn = $("jump-latest");
-  const queryInput = /** @type {HTMLInputElement} */ ($("query"));
+  const queryInput = /** @type {HTMLTextAreaElement} */ ($("query"));
+  const queryMirror = $("query-mirror");
+  const assistLine = $("assist-line");
+  const assistBox = $("assist-box");
+  const assistSr = $("assist-sr");
+  const refineBtn = /** @type {HTMLButtonElement} */ ($("btn-refine"));
+  /** media/assist.js(入力補助の、画面に依存しない処理) */
+  const A = /** @type {any} */ (window).QbsAssist;
   const sendBtn = /** @type {HTMLButtonElement} */ ($("btn-send"));
   const cancelBtn = $("btn-cancel");
   const modeSelect = /** @type {HTMLSelectElement} */ ($("mode"));
@@ -214,6 +221,8 @@
 
   const testMode = /** @type {HTMLInputElement} */ ($("test-mode"));
   testMode.addEventListener("change", () => vscode.postMessage({ type: "setTestMode", value: testMode.checked }));
+  const inputAssistToggle = /** @type {HTMLInputElement} */ ($("input-assist"));
+  inputAssistToggle.addEventListener("change", () => vscode.postMessage({ type: "setInputAssist", value: inputAssistToggle.checked }));
 
   function renderState() {
     const s = state;
@@ -223,6 +232,20 @@
     queryInput.disabled = !ready;
     sendBtn.disabled = !ready;
     modeSelect.disabled = !ready;
+    refineBtn.disabled = !ready;
+    inputAssistToggle.checked = s.inputAssist !== false;
+    $("input-assist-test").classList.toggle("hidden", !s.testMode);
+    $("input-assist-note").textContent = s.assistNote || "";
+    $("input-assist-note").classList.toggle("hidden", !s.assistNote);
+    renderAssistStats(s.assistStats);
+    if (!ready || !s.assist || !s.assist.auto) {
+      // 処理中・設定でオフ・テストモードのときは、出している候補を消す
+      cancelSuggest();
+      if (!ready || !s.assist || !s.assist.names) {
+        clearGhost();
+        hideAssistLine();
+      }
+    }
     cancelBtn.classList.toggle("hidden", !s.busy);
     sendBtn.classList.toggle("hidden", !!s.busy);
     queryInput.placeholder = !s.hasWorkspace
@@ -1394,13 +1417,526 @@
       const line = (m.output || "").split("\n").find((l) => /error|fail|✘|not ok|expected/i.test(l)) || "";
       const fix = el("button", { class: "secondary", text: "失敗の内容で修正を依頼する(入力欄に下書き)" });
       fix.onclick = () => {
-        queryInput.value = `テスト(${m.command})が失敗したので直したい: ${line.trim().slice(0, 200)}`;
-        queryInput.focus();
+        insertDraft(`テスト(${m.command})が失敗したので直したい: ${line.trim().slice(0, 200)}`);
       };
       f.testBox.append(el("div", { class: "row" }, fix));
     }
     ensureVisible(f.testBox);
   }
+
+  // ---------- 入力補助(続きの候補・名前の補完・依頼を整える) ----------
+  //
+  // - 候補は入力欄に重ねた要素(#query-mirror)に薄い文字で描くだけで、入力の値には入れない(Enter は打った文だけを送る)
+  // - 受け入れは Tab(全部)と Ctrl/Alt/⌘+→(1語ずつ)。execCommand で入れるので Ctrl+Z で戻せる。入れた部分は次に打つまで下線で示す
+  // - IME の変換中・処理中・カーソルが末尾でないときは出さない。Esc で消した書きかけには出し直さない
+  // - 続きの候補が無いときは、足すと伝わりやすくなることと「依頼を整える」を示す(API を使わない)
+
+  const assist = {
+    /** 候補を出したときの入力と、その続き(薄い文字) */
+    base: "",
+    ghost: "",
+    /** "llm": 続きの候補 / "name": 名前の補完 */
+    kind: "",
+    /** 名前の補完で前方一致した名前 */
+    names: /** @type {string[]} */ ([]),
+    composing: false,
+    /** @type {ReturnType<typeof setTimeout> | undefined} */
+    timer: undefined,
+    reqId: 0,
+    nameReqId: 0,
+    refineId: 0,
+    /** 続きの候補を求めて、まだ届いていない */
+    waiting: false,
+    /** Esc で消した書きかけ */
+    dismissed: "",
+    /** 直前に受け入れた範囲 */
+    accepted: /** @type {{ start: number, end: number } | null} */ (null),
+    /** 受け入れで入力欄を書き換えている間(input イベントを入力の変化として扱わない) */
+    inserting: false,
+    /** 送るまでに続きの候補を表示した・使った回数と、整えた依頼を入れたか(送るときにホストへ渡す) */
+    shown: 0,
+    used: 0,
+    refined: false,
+  };
+
+  const PART_LABEL = { location: "場所", behavior: "どうなってほしいか", condition: "どんなとき", scope: "変えないもの", target: "対象", viewpoint: "知りたいこと" };
+
+  function caretAtEnd() {
+    const len = queryInput.value.length;
+    return queryInput.selectionStart === len && queryInput.selectionEnd === len;
+  }
+
+  /** 入力の内容と候補を重ねた要素に写す(入力欄の高さもこの要素で決まる) */
+  function renderMirror() {
+    const value = queryInput.value;
+    const parts = [];
+    const acc = assist.accepted;
+    if (acc && acc.end <= value.length && acc.start < acc.end) {
+      parts.push(
+        document.createTextNode(value.slice(0, acc.start)),
+        el("span", { class: "accepted", text: value.slice(acc.start, acc.end) }),
+        document.createTextNode(value.slice(acc.end)),
+      );
+    } else {
+      parts.push(document.createTextNode(value));
+    }
+    const show = !!assist.ghost && !assist.composing && !queryInput.disabled && document.activeElement === queryInput && caretAtEnd();
+    if (show) {
+      parts.push(el("span", { class: "ghost", text: assist.ghost }));
+      parts.push(el("span", { class: "ghost-key", text: assist.kind === "name" && assist.names.length > 1 ? `Tab ・ 他${assist.names.length - 1}件` : "Tab" }));
+    }
+    // 末尾が改行のときも、その行の高さを取る
+    parts.push(document.createTextNode("\u200b"));
+    queryMirror.replaceChildren(...parts);
+    queryMirror.scrollTop = queryInput.scrollTop;
+  }
+
+  function clearGhost() {
+    assist.ghost = "";
+    assist.kind = "";
+    assist.names = [];
+    renderMirror();
+  }
+
+  function hideAssistLine() {
+    assistLine.replaceChildren();
+    assistLine.classList.add("hidden");
+  }
+
+  /** 求めている続きの候補を取り消す(遅れて届いても使わない) */
+  function cancelSuggest() {
+    clearTimeout(assist.timer);
+    assist.timer = undefined;
+    if (assist.waiting) {
+      assist.waiting = false;
+      assist.reqId++;
+      vscode.postMessage({ type: "suggestCancel" });
+    }
+  }
+
+  function assistReady() {
+    return !!state.assist && state.hasKey && state.hasWorkspace && !state.busy && !queryInput.disabled;
+  }
+
+  /** 入力が変わったとき: 打った文字が候補と同じなら候補を縮め、違えば消して、名前の補完か続きの候補を求める */
+  function onDraftChanged() {
+    if (assist.inserting) {
+      return;
+    }
+    assist.accepted = null;
+    const value = queryInput.value;
+    if (!value.trim()) {
+      // 書きかけを消した: この依頼で候補を表示した・使った数を数え直す
+      assist.shown = 0;
+      assist.used = 0;
+      assist.refined = false;
+    }
+    if (assist.ghost) {
+      const rest = A.consume(assist.base, assist.ghost, value);
+      if (rest && caretAtEnd()) {
+        assist.base = value;
+        assist.ghost = rest;
+        renderMirror();
+        return;
+      }
+      if (rest === "" && assist.kind === "llm") {
+        // 候補と同じ文を最後まで打った
+        assist.used++;
+      }
+      assist.ghost = "";
+      assist.kind = "";
+      assist.names = [];
+    }
+    cancelSuggest();
+    hideAssistLine();
+    renderMirror();
+    if (!assistReady() || assist.composing || !caretAtEnd()) {
+      return;
+    }
+    const ident = state.assist.names ? A.identifierBefore(value, value.length) : undefined;
+    if (ident) {
+      // 名前を打っている途中は、続きの候補を求めない
+      vscode.postMessage({ type: "completeName", id: ++assist.nameReqId, prefix: ident.prefix });
+      return;
+    }
+    scheduleSuggest();
+  }
+
+  /** 入力が止まったら続きの候補を求める */
+  function scheduleSuggest() {
+    clearTimeout(assist.timer);
+    const value = queryInput.value;
+    // 「依頼を整える」のカードを開いている間は、そちらで決めているので続きの候補を出さない
+    if (!state.assist.auto || A.meaningfulLength(value) < 5 || value === assist.dismissed || !assistBox.classList.contains("hidden")) {
+      return;
+    }
+    assist.timer = setTimeout(() => {
+      assist.timer = undefined;
+      if (!assistReady() || !state.assist.auto || assist.composing || document.hidden || document.activeElement !== queryInput || !caretAtEnd() || queryInput.value !== value || !assistBox.classList.contains("hidden")) {
+        return;
+      }
+      assist.waiting = true;
+      vscode.postMessage({ type: "suggest", id: ++assist.reqId, draft: value, mode: modeSelect.value });
+    }, state.assist.delayMs || 700);
+  }
+
+  function onSuggestion(m) {
+    if (m.id !== assist.reqId) {
+      return;
+    }
+    assist.waiting = false;
+    const value = queryInput.value;
+    if (!assistReady() || assist.composing || !caretAtEnd() || document.activeElement !== queryInput) {
+      return;
+    }
+    // 届くまでに打った文字が候補の先頭と同じなら、その分を縮めて出す
+    const ghost = m.completion ? (value === m.draft ? m.completion : A.consume(m.draft, m.completion, value) || "") : "";
+    if (ghost) {
+      assist.base = value;
+      assist.ghost = ghost;
+      assist.kind = "llm";
+      assist.names = [];
+      assist.shown++;
+      renderMirror();
+      assistSr.textContent = `続きの候補: ${ghost}(Tab で入れられます)`;
+      return;
+    }
+    if (value === m.draft && Array.isArray(m.missing) && m.missing.length > 0) {
+      showMissing(m.missing);
+    }
+  }
+
+  /** 続きの候補が無いとき(詰まったとき): 足すと伝わりやすくなることと、「依頼を整える」を示す */
+  function showMissing(missing) {
+    const btn = el("button", { class: "link", text: "依頼を整える", title: "書きかけの依頼を、調査と計画に伝わりやすい形に整えます(Ctrl+Enter)" });
+    btn.onclick = () => requestRefine();
+    assistLine.replaceChildren(el("span", { text: `足すと伝わりやすくなること: ${missing.join("・")}` }), btn);
+    assistLine.classList.remove("hidden");
+  }
+
+  function onNameCompletion(m) {
+    if (m.id !== assist.nameReqId || !caretAtEnd()) {
+      return;
+    }
+    const value = queryInput.value;
+    const ident = A.identifierBefore(value, value.length);
+    if (!ident || ident.prefix !== m.prefix) {
+      return;
+    }
+    const names = Array.isArray(m.names) ? m.names : [];
+    const g = A.nameGhost(m.prefix, names);
+    assist.names = names.filter((n) => n.startsWith(m.prefix) && n !== m.prefix);
+    if (g.text) {
+      assist.base = value;
+      assist.ghost = g.text;
+      assist.kind = "name";
+    }
+    renderMirror();
+    // 1つに決まらないときは、どの名前にするかを選べるように並べる
+    if (names.length > 1 || (!g.text && names.length > 0)) {
+      showNameChoices(ident, names, Number(m.total) || names.length, m.defs || {});
+    }
+  }
+
+  function showNameChoices(ident, names, total, defs) {
+    const row = el("span", { class: "name-choices" });
+    for (const name of names) {
+      const def = defs && defs[name];
+      const b = el("button", { class: "name-chip", text: name, title: def ? `${def.path}:${def.line}` : "この名前を入れる" });
+      // 入力欄のフォーカスを保つ
+      b.addEventListener("mousedown", (e) => e.preventDefault());
+      b.onclick = () => {
+        replaceRange(ident.start, ident.start + ident.prefix.length, name, "name");
+        clearGhost();
+        hideAssistLine();
+      };
+      row.append(b);
+    }
+    assistLine.replaceChildren(el("span", { text: total > names.length ? `名前の候補(${total}件のうち${names.length}件):` : "名前の候補:" }), row);
+    assistLine.classList.remove("hidden");
+  }
+
+  /** 入力欄の [start, end) を text にする。execCommand で入れて Ctrl+Z で戻せるようにする */
+  function replaceRange(start, end, text, kind) {
+    queryInput.focus();
+    queryInput.setSelectionRange(start, end);
+    assist.inserting = true;
+    let done = false;
+    try {
+      done = document.execCommand("insertText", false, text);
+    } catch {
+      done = false;
+    }
+    if (!done) {
+      queryInput.setRangeText(text, start, end, "end");
+    }
+    assist.inserting = false;
+    assist.accepted = text ? { start, end: start + text.length } : null;
+    if (kind === "name") {
+      vscode.postMessage({ type: "nameAccepted" });
+    } else if (kind === "llm") {
+      assist.used++;
+    }
+    renderMirror();
+  }
+
+  /** 候補を受け入れる(all=false は1語だけ) */
+  function acceptGhost(all) {
+    const piece = all ? assist.ghost : A.nextSegment(assist.ghost);
+    const rest = assist.ghost.slice(piece.length);
+    const kind = assist.kind;
+    const end = queryInput.value.length;
+    assist.ghost = "";
+    replaceRange(end, end, piece, kind);
+    hideAssistLine();
+    if (rest && !all) {
+      assist.base = queryInput.value;
+      assist.ghost = rest;
+      assist.kind = kind;
+    } else {
+      assist.kind = "";
+      assist.names = [];
+    }
+    renderMirror();
+  }
+
+  /** 入力欄に文を入れる(書きかけがあれば、消さずに次の行へ足す) */
+  function insertDraft(text) {
+    const value = queryInput.value;
+    if (value.trim()) {
+      replaceRange(value.length, value.length, (value.endsWith("\n") ? "" : "\n") + text, "");
+    } else {
+      replaceRange(0, value.length, text, "");
+    }
+    assist.accepted = null;
+    renderMirror();
+  }
+
+  function setQuery(text) {
+    queryInput.value = text;
+    assist.accepted = null;
+    assist.dismissed = "";
+    cancelSuggest();
+    clearGhost();
+    hideAssistLine();
+  }
+
+  // ---------- 依頼を整える ----------
+
+  function closeRefine() {
+    assistBox.replaceChildren();
+    assistBox.classList.add("hidden");
+  }
+
+  function refineCard(title) {
+    const close = el("button", { class: "icon-btn", text: "×", title: "閉じる", "aria-label": "閉じる" });
+    close.onclick = () => {
+      assist.refineId++;
+      closeRefine();
+      queryInput.focus();
+    };
+    const body = el("div", { class: "refine-body" });
+    const root = el("div", { class: "refine-card" }, el("div", { class: "refine-head" }, el("strong", { text: title }), close), body);
+    assistBox.replaceChildren(root);
+    assistBox.classList.remove("hidden");
+    return body;
+  }
+
+  function requestRefine() {
+    const draft = queryInput.value.trim();
+    if (!draft || queryInput.disabled) {
+      return;
+    }
+    cancelSuggest();
+    clearGhost();
+    hideAssistLine();
+    const id = ++assist.refineId;
+    refineCard("依頼を整える").append(el("div", { class: "muted", text: "書きかけの依頼を、調査と計画に伝わりやすい形に整えています..." }));
+    vscode.postMessage({ type: "refine", id, draft, mode: modeSelect.value });
+  }
+
+  /** 差の印(足した部分)と、決めることの〔 〕を付けて表示する(〔 〕は差の区切りをまたいでも1つにまとめる) */
+  function refineText(draft, text) {
+    /** @type {boolean[]} 文字ごとに、足した部分か */
+    const added = [];
+    for (const seg of A.diffSegments(draft, text)) {
+      added.push(...Array.from(seg.text, () => seg.added));
+    }
+    const chars = Array.from(text);
+    const nodes = [];
+    let i = 0;
+    for (const piece of text.split(/(〔[^〔〕]*〕)/)) {
+      const len = Array.from(piece).length;
+      if (!piece) {
+        continue;
+      }
+      if (/^〔[^〔〕]*〕$/.test(piece)) {
+        nodes.push(el("span", { class: "slot", text: piece }));
+      } else {
+        // 足した部分ごとにまとめて印を付ける
+        let start = i;
+        while (start < i + len) {
+          let end = start;
+          while (end < i + len && added[end] === added[start]) {
+            end++;
+          }
+          const run = chars.slice(start, end).join("");
+          nodes.push(added[start] ? el("mark", { class: "added", text: run }) : document.createTextNode(run));
+          start = end;
+        }
+      }
+      i += len;
+    }
+    return nodes;
+  }
+
+  function onRefined(m) {
+    if (m.id !== assist.refineId) {
+      return;
+    }
+    if (m.error || !m.proposal) {
+      refineCard("依頼を整える").append(el("div", { class: "warn-box", text: m.error || "依頼を整えられませんでした。" }));
+      return;
+    }
+    const p = m.proposal;
+    const body = refineCard("伝わりやすい依頼の案");
+    /** @type {Array<{ text: string } | undefined>} */
+    const answers = p.questions.map(() => undefined);
+    const preview = el("div", { class: "refine-text" });
+    const update = () => preview.replaceChildren(...refineText(m.draft, A.composeInstruction(p.instruction, p.questions, answers, true, p.intent)));
+    update();
+    body.append(preview);
+    if (p.parts.length > 0) {
+      const parts = el("div", { class: "refine-parts" }, el("span", { class: "muted", text: "補ったこと:" }));
+      for (const part of p.parts) {
+        parts.append(el("span", { class: "part-chip", title: part.text }, el("strong", { text: PART_LABEL[part.kind] || part.kind }), document.createTextNode(` ${part.text}`)));
+      }
+      body.append(parts);
+    }
+    if (p.nameRefs && p.nameRefs.length > 0) {
+      // 補った名前は、定義を開いて確かめられるようにする(知らない名前をそのまま受け入れないため)
+      const refs = el("div", { class: "refine-parts" }, el("span", { class: "muted", text: "補った名前(開いて確かめられます):" }));
+      for (const r of p.nameRefs) {
+        refs.append(codeLink(r.path, r.line, `${r.name}(${r.path}:${r.line})`));
+      }
+      body.append(refs);
+    }
+    if (p.unknownNames.length > 0) {
+      body.append(el("div", { class: "warn-box", text: `コードで見つからなかった名前: ${p.unknownNames.join(", ")}(確かめてから使ってください)` }));
+    }
+    p.questions.forEach((q, qi) => {
+      const set = el("fieldset", { class: "mcq clarify-q" }, el("legend", { text: `決めること ${qi + 1}` }), el("div", { class: "clarify-question", text: q.question }));
+      const name = `refine-${m.id}-${qi}`;
+      const note = el("input", { type: "text", class: "clarify-note", placeholder: "その他(自由に書く)" });
+      const pick = (text) => {
+        answers[qi] = text ? { text } : undefined;
+        update();
+      };
+      q.options.forEach((o) => {
+        const input = el("input", { type: "radio", name });
+        input.addEventListener("change", () => {
+          note.value = "";
+          pick(o.fill);
+        });
+        const label = el("span", { class: "clarify-option" }, el("strong", { text: o.label }), o.fill !== o.label ? el("span", { class: "muted", text: o.fill }) : null);
+        set.append(el("label", {}, input, label));
+      });
+      const later = el("input", { type: "radio", name });
+      later.checked = true;
+      later.addEventListener("change", () => {
+        note.value = "";
+        pick("");
+      });
+      // 読み解きの質問には送ったあとの確認が無いので、答えなければ文から外して、流れ・呼び出し元を中心に調べる
+      const laterLabel = p.intent === "read" ? ["おまかせ", "流れ・呼び出し元を中心に調べます"] : ["まだ決めない", "調べたあとの確認で決めます"];
+      set.append(el("label", {}, later, el("span", { class: "clarify-option" }, el("strong", { text: laterLabel[0] }), el("span", { class: "muted", text: laterLabel[1] }))));
+      note.addEventListener("input", () => {
+        later.checked = !note.value.trim();
+        set.querySelectorAll("input[type=radio]").forEach((r) => {
+          if (r !== later && note.value.trim()) {
+            /** @type {HTMLInputElement} */ (r).checked = false;
+          }
+        });
+        pick(note.value.trim());
+      });
+      set.append(note);
+      body.append(set);
+    });
+    const insert = el("button", { text: "入力欄に入れる" });
+    insert.onclick = () => {
+      const text = A.composeInstruction(p.instruction, p.questions, answers, false, p.intent);
+      replaceRange(0, queryInput.value.length, text, "refine");
+      assist.accepted = null;
+      assist.refined = true;
+      closeRefine();
+      renderMirror();
+    };
+    const close = el("button", { class: "secondary", text: "閉じる" });
+    close.onclick = () => {
+      closeRefine();
+      queryInput.focus();
+    };
+    const changed = queryInput.value.trim() !== m.draft;
+    body.append(
+      el(
+        "div",
+        { class: "card-foot" },
+        insert,
+        close,
+        el("span", { class: "muted", text: changed ? "整える間に入力欄が変わりました。入れると今の入力を置き換えます(Ctrl+Z で戻せます)。" : "入れたあとも書き直せます。Ctrl+Z で元に戻せます。" }),
+      ),
+    );
+  }
+
+  function renderAssistStats(st) {
+    const box = $("assist-stats");
+    box.classList.toggle("hidden", !st);
+    if (!st) {
+      return;
+    }
+    const avg = (sum, n) => (n > 0 ? (sum / n).toFixed(1) : "-");
+    const reasons = Object.entries(st.suppressed || {})
+      .sort((a, b) => b[1] - a[1])
+      .map(([k, v]) => `${k} ${v}`)
+      .join(", ");
+    const u = st.usage || { calls: 0, estimated: 0, actual: 0, output: 0 };
+    box.textContent = [
+      `入力補助の記録: 続きの候補 表示 ${st.shown} / 使用 ${st.accepted}・名前の補完 ${st.names}・依頼を整える ${st.refined}(入れた ${st.refineUsed})`,
+      `送った依頼 ${st.sends}(補助あり ${st.assistedSends})・名前を含む 補助あり ${st.namedAssisted} / なし ${st.namedUnassisted}`,
+      `調査の平均回数 補助あり ${avg(st.stepsAssisted, st.investigatedAssisted)} / なし ${avg(st.stepsUnassisted, st.investigatedUnassisted)}・要件の確認 ${st.clarifiedAssisted} / ${st.clarifiedUnassisted}・見つからず ${st.notFoundAssisted} / ${st.notFoundUnassisted}`,
+      `出さなかった理由: ${reasons || "なし"}`,
+      `入力補助の API: ${u.calls}回 / 入力 ${u.actual > 0 ? `${u.actual.toLocaleString()}(実測、うちキャッシュ ${(u.cached || 0).toLocaleString()})` : `約${u.estimated.toLocaleString()}`} / 出力 ${u.output.toLocaleString()} トークン`,
+    ].join("\n");
+  }
+
+  queryInput.addEventListener("compositionstart", () => {
+    assist.composing = true;
+    cancelSuggest();
+    renderMirror();
+  });
+  queryInput.addEventListener("compositionend", () => {
+    assist.composing = false;
+    onDraftChanged();
+  });
+  queryInput.addEventListener("input", (e) => {
+    if (assist.composing || /** @type {InputEvent} */ (e).isComposing) {
+      renderMirror();
+      return;
+    }
+    onDraftChanged();
+  });
+  for (const type of ["keyup", "click", "focus", "blur", "select"]) {
+    queryInput.addEventListener(type, () => renderMirror());
+  }
+  queryInput.addEventListener("scroll", () => {
+    queryMirror.scrollTop = queryInput.scrollTop;
+  });
+  modeSelect.addEventListener("change", () => {
+    cancelSuggest();
+    clearGhost();
+    hideAssistLine();
+  });
+  refineBtn.addEventListener("click", () => requestRefine());
 
   // ---------- 入出力 ----------
 
@@ -1410,14 +1946,47 @@
       return;
     }
     closeClarify("(新しい質問をしたため無効になりました)");
+    assist.refineId++;
+    closeRefine();
     addMessage("user", text);
-    queryInput.value = "";
-    vscode.postMessage({ type: "ask", query: text, mode: modeSelect.value });
+    const used = { shown: assist.shown, accepted: assist.used, refined: assist.refined };
+    assist.shown = 0;
+    assist.used = 0;
+    assist.refined = false;
+    setQuery("");
+    vscode.postMessage({ type: "ask", query: text, mode: modeSelect.value, assist: used });
   }
 
   sendBtn.addEventListener("click", send);
   queryInput.addEventListener("keydown", (e) => {
-    if (e.key === "Enter" && !e.isComposing) {
+    if (e.isComposing || e.keyCode === 229) {
+      return;
+    }
+    const ghostShown = !!assist.ghost && caretAtEnd();
+    if (e.key === "Tab" && ghostShown && !e.shiftKey && !e.ctrlKey && !e.altKey && !e.metaKey) {
+      e.preventDefault();
+      acceptGhost(true);
+      return;
+    }
+    if (e.key === "ArrowRight" && ghostShown && (e.ctrlKey || e.altKey || e.metaKey) && !e.shiftKey) {
+      e.preventDefault();
+      acceptGhost(false);
+      return;
+    }
+    if (e.key === "Escape" && (assist.ghost || !assistLine.classList.contains("hidden"))) {
+      e.preventDefault();
+      assist.dismissed = queryInput.value;
+      cancelSuggest();
+      clearGhost();
+      hideAssistLine();
+      return;
+    }
+    if (e.key === "Enter" && (e.ctrlKey || e.metaKey) && !e.shiftKey) {
+      e.preventDefault();
+      requestRefine();
+      return;
+    }
+    if (e.key === "Enter" && !e.shiftKey && !e.altKey) {
       e.preventDefault();
       send();
     }
@@ -1495,9 +2064,19 @@
         setLive("");
         renderCampaignDone(m);
         break;
+      case "suggestion":
+        onSuggestion(m);
+        break;
+      case "nameCompletion":
+        onNameCompletion(m);
+        break;
+      case "refined":
+        onRefined(m);
+        break;
     }
   });
 
   renderEmptyHint();
+  renderMirror();
   vscode.postMessage({ type: "ready" });
 })();

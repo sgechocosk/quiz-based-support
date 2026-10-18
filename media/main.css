@@ -252,8 +252,32 @@ details.lesson-step > .card-foot { padding: 0 8px 8px 32px; }
 
 /* ---------- 入力欄 ---------- */
 #input-area { flex-shrink: 0; display: flex; flex-direction: column; gap: 4px; padding-top: 6px; border-top: 1px solid var(--subtle-border); }
-#query { width: 100%; box-sizing: border-box; background: var(--vscode-input-background); color: var(--vscode-input-foreground); border: 1px solid var(--vscode-input-border, transparent); border-radius: 2px; padding: 5px 6px; outline: none; font-family: inherit; font-size: inherit; }
-#query:focus { border-color: var(--accent); }
+/*
+ * 入力欄: 高さは通常の流れに置いた #query-mirror で決め、その上に textarea を重ねる(JS で高さを計算しない)。
+ * mirror には入力と同じ文字(透明)と続きの候補(薄い文字)を描くので、両方の文字の折り返しをそろえる
+ */
+.query-wrap { position: relative; background: var(--vscode-input-background); border: 1px solid var(--vscode-input-border, transparent); border-radius: 2px; }
+.query-wrap:focus-within { border-color: var(--accent); }
+#query-mirror, #query { display: block; width: 100%; box-sizing: border-box; margin: 0; border: 0; padding: 5px 6px; font-family: inherit; font-size: inherit; font-weight: normal; line-height: 1.45; letter-spacing: normal; white-space: pre-wrap; overflow-wrap: break-word; word-break: normal; tab-size: 4; scrollbar-gutter: stable; }
+#query-mirror { min-height: calc(1.45em + 10px); max-height: 40vh; overflow: hidden; color: transparent; pointer-events: none; }
+#query { position: absolute; inset: 0; height: 100%; resize: none; overflow-y: auto; background: transparent; color: var(--vscode-input-foreground); outline: none; }
 #query::placeholder { color: var(--vscode-input-placeholderForeground); }
+#query-mirror .ghost { color: var(--vscode-editorGhostText-foreground, var(--vscode-input-placeholderForeground)); }
+#query-mirror .ghost-key { margin-left: 6px; padding: 0 4px; font-size: 10px; border: 1px solid var(--subtle-border); border-radius: 3px; color: var(--muted); white-space: nowrap; }
+#query-mirror .accepted { text-decoration: underline; text-decoration-color: var(--accent); text-underline-offset: 3px; }
+.assist-line { display: flex; flex-wrap: wrap; gap: 4px 6px; align-items: center; font-size: 12px; color: var(--muted); }
+.name-choices { display: inline-flex; flex-wrap: wrap; gap: 4px; }
+button.name-chip { padding: 0 6px; font-family: var(--code-font); font-size: 11px; background: var(--vscode-badge-background); color: var(--vscode-badge-foreground); }
+button.name-chip:hover:not(:disabled) { background: var(--vscode-badge-background); outline: 1px solid var(--accent); }
+.sr-only { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; }
+.refine-card { border: 1px solid var(--border); border-left: 3px solid var(--accent); border-radius: var(--radius); background: var(--card-bg); padding: 6px 8px; display: flex; flex-direction: column; gap: 6px; max-height: 45vh; overflow-y: auto; }
+.refine-head { display: flex; align-items: center; justify-content: space-between; gap: 6px; }
+.refine-body { display: flex; flex-direction: column; gap: 6px; }
+.refine-text { white-space: pre-wrap; padding: 4px 6px; border: 1px dashed var(--subtle-border); border-radius: var(--radius); }
+.refine-text mark.added { background: var(--ok-bg); color: inherit; border-radius: 2px; }
+.refine-text .slot { background: var(--warn-bg); border-bottom: 1px dashed var(--warn); }
+.refine-parts { display: flex; flex-wrap: wrap; gap: 4px; align-items: baseline; font-size: 12px; }
+.part-chip { border: 1px solid var(--subtle-border); border-radius: 10px; padding: 0 6px; }
+.assist-stats { white-space: pre-wrap; font-size: 11px; }
 #send-row { display: flex; gap: 6px; align-items: center; }
 #mode { max-width: 130px; font-size: 12px; }
