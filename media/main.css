@@ -263,6 +263,10 @@ details.lesson-step > .card-foot { padding: 0 8px 8px 32px; }
 #query { position: absolute; inset: 0; height: 100%; resize: none; overflow-y: auto; background: transparent; color: var(--vscode-input-foreground); outline: none; }
 #query::placeholder { color: var(--vscode-input-placeholderForeground); }
 #query-mirror .ghost { color: color-mix(in srgb, var(--vscode-input-foreground) 50%, transparent); }
+/* 置き換え案: 入力欄の文字は隠し、残る部分は通常の色、足す部分は薄い文字、消える部分は取り消し線で重ねて見せる */
+.query-wrap.previewing #query { color: transparent; caret-color: transparent; }
+#query-mirror .keep { color: var(--vscode-input-foreground); }
+#query-mirror .del { color: color-mix(in srgb, var(--vscode-input-foreground) 40%, transparent); text-decoration: line-through; }
 #query-mirror .ghost-key { margin-left: 6px; padding: 0 4px; font-size: 10px; border: 1px solid var(--subtle-border); border-radius: 3px; color: var(--muted); white-space: nowrap; }
 .sr-only { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; }
 #send-row { display: flex; gap: 6px; align-items: center; }

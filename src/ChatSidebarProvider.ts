@@ -49,7 +49,9 @@ import {
   type ProjectRule,
 } from "./core/patterns";
 import { ChangePlanner, PlanError } from "./core/planner";
-import { PromptAssistant } from "./core/promptAssist";
+import { coChangeSuggestions } from "./core/coupling";
+import { buildOverview } from "./core/overview";
+import { PromptAssistant, type AssistContext } from "./core/promptAssist";
 import type { RequirementSpec, StagePlan } from "./core/planTypes";
 import type { KeyValueStore, TypeChecker } from "./core/ports";
 import { buildStructureQuestions } from "./core/questions";
@@ -85,6 +87,8 @@ interface Services {
   /** 型検査(TypeScript の設定が無ければ null)。初めて使うときに作る */
   typeChecker?: TypeChecker | null;
   history?: GitHistory;
+  /** システムの全体像(入力補助用)。索引を更新したら作り直す */
+  overview?: Promise<string>;
 }
 
 /**
@@ -208,6 +212,8 @@ export class ChatSidebarProvider
   private readonly log: LearnerLog;
   /** 入力補助(サービスを作ったときに作る) */
   private assistant?: PromptAssistant;
+  /** 直近の依頼と、その結果の要約(入力補助が、次に書きそうな依頼を当てる手がかり。新しい順) */
+  private readonly recentTurns: Array<{ query: string; outcome: string }> = [];
   /** 入力補助の記録(候補が出ない理由を調べられるように、出力パネルに残す) */
   private assistLog?: vscode.OutputChannel;
   private readonly sessions = new Map<string, QuizSession>();
@@ -304,6 +310,7 @@ export class ChatSidebarProvider
       vscode.Uri.joinPath(mediaRoot, "main.css"),
     );
     const js = webview.asWebviewUri(vscode.Uri.joinPath(mediaRoot, "main.js"));
+    const assistJs = webview.asWebviewUri(vscode.Uri.joinPath(mediaRoot, "assist.js"));
     const csp = [
       "default-src 'none'",
       `style-src ${webview.cspSource}`,
@@ -339,7 +346,7 @@ export class ChatSidebarProvider
     </div>
     <label class="setting setting-toggle">
       <input type="checkbox" id="input-assist">
-      <div class="setting-text"><div class="setting-name">入力中の候補</div><div class="muted">入力が止まったときに、書きかけの続きを薄い文字で出します(Tab で入れる)。続きを作るため、送信前の書きかけとコードの構成を OpenAI API に送ります。テストモードの間は出しません。</div></div>
+      <div class="setting-text"><div class="setting-name">入力中の候補</div><div class="muted">入力が止まったときに、書きかけが何を指示しようとしているかを推測し、続き、または情報が足りない依頼の置き換え案を薄い文字で出します(Tab で入れる)。推測のため、送信前の書きかけ・プロジェクトの概要・関連コードの抜粋・開いているファイルと選択範囲・未コミットのファイル名・最近の依頼と結果を OpenAI API に送ります。テストモードの間は出しません。</div></div>
     </label>
     <label class="setting setting-toggle" title="開発・検証向けの表示です">
       <input type="checkbox" id="test-mode">
@@ -373,6 +380,7 @@ export class ChatSidebarProvider
     </div>
   </footer>
 </div>
+<script nonce="${nonce}" src="${assistJs}"></script>
 <script nonce="${nonce}" src="${js}"></script>
 </body>
 </html>`;
@@ -470,6 +478,7 @@ export class ChatSidebarProvider
     this.assistant = new PromptAssistant({
       llm: this.client,
       index: () => (index.hasChunks() ? index : undefined),
+      context: (files) => this.assistContext(files),
       workspaceId: ws.id,
       log: (line) => log.appendLine(`${new Date().toLocaleTimeString()} ${line}`),
     });
@@ -519,6 +528,7 @@ export class ChatSidebarProvider
         !cfg.testMode &&
         plan.pendingTokens <= cfg.autoEmbedMaxTokens;
       await services.index.commit(plan, { embed });
+      services.overview = undefined;
       if (wantEmbed && !embed && plan.pendingEmbeds.length > 0) {
         this.status(
           cfg.testMode
@@ -702,21 +712,51 @@ export class ChatSidebarProvider
   // 依頼の処理(withAgent)とは別の経路: 処理中の状態にせず、会話にエラーを出さない(入力の邪魔をしない)。
   // ここで例外を投げると onMessage が処理中の状態を戻してしまうので、例外は外に出さない。
 
-  /** 書きかけの続きの候補(入力が止まったときに webview から届く) */
+  /** 入力補助に渡す、作業の状況(全体像・開いているファイルと選択範囲・未コミットのファイル・一緒に変わるファイル・直近の依頼) */
+  private async assistContext(hitFiles: string[]): Promise<AssistContext> {
+    const services = this.services;
+    if (!services) {
+      return {};
+    }
+    services.overview ??= buildOverview(services.ws, services.index.repoMap(3000)).catch(() => "");
+    services.history ??= new GitHistory(services.ws.folder.uri.fsPath);
+    const editor = vscode.window.activeTextEditor;
+    const activeFile = editor ? services.ws.relativeOf(editor.document.uri) : undefined;
+    const selected = editor && activeFile && !editor.selection.isEmpty ? editor.document.getText(editor.selection) : "";
+    const [overview, changedFiles, commits] = await Promise.all([services.overview, services.history.changedFiles(), hitFiles.length > 0 ? services.history.commits() : Promise.resolve([])]);
+    return {
+      overview,
+      activeFile,
+      selection: selected.trim() ? selected : undefined,
+      changedFiles,
+      coChanged: hitFiles.length > 0 ? coChangeSuggestions(commits, hitFiles, { limit: 6 }).map((c) => c.path) : [],
+      recent: this.recentTurns.slice(0, 3),
+    };
+  }
+
+  /** 依頼の結果の要約を、直近の依頼に記録する(入力補助の手がかり) */
+  private noteOutcome(query: string, outcome: string): void {
+    const turn = this.recentTurns.find((t) => t.query === query);
+    if (turn) {
+      turn.outcome = outcome.replace(/\s+/g, " ").slice(0, 300);
+    }
+  }
+
+  /** 書きかけの続きの候補・置き換え案(入力が止まったときに webview から届く) */
   private async handleSuggest(m: Record<string, any>): Promise<void> {
     const id = Number(m.id) || 0;
     const draft = String(m.draft ?? "");
-    const reply = (completion: string) => this.post({ type: "suggestion", id, draft, completion });
+    const reply = (kind: string, text: string) => this.post({ type: "suggestion", id, draft, kind, text });
     const cfg = readConfig();
     const assistant = this.assistant;
     if (!cfg.inputAssist || cfg.testMode || this.busy || !this.apiKey || !assistant) {
-      reply("");
+      reply("none", "");
       return;
     }
     try {
       const out = await assistant.complete(draft, this.coerceMode(m.mode));
       if (out.reason !== "aborted") {
-        reply(out.completion);
+        reply(out.kind, out.text);
       }
     } catch {
       // 候補は出せなくても入力は続けられる
@@ -740,19 +780,20 @@ export class ChatSidebarProvider
     }
     // 新しい質問をしたら、答えていない要件の確認は無効にする
     this.pendingClarify = undefined;
+    this.recentTurns.unshift({ query: text, outcome: "" });
+    this.recentTurns.length = Math.min(this.recentTurns.length, 5);
     await this.withAgent(services, async (agent, hooks) => {
       const inv = await agent.investigate(text, mode, hooks);
       if (!investigationRequiresChange(inv)) {
         // 仕組みの質問: 読解のクイズ
-        await this.presentQuiz(
-          services,
-          await agent.compose(inv, [], hooks),
-          text,
-        );
+        const result = await agent.compose(inv, [], hooks);
+        this.noteOutcome(text, `仕組みの質問。${result.quiz.goal}`);
+        await this.presentQuiz(services, result, text);
         return;
       }
       // 実装・修正の依頼: 要件を整理し、大きい・案が複数あるなら先に質問する(調査結果は回答後の計画に使う)
       const { spec, clarification } = await agent.organize(inv, hooks);
+      this.noteOutcome(text, `変更の依頼。${spec.understanding} 受け入れ条件: ${spec.criteria.join(" / ")}`);
       if (clarification) {
         const id = crypto.randomUUID();
         this.pendingClarify = { id, query: text, inv, clarification, spec };
