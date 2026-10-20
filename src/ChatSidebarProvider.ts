@@ -56,11 +56,13 @@ import type { KeyValueStore, TypeChecker } from "./core/ports";
 import { buildStructureQuestions } from "./core/questions";
 import { applyItemToText, compactDiff, resolveBlanks } from "./core/quiz";
 import {
+  applyReview,
   changedFocus,
   MAX_STAGES,
   reviewProgress,
   stageSpec,
   statusLabel,
+  type StageChanges,
   type StageResult,
 } from "./core/stages";
 import { makeRng, sha1, splitLines } from "./core/text";
@@ -137,6 +139,8 @@ interface Campaign {
   inv: Investigation;
   /** 今の段階の手順(計画できなかったときは undefined) */
   lessonId?: string;
+  /** 直近の見直しで変わった残りの段階(画面の地図に印を付ける) */
+  changes?: StageChanges;
 }
 
 /** 保持する出題・手順・依頼の数(古いものから捨てる) */
@@ -1249,16 +1253,20 @@ export class ChatSidebarProvider
       index: campaign.current,
       total: campaign.stages.length,
       label: campaign.stages[campaign.current]?.label ?? "",
-      roadmap: campaign.stages.map((s, i) => ({
-        label: s.label,
-        goal: s.goal,
-        status:
-          i < campaign.current
-            ? (campaign.done[i]?.status ?? "applied")
-            : i === campaign.current
-              ? "current"
-              : "todo",
-      })),
+      roadmap: [
+        ...campaign.stages.map((s, i) => ({
+          label: s.label,
+          goal: s.goal,
+          change: campaign.changes?.marks[s.label] as string | undefined,
+          status:
+            i < campaign.current
+              ? (campaign.done[i]?.status ?? "applied")
+              : i === campaign.current
+                ? "current"
+                : "todo",
+        })),
+        ...(campaign.changes?.removed ?? []).map((s) => ({ label: s.label, goal: s.goal, change: "removed", status: "todo" })),
+      ],
     };
   }
 
@@ -1301,7 +1309,9 @@ export class ChatSidebarProvider
           campaign.stages.slice(campaign.current),
           hooks,
         );
-        campaign.stages = [...campaign.stages.slice(0, campaign.current), ...r.remaining];
+        const applied = applyReview(campaign.stages.slice(campaign.current), r.remaining);
+        campaign.stages = [...campaign.stages.slice(0, campaign.current), ...applied.remaining];
+        campaign.changes = applied.changes;
         reason = r.reason;
       }
       if (campaign.current >= campaign.stages.length || campaign.current >= MAX_STAGES) {
