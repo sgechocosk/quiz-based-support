@@ -897,6 +897,7 @@
 
   // ---------- 段階に分けた依頼 ----------
 
+  const CHANGE_MARK = { new: "【追加】", changed: "【変更】", removed: "【削除】" };
   const STAGE_NOTE = { unapplied: "(反映せずに進めた)", skipped: "(飛ばした)" };
 
   /** 段階の地図(済んだ・今の・残りの段階) */
@@ -904,7 +905,11 @@
     const list = el("ol", { class: "step-map stage-map" });
     for (const st of stages) {
       const cls = st.status === "current" ? "current" : st.status === "todo" ? "todo" : st.status === "skipped" ? "skipped" : "done";
-      const li = el("li", { class: cls, title: st.goal || "" }, document.createTextNode(`${st.label}${STAGE_NOTE[st.status] || ""}`));
+      const li = el("li", { class: st.change === "removed" ? "removed" : cls, title: st.goal || "" });
+      if (st.change) {
+        li.append(el("strong", { class: "stage-change", text: CHANGE_MARK[st.change] }));
+      }
+      li.append(document.createTextNode(`${st.label}${STAGE_NOTE[st.status] || ""}`));
       if (st.goal) {
         li.append(el("span", { class: "muted stage-goal", text: ` — ${st.goal}` }));
       }

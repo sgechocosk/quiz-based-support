@@ -132,6 +132,30 @@ export function stageBrief(spec: Pick<RequirementSpec, "stage">): string {
 
 // ---------- 進み具合の見直し ----------
 
+/** 見直しで変わった残りの段階(label をキーにする) */
+export interface StageChanges {
+  marks: Record<string, "new" | "changed">;
+  removed: StagePlan[];
+}
+
+/** 見直し前後の残りの段階を比べる。直近の段階(先頭)は変えさせず、変えられるのはその後ろだけ */
+export function applyReview(before: StagePlan[], after: StagePlan[]): { remaining: StagePlan[]; changes: StageChanges } {
+  const head = before[0];
+  const remaining = head && after.length > 0 ? [head, ...after.filter((s) => s.label !== head.label)] : after;
+  const old = new Map(before.map((s) => [s.label, s]));
+  const marks: StageChanges["marks"] = {};
+  for (const s of remaining) {
+    const o = old.get(s.label);
+    if (!o) {
+      marks[s.label] = "new";
+    } else if (o.goal !== s.goal) {
+      marks[s.label] = "changed";
+    }
+  }
+  const kept = new Set(remaining.map((s) => s.label));
+  return { remaining, changes: { marks, removed: remaining.length > 0 ? before.filter((s) => !kept.has(s.label)) : [] } };
+}
+
 export const PROGRESS_SCHEMA = {
   name: "progress",
   schema: {

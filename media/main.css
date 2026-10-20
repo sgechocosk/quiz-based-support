@@ -216,6 +216,8 @@ input.clarify-note { background: var(--vscode-input-background); color: var(--vs
 /* ---------- 段階に分けた依頼 ---------- */
 ol.stage-map { margin: 0; padding-left: 20px; }
 .stage-goal { font-size: 12px; }
+.stage-change { color: var(--warn); margin-right: 4px; }
+.step-map li.removed { text-decoration: line-through; }
 .stage-next { display: flex; flex-direction: column; gap: 4px; padding-top: 8px; border-top: 1px dashed var(--subtle-border); }
 .progress { height: 3px; border-radius: 2px; background: var(--subtle-border); overflow: hidden; }
 .progress > div { height: 100%; background: var(--accent); transition: width 0.3s; }

@@ -7,7 +7,7 @@ import { lessonGoal } from "../../core/lesson";
 import { ChangePlanner } from "../../core/planner";
 import type { RequirementSpec, StagePlan } from "../../core/planTypes";
 import type { ChatLlm, ChatRequest } from "../../core/ports";
-import { changedFocus, reviewProgress, stageBrief, stageSpec, type StageResult } from "../../core/stages";
+import { applyReview, changedFocus, reviewProgress, stageBrief, stageSpec, type StageResult } from "../../core/stages";
 import { EvidenceStore } from "../../core/tools";
 import { makeTempDir, NodeWorkspace, writeFiles } from "./helpers/nodeWorkspace";
 
@@ -195,4 +195,15 @@ test("段階: 次の段階の前に今のコードで調べ直し(変わった�
   assert.match(planUser, /【受け入れ条件\(今回の段階\)】\n1\. 設定した最低文字数で判定する/);
   assert.match(planUser, /L1\| const MIN = 8;/, "計画にも今の内容を渡す");
   assert.match(lessonGoal(plan), /^依頼全体を3段階に分けたうちの2段階目「処理」です。/);
+});
+
+test("applyReview: 直近の段階は変えず、後ろの追加・変更・削除に印を付ける", () => {
+  const st = (label: string, goal = ""): StagePlan => ({ label, goal, criteria: [] });
+  const before = [st("A", "a"), st("B", "b"), st("C", "c")];
+  const { remaining, changes } = applyReview(before, [st("A2", "x"), st("B", "b2"), st("D", "d")]);
+  assert.deepEqual(remaining.map((s) => s.label), ["A", "A2", "B", "D"]);
+  assert.deepEqual(changes.marks, { A2: "new", B: "changed", D: "new" });
+  assert.deepEqual(changes.removed.map((s) => s.label), ["C"]);
+  // 完成(残りなし)のときは削除扱いにしない
+  assert.deepEqual(applyReview(before, []).changes, { marks: {}, removed: [] });
 });
