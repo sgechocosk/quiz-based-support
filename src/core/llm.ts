@@ -23,13 +23,43 @@ export interface ApiRequestInfo {
   channel: ApiChannel;
 }
 
-/** 応答を受け取った後に知らせる内容 */
-export interface ApiUsageInfo extends ApiRequestInfo {
-  /** API が返した実際の入力トークン数(返されなければ undefined) */
-  actualInputTokens?: number;
-  /** そのうちプロンプトキャッシュに当たった数 */
-  cachedInputTokens?: number;
-  outputTokens?: number;
+const KIND_LABEL: Record<ApiRequestInfo["kind"], string> = { chat: "チャット", embedding: "埋め込み", decision: "判定" };
+const CHANNEL_LABEL: Record<ApiChannel, string> = { main: "依頼の処理", assist: "入力補助", "assist-auto": "入力補助(自動)" };
+
+/** 1回の呼び出し(リクエストの記録に添える情報) */
+interface CallInfo {
+  info: ApiRequestInfo;
+}
+
+const n = (v: unknown): number | undefined => (Number.isFinite(Number(v)) && Number(v) > 0 ? Number(v) : undefined);
+const fmt = (v: number | undefined): string => (v === undefined ? "-" : v.toLocaleString());
+
+/** リクエストの本文から、記録に出す引数(推論強度・出力の上限・キャッシュキー・ツール数・形式) */
+function describeBody(body: unknown): string {
+  const b = (typeof body === "object" && body !== null ? body : {}) as Record<string, any>;
+  const parts: string[] = [];
+  if (Array.isArray(b.messages)) {
+    parts.push(`メッセージ${b.messages.length}件`);
+  }
+  if (Array.isArray(b.input)) {
+    parts.push(`入力${b.input.length}件`);
+  }
+  if (b.reasoning_effort !== undefined) {
+    parts.push(`推論=${b.reasoning_effort}`);
+  }
+  if (b.max_completion_tokens !== undefined) {
+    parts.push(`出力上限=${b.max_completion_tokens}`);
+  }
+  if (b.prompt_cache_key !== undefined) {
+    parts.push("キャッシュキー");
+  }
+  if (Array.isArray(b.tools)) {
+    parts.push(`ツール${b.tools.length}個`);
+  }
+  if (b.response_format?.json_schema?.name) {
+    parts.push(`JSON形式=${b.response_format.json_schema.name}`);
+  }
+  return parts.join(" ");
 }
 
 export interface OpenAiOptions {
@@ -44,8 +74,11 @@ export interface OpenAiOptions {
   maxRetries?: number;
   /** API を呼ぶ直前に呼ばれる。例外を投げると、その呼び出しを取り消す(リクエストは送らない) */
   beforeRequest?: (info: ApiRequestInfo) => Promise<void>;
-  /** 応答を受け取った後に呼ばれる */
-  afterResponse?: (info: ApiUsageInfo) => void;
+  /**
+   * API キーを使うリクエストのたびに、記録の1行を渡す(送信・完了・失敗・確認の取り消し)。
+   * 完了には、入力・出力トークン数(API が返した実測)・キャッシュに当たった数・推論トークン数・時間を含む。送った内容そのものは含まない。
+   */
+  log?: (line: string) => void;
 }
 
 /** メッセージ1件あたりの付帯トークン(役割名・区切り)の目安 */
@@ -138,13 +171,22 @@ export class OpenAiClient implements ChatLlm, Embedder, DecisionLlm {
     if (!this.o.beforeRequest) {
       return;
     }
-    await this.o.beforeRequest(info);
-    if (signal?.aborted) {
-      throw new LlmError("中止しました。");
+    try {
+      await this.o.beforeRequest(info);
+      if (signal?.aborted) {
+        throw new LlmError("中止しました。");
+      }
+    } catch (error) {
+      this.o.log?.(`× 取り消し ${this.label(info)}: ${error instanceof Error ? error.message : String(error)}`);
+      throw error;
     }
   }
 
-  private async post(pathname: string, body: unknown, signal?: AbortSignal, retries?: number): Promise<any> {
+  private label(info: ApiRequestInfo): string {
+    return `${KIND_LABEL[info.kind]}「${info.purpose}」 モデル ${info.model} 系統 ${CHANNEL_LABEL[info.channel]}`;
+  }
+
+  private async post(pathname: string, body: unknown, signal: AbortSignal | undefined, retries: number | undefined, call: CallInfo): Promise<any> {
     const key = await this.o.apiKey();
     if (!key) {
       throw new LlmError("APIキーが設定されていません。");
@@ -154,8 +196,13 @@ export class OpenAiClient implements ChatLlm, Embedder, DecisionLlm {
     const url = this.o.baseUrl().replace(/\/+$/, "") + pathname;
     const maxRetries = retries ?? this.o.maxRetries ?? 3;
 
+    const log = this.o.log;
+    const label = this.label(call.info);
     for (let attempt = 0; ; attempt++) {
       let response: Response;
+      const started = Date.now();
+      const secs = () => `${((Date.now() - started) / 1000).toFixed(1)}秒`;
+      log?.(`→ 送信 ${label} 試行${attempt + 1}回目 入力(見積もり)約${fmt(call.info.inputTokens)}トークン ${describeBody(body)}`);
       try {
         response = await doFetch(url, {
           method: "POST",
@@ -164,6 +211,7 @@ export class OpenAiClient implements ChatLlm, Embedder, DecisionLlm {
           signal,
         });
       } catch (error) {
+        log?.(`× 通信失敗 ${label} ${secs()}: ${error instanceof Error ? error.message : String(error)}`);
         if (signal?.aborted) {
           throw new LlmError("中止しました。");
         }
@@ -174,7 +222,17 @@ export class OpenAiClient implements ChatLlm, Embedder, DecisionLlm {
         throw new LlmError(`ネットワークエラー: ${error instanceof Error ? error.message : String(error)}`);
       }
       if (response.ok) {
-        return response.json();
+        const json: any = await response.json();
+        const u = json?.usage ?? {};
+        const input = n(u.prompt_tokens ?? u.input_tokens);
+        const output = n(u.completion_tokens ?? u.output_tokens);
+        const cached = n(u.prompt_tokens_details?.cached_tokens ?? u.input_tokens_details?.cached_tokens);
+        const reasoning = n(u.completion_tokens_details?.reasoning_tokens);
+        const finish = json?.choices?.[0]?.finish_reason;
+        log?.(
+          `← 完了 ${label} ${secs()} 入力${fmt(input)}トークン(キャッシュ${fmt(cached)}) 出力${fmt(output)}トークン(推論${fmt(reasoning)})${finish ? ` 終了理由=${finish}` : ""}${input === undefined && output === undefined ? "(使用量が返されませんでした)" : ""}`,
+        );
+        return json;
       }
       const text = await response.text();
       let message = text.slice(0, 300);
@@ -183,6 +241,7 @@ export class OpenAiClient implements ChatLlm, Embedder, DecisionLlm {
       } catch {
         // JSONでない本文はそのまま使う
       }
+      log?.(`× エラー ${label} ${secs()} HTTP ${response.status}: ${message.slice(0, 200)}`);
       if (RETRYABLE.has(response.status) && attempt < maxRetries && !/quota/i.test(message)) {
         const retryAfter = Number(response.headers.get("retry-after"));
         await sleep(Number.isFinite(retryAfter) && retryAfter > 0 ? retryAfter * 1000 : Math.min(500 * 2 ** attempt, 8000));
@@ -261,13 +320,13 @@ export class OpenAiClient implements ChatLlm, Embedder, DecisionLlm {
     await this.gate(info, request.signal);
     let json: any;
     try {
-      json = await this.post("/chat/completions", body, request.signal, request.retries);
+      json = await this.post("/chat/completions", body, request.signal, request.retries, { info });
     } catch (error) {
       const rejected = error instanceof LlmError && error.status === 400;
       if (rejected && optional) {
         this.rejectsOptional.add(model);
         plain();
-        json = await this.post("/chat/completions", body, request.signal, request.retries);
+        json = await this.post("/chat/completions", body, request.signal, request.retries, { info });
       } else {
         const retriable = mode === "auto" && hasTools && body.reasoning_effort === undefined && rejected && /reasoning_effort/i.test(error.message) && /tool/i.test(error.message);
         if (!retriable) {
@@ -275,17 +334,11 @@ export class OpenAiClient implements ChatLlm, Embedder, DecisionLlm {
         }
         this.needsNoneWithTools.add(model);
         body.reasoning_effort = "none";
-        json = await this.post("/chat/completions", body, request.signal, request.retries);
+        json = await this.post("/chat/completions", body, request.signal, request.retries, { info });
       }
     }
     const actual = Number(json?.usage?.prompt_tokens) || undefined;
     this.learn("chat", raw, actual, info.channel);
-    this.o.afterResponse?.({
-      ...info,
-      actualInputTokens: actual,
-      cachedInputTokens: Number(json?.usage?.prompt_tokens_details?.cached_tokens) || undefined,
-      outputTokens: Number(json?.usage?.completion_tokens) || undefined,
-    });
     const message = json?.choices?.[0]?.message as WireMessage | undefined;
     if (!message) {
       throw new LlmError("APIの応答に choices[0].message がありません。");
@@ -317,10 +370,11 @@ export class OpenAiClient implements ChatLlm, Embedder, DecisionLlm {
         questions: [{ type: "predicate", name: request.name, instructions: request.instructions }],
       },
       request.signal,
+      undefined,
+      { info },
     );
     const actual = Number(json?.usage?.input_tokens) || undefined;
     this.learn("decision", raw, actual);
-    this.o.afterResponse?.({ ...info, actualInputTokens: actual });
     const answers = (json?.answers ?? []) as Array<{ type?: string; name?: string; probability?: unknown }>;
     const answer = answers.find((a) => a?.name === request.name);
     if (!answer) {
@@ -347,10 +401,9 @@ export class OpenAiClient implements ChatLlm, Embedder, DecisionLlm {
       channel: "main",
     };
     await this.gate(info, signal);
-    const json = await this.post("/embeddings", { model, input: texts, encoding_format: "float" }, signal);
+    const json = await this.post("/embeddings", { model, input: texts, encoding_format: "float" }, signal, undefined, { info });
     const actual = Number(json?.usage?.prompt_tokens) || undefined;
     this.learn("embedding", raw, actual);
-    this.o.afterResponse?.({ ...info, actualInputTokens: actual });
     const data = (json?.data ?? []) as Array<{ index: number; embedding: number[] }>;
     if (data.length !== texts.length) {
       throw new LlmError(`埋め込みの件数が一致しません(要求${texts.length}件/応答${data.length}件)。`);

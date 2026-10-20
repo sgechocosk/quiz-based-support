@@ -41,7 +41,6 @@ import {
   LlmError,
   OpenAiClient,
   type ApiRequestInfo,
-  type ApiUsageInfo,
 } from "./core/llm";
 import {
   parseProjectRules,
@@ -214,8 +213,8 @@ export class ChatSidebarProvider
   private assistant?: PromptAssistant;
   /** 直近の依頼と、その結果の要約(入力補助が、次に書きそうな依頼を当てる手がかり。新しい順) */
   private readonly recentTurns: Array<{ query: string; outcome: string }> = [];
-  /** 入力補助の記録(候補が出ない理由を調べられるように、出力パネルに残す) */
-  private assistLog?: vscode.OutputChannel;
+  /** 出力パネル「コード思考」: API キーを使うリクエストのたびの記録(送信・入力/出力トークン数・失敗)と、入力補助の判断(デバッグ用。常に記録する) */
+  private readonly output = vscode.window.createOutputChannel("コード思考");
   private readonly sessions = new Map<string, QuizSession>();
   private readonly lessons = new Map<string, LessonSession>();
   private readonly campaigns = new Map<string, Campaign>();
@@ -231,7 +230,6 @@ export class ChatSidebarProvider
   /** API 実行前の確認で「この処理では以降確認しない」が選ばれた(処理の始めに戻す) */
   private approveRest = false;
   /** 1つの処理での API 使用量(処理の終わりに表示する) */
-  private usage = { calls: 0, estimated: 0, actual: 0, output: 0 };
   private abort?: AbortController;
   private busy = false;
   private syncing = false;
@@ -250,7 +248,7 @@ export class ChatSidebarProvider
       embeddingModel: () => readConfig().embeddingModel,
       reasoningEffort: () => readConfig().reasoningEffort,
       beforeRequest: (info) => this.confirmApi(info),
-      afterResponse: (info) => this.countUsage(info),
+      log: (line) => this.writeLog(line),
     });
     const store: KeyValueStore = {
       get: <T>(key: string) => context.workspaceState.get<T>(key),
@@ -280,7 +278,7 @@ export class ChatSidebarProvider
   dispose(): void {
     this.abort?.abort();
     this.assistant?.cancel();
-    this.assistLog?.dispose();
+    this.output.dispose();
     if (this.syncTimer) {
       clearTimeout(this.syncTimer);
     }
@@ -330,7 +328,7 @@ export class ChatSidebarProvider
     <label for="level" class="toolbar-label">経験レベル</label>
     <select id="level" title="解説の細かさ・用語・扱う内容の深さが変わります"></select>
     <span class="spacer"></span>
-    <button id="test-badge" class="badge test hidden" title="テストモード: API 実行前の確認・トークン数・内部の情報を表示中(クリックで設定を開く)">テスト</button>
+    <button id="test-badge" class="badge test hidden" title="テストモード: API 実行前の確認・内部の情報を表示中(クリックで設定を開く)">テスト</button>
     <button id="btn-log" class="toolbar-btn" title="これまでの判断の記録と振り返り" aria-expanded="false">判断の記録</button>
     <button id="btn-settings" class="toolbar-btn" title="APIキー・索引・テストモード" aria-expanded="false">設定</button>
   </header>
@@ -350,7 +348,7 @@ export class ChatSidebarProvider
     </label>
     <label class="setting setting-toggle" title="開発・検証向けの表示です">
       <input type="checkbox" id="test-mode">
-      <div class="setting-text"><div class="setting-name">テストモード</div><div class="muted">API を呼ぶ前に目的と入力トークン数を確認し、処理ごとの使用量や生成の内部情報を表示します(開発・検証向け)。</div></div>
+      <div class="setting-text"><div class="setting-name">テストモード</div><div class="muted">API を呼ぶ前に目的を確認し、生成の内部情報を表示します(開発・検証向け)。</div></div>
     </label>
   </section>
   <section id="setup-box" class="panel notice-panel hidden"></section>
@@ -473,14 +471,12 @@ export class ChatSidebarProvider
     watcher.onDidDelete((u) => mark(u, true));
 
     this.services = { ws, lsp: new VscodeLsp(ws), index, watcher };
-    this.assistLog ??= vscode.window.createOutputChannel("コード思考: 入力補助");
-    const log = this.assistLog;
     this.assistant = new PromptAssistant({
       llm: this.client,
       index: () => (index.hasChunks() ? index : undefined),
       context: (files) => this.assistContext(files),
       workspaceId: ws.id,
-      log: (line) => log.appendLine(`${new Date().toLocaleTimeString()} ${line}`),
+      log: (line) => this.writeLog(`入力補助: ${line}`),
     });
     return this.services;
   }
@@ -532,7 +528,7 @@ export class ChatSidebarProvider
       if (wantEmbed && !embed && plan.pendingEmbeds.length > 0) {
         this.status(
           cfg.testMode
-            ? `意味検索に未反映の差分が約${plan.pendingTokens.toLocaleString()}トークンあります(テストモードのため自動では更新しません)。設定の「索引」から更新できます。`
+            ? "意味検索に未反映の差分があります(テストモードのため自動では更新しません)。設定の「索引」から更新できます。"
             : "意味検索に反映していない変更があります。設定の「索引」から更新できます。",
         );
       }
@@ -1532,7 +1528,6 @@ export class ChatSidebarProvider
       {
         modal: true,
         detail: [
-          `入力トークン数: 約 ${info.inputTokens.toLocaleString()}(見積もり)`,
           `モデル: ${info.model}(${kind})`,
           "",
           "この確認はテストモードでだけ行います。サイドバーの設定の「テストモード」または設定 quizSupport.testMode でオフにできます。",
@@ -1549,36 +1544,14 @@ export class ChatSidebarProvider
     }
   }
 
-  private countUsage(info: ApiUsageInfo): void {
-    // 入力補助は依頼の処理の集計に混ぜない
-    if (info.channel !== "main") {
-      return;
-    }
-    this.usage.calls++;
-    this.usage.estimated += info.inputTokens;
-    this.usage.actual += info.actualInputTokens ?? 0;
-    this.usage.output += info.outputTokens ?? 0;
+  /** 出力パネル「コード思考」に1行足す(時刻つき) */
+  private writeLog(line: string): void {
+    this.output.appendLine(`${new Date().toLocaleTimeString()} ${line}`);
   }
 
-  /** 処理の始めに、確認の省略と使用量の集計を戻す */
+  /** 処理の始めに、確認の省略を戻す */
   private beginOperation(): void {
     this.approveRest = false;
-    this.usage = { calls: 0, estimated: 0, actual: 0, output: 0 };
-  }
-
-  /** 処理ごとの使用量はテストモードでだけ表示する */
-  private reportUsage(): void {
-    const u = this.usage;
-    if (u.calls === 0 || !readConfig().testMode) {
-      return;
-    }
-    const input =
-      u.actual > 0
-        ? `${u.actual.toLocaleString()}(実測)`
-        : `約${u.estimated.toLocaleString()}(見積もり)`;
-    this.status(
-      `API 使用量: ${u.calls}回 / 入力 ${input}${u.output > 0 ? ` / 出力 ${u.output.toLocaleString()}` : ""} トークン`,
-    );
   }
 
   /** 出題を始められる状態か確かめる(できなければ理由を表示して undefined) */
@@ -1636,7 +1609,6 @@ export class ChatSidebarProvider
     } finally {
       this.busy = false;
       this.abort = undefined;
-      this.reportUsage();
       await this.pushState();
     }
   }
@@ -1963,7 +1935,6 @@ export class ChatSidebarProvider
       removed: plan.removedFiles,
       chunks: plan.newChunks,
       pendingEmbeds: plan.pendingEmbeds.length,
-      tokens: plan.pendingTokens,
       truncated: plan.truncated,
       hasKey: !!this.apiKey,
       semantic: services.index.isSemanticEnabled(),
@@ -1976,7 +1947,7 @@ export class ChatSidebarProvider
       return;
     }
     if (!this.pendingPlan) {
-      // 確認画面(トークン数の見積もり)を見せずに埋め込みを始めない。最新の見積もりを出し直して、押し直してもらう
+      // 確認画面を見せずに埋め込みを始めない。最新の内容を出し直して、押し直してもらう
       await this.handlePlan();
       return;
     }
@@ -1985,7 +1956,7 @@ export class ChatSidebarProvider
     this.busy = true;
     this.abort = new AbortController();
     this.beginOperation();
-    // 更新の画面でトークン数を見せて押してもらっているので、埋め込みの呼び出しごとには確認しない
+    // 更新の画面で確認して押してもらっているので、埋め込みの呼び出しごとには確認しない
     this.approveRest = true;
     await this.pushState();
     try {
@@ -1998,7 +1969,6 @@ export class ChatSidebarProvider
       this.status(
         `インデックスを更新しました(${stats.files}ファイル / ${stats.chunks}チャンク / ベクトル${stats.vectors}件${embed ? "" : "・キーワード検索のみ"})。`,
       );
-      this.reportUsage();
     } finally {
       this.approveRest = false;
       this.busy = false;

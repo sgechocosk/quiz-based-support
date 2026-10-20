@@ -371,13 +371,12 @@
             (m.truncated ? "\n※ファイル数が上限を超えたため一部のみ対象です(設定 quizSupport.maxFiles)。" : ""),
       }),
     );
-    // トークン数はテストモードでだけ出す
     box.append(
       el("div", {
         class: "muted",
         text:
           "キーワード検索の索引は API を使わずに作れます。意味検索を有効にすると、OpenAI API でコードの埋め込みを作り、言い回しが違っても関連するコードを見つけやすくなります。" +
-          (state.testMode ? `\n未計算: ${m.pendingEmbeds} チャンク(約 ${m.tokens.toLocaleString()} トークン)` : ""),
+          (state.testMode ? `\n未計算: ${m.pendingEmbeds} チャンク` : ""),
       }),
     );
     const lexical = el("button", { class: "secondary", text: "キーワードのみ更新" });
