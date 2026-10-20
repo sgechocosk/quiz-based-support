@@ -213,7 +213,7 @@ export class ChatSidebarProvider
   private assistant?: PromptAssistant;
   /** 直近の依頼と、その結果の要約(入力補助が、次に書きそうな依頼を当てる手がかり。新しい順) */
   private readonly recentTurns: Array<{ query: string; outcome: string }> = [];
-  /** 出力パネル「コード思考」: API キーを使うリクエストのたびの記録(送信・入力/出力トークン数・失敗)と、入力補助の判断(デバッグ用。常に記録する) */
+  /** 出力パネル「コード思考」: API キーを使うリクエストのたびの記録(モデル・入力/出力トークン数・キャッシュ。デバッグ用に常に記録する) */
   private readonly output = vscode.window.createOutputChannel("コード思考");
   private readonly sessions = new Map<string, QuizSession>();
   private readonly lessons = new Map<string, LessonSession>();
@@ -308,7 +308,6 @@ export class ChatSidebarProvider
       vscode.Uri.joinPath(mediaRoot, "main.css"),
     );
     const js = webview.asWebviewUri(vscode.Uri.joinPath(mediaRoot, "main.js"));
-    const assistJs = webview.asWebviewUri(vscode.Uri.joinPath(mediaRoot, "assist.js"));
     const csp = [
       "default-src 'none'",
       `style-src ${webview.cspSource}`,
@@ -344,7 +343,7 @@ export class ChatSidebarProvider
     </div>
     <label class="setting setting-toggle">
       <input type="checkbox" id="input-assist">
-      <div class="setting-text"><div class="setting-name">入力中の候補</div><div class="muted">入力が止まったときに、書きかけが何を指示しようとしているかを推測し、続き、または情報が足りない依頼の置き換え案を薄い文字で出します(Tab で入れる)。推測のため、送信前の書きかけ・プロジェクトの概要・関連コードの抜粋・開いているファイルと選択範囲・未コミットのファイル名・最近の依頼と結果を OpenAI API に送ります。テストモードの間は出しません。</div></div>
+      <div class="setting-text"><div class="setting-name">入力中の候補</div><div class="muted">入力が止まったときに、書きかけが何を指示しようとしているかを推測し、その続きを薄い文字で出します(Tab で入れる)。推測のため、送信前の書きかけ・プロジェクトの概要・関連コードの抜粋・開いているファイルと選択範囲・未コミットのファイル名・最近の依頼と結果を OpenAI API に送ります。テストモードの間は出しません。</div></div>
     </label>
     <label class="setting setting-toggle" title="開発・検証向けの表示です">
       <input type="checkbox" id="test-mode">
@@ -378,7 +377,6 @@ export class ChatSidebarProvider
     </div>
   </footer>
 </div>
-<script nonce="${nonce}" src="${assistJs}"></script>
 <script nonce="${nonce}" src="${js}"></script>
 </body>
 </html>`;
@@ -476,7 +474,6 @@ export class ChatSidebarProvider
       index: () => (index.hasChunks() ? index : undefined),
       context: (files) => this.assistContext(files),
       workspaceId: ws.id,
-      log: (line) => this.writeLog(`入力補助: ${line}`),
     });
     return this.services;
   }
@@ -738,21 +735,21 @@ export class ChatSidebarProvider
     }
   }
 
-  /** 書きかけの続きの候補・置き換え案(入力が止まったときに webview から届く) */
+  /** 書きかけの続きの候補(入力が止まったときに webview から届く) */
   private async handleSuggest(m: Record<string, any>): Promise<void> {
     const id = Number(m.id) || 0;
     const draft = String(m.draft ?? "");
-    const reply = (kind: string, text: string) => this.post({ type: "suggestion", id, draft, kind, text });
+    const reply = (text: string) => this.post({ type: "suggestion", id, draft, text });
     const cfg = readConfig();
     const assistant = this.assistant;
     if (!cfg.inputAssist || cfg.testMode || this.busy || !this.apiKey || !assistant) {
-      reply("none", "");
+      reply("");
       return;
     }
     try {
       const out = await assistant.complete(draft, this.coerceMode(m.mode));
       if (out.reason !== "aborted") {
-        reply(out.kind, out.text);
+        reply(out.text);
       }
     } catch {
       // 候補は出せなくても入力は続けられる

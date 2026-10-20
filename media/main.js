@@ -32,9 +32,6 @@
   const jumpBtn = $("jump-latest");
   const queryInput = /** @type {HTMLTextAreaElement} */ ($("query"));
   const queryMirror = $("query-mirror");
-  const queryWrap = /** @type {HTMLElement} */ (queryInput.parentElement);
-  /** media/assist.js(入力補助の、画面に依存しない処理) */
-  const A = /** @type {any} */ (window).QbsAssist;
   const assistSr = $("assist-sr");
   const sendBtn = /** @type {HTMLButtonElement} */ ($("btn-send"));
   const cancelBtn = $("btn-cancel");
@@ -1414,23 +1411,17 @@
     ensureVisible(f.testBox);
   }
 
-  // ---------- 入力補助(続きの候補・置き換え案) ----------
+  // ---------- 入力補助(続きの候補) ----------
   //
   // - 候補は入力欄に重ねた要素(#query-mirror)に薄い文字で描くだけで、入力の値には入れない(Enter は打った文だけを送る)
-  //   - 続き(continue): 書きかけの末尾に薄い文字で出す。打った文字が候補の先頭と同じなら縮める
-  //   - 置き換え(replace): 書き終わっていて情報が足りない依頼に、足りない情報を補った案を出す。
-  //     残る部分は通常の色、足す部分は薄い文字、消える部分は取り消し線で、入力欄の中に重ねて見せる
-  // - Tab で入れる(execCommand で入れるので Ctrl+Z で戻せる)。Esc で消す。何か打てば消える
-  // - IME の変換中・処理中は出さず、求めもしない(続きはカーソルが末尾のときだけ)
+  // - Tab で入れる(execCommand で入れるので Ctrl+Z で戻せる)。Esc で消す。打った文字が候補の先頭と同じなら、候補を縮める
+  // - IME の変換中・処理中・カーソルが末尾でないときは出さず、求めもしない
 
   const DELAY_MS = 800;
   const assist = {
     /** 候補を出したときの入力と、その続き(薄い文字) */
     base: "",
     ghost: "",
-    /** 置き換え案: { base: 案を出したときの入力, text: 案, segs: 差 } */
-    /** @type {{ base: string, text: string, segs: Array<{ text: string, kind: string }> } | null} */
-    replace: null,
     /** @type {ReturnType<typeof setTimeout> | undefined} */
     timer: undefined,
     reqId: 0,
@@ -1450,20 +1441,9 @@
 
   /** 入力と候補を重ねた要素に写す(入力欄の高さもこの要素で決まる) */
   function renderMirror() {
-    const visible = !assist.composing && !queryInput.disabled && document.activeElement === queryInput;
-    const preview = !!assist.replace && visible;
-    queryWrap.classList.toggle("previewing", preview);
-    /** @type {Array<Node>} */
-    let parts;
-    if (preview && assist.replace) {
-      // 置き換え案: 入力欄の文字は隠し(previewing)、残る部分・足す部分・消える部分を重ねて描く
-      parts = assist.replace.segs.map((seg) => el("span", { class: seg.kind === "keep" ? "keep" : seg.kind === "add" ? "ghost" : "del", text: seg.text }));
-      parts.push(el("span", { class: "ghost-key", text: "Tab で置き換え" }));
-    } else {
-      parts = [document.createTextNode(queryInput.value)];
-      if (assist.ghost && visible && caretAtEnd()) {
-        parts.push(el("span", { class: "ghost", text: assist.ghost }), el("span", { class: "ghost-key", text: "Tab" }));
-      }
+    const parts = [document.createTextNode(queryInput.value)];
+    if (assist.ghost && !assist.composing && !queryInput.disabled && document.activeElement === queryInput && caretAtEnd()) {
+      parts.push(el("span", { class: "ghost", text: assist.ghost }), el("span", { class: "ghost-key", text: "Tab" }));
     }
     // 末尾が改行のときも、その行の高さを取る
     parts.push(document.createTextNode("\u200b"));
@@ -1473,7 +1453,6 @@
 
   function clearGhost() {
     assist.ghost = "";
-    assist.replace = null;
     renderMirror();
   }
 
@@ -1488,6 +1467,15 @@
     }
   }
 
+  /** 打った文字が候補の先頭と同じなら、残りの候補(違えば null) */
+  function consume(base, ghost, value) {
+    if (!value.startsWith(base)) {
+      return null;
+    }
+    const typed = value.slice(base.length);
+    return ghost.startsWith(typed) ? ghost.slice(typed.length) : null;
+  }
+
   function assistReady() {
     return !!state.assistAuto && state.hasKey && state.hasWorkspace && !state.busy && !queryInput.disabled;
   }
@@ -1498,10 +1486,8 @@
       return;
     }
     const value = queryInput.value;
-    // 置き換え案は、何か打てば消す(打った文字は入力欄にそのまま入っている)
-    assist.replace = null;
     if (assist.ghost) {
-      const rest = A.consume(assist.base, assist.ghost, value);
+      const rest = consume(assist.base, assist.ghost, value);
       if (rest && caretAtEnd()) {
         assist.base = value;
         assist.ghost = rest;
@@ -1535,25 +1521,11 @@
     }
     assist.waiting = false;
     const value = queryInput.value;
-    if (!assistReady() || assist.composing || document.activeElement !== queryInput || !m.text) {
-      return;
-    }
-    if (m.kind === "replace") {
-      // 置き換え案は、案を作った書きかけのままのときだけ出す
-      if (value === m.draft) {
-        assist.base = value;
-        assist.ghost = "";
-        assist.replace = { base: value, text: m.text, segs: A.diffSegments(value, m.text) };
-        renderMirror();
-        assistSr.textContent = `置き換え案: ${m.text}(Tab で置き換えられます)`;
-      }
-      return;
-    }
-    if (m.kind !== "continue" || !caretAtEnd()) {
+    if (!assistReady() || assist.composing || !caretAtEnd() || document.activeElement !== queryInput || !m.text) {
       return;
     }
     // 届くまでに打った文字が候補の先頭と同じなら、その分を縮めて出す
-    const ghost = value === m.draft ? m.text : A.consume(m.draft, m.text, value) || "";
+    const ghost = value === m.draft ? m.text : consume(m.draft, m.text, value) || "";
     if (ghost) {
       assist.base = value;
       assist.ghost = ghost;
@@ -1578,28 +1550,6 @@
       queryInput.setRangeText(text, end, end, "end");
     }
     assist.inserting = false;
-    renderMirror();
-  }
-
-  /** 置き換え案で、入力欄の全体を置き換える。execCommand で入れるので Ctrl+Z で書きかけに戻せる */
-  function acceptReplace() {
-    const text = assist.replace ? assist.replace.text : "";
-    assist.replace = null;
-    queryInput.focus();
-    queryInput.select();
-    assist.inserting = true;
-    let done = false;
-    try {
-      done = document.execCommand("insertText", false, text);
-    } catch {
-      done = false;
-    }
-    if (!done) {
-      queryInput.setRangeText(text, 0, queryInput.value.length, "end");
-    }
-    assist.inserting = false;
-    cancelSuggest();
-    assist.dismissed = queryInput.value;
     renderMirror();
   }
 
@@ -1658,18 +1608,12 @@
     if (e.isComposing || e.keyCode === 229) {
       return;
     }
-    const plainTab = e.key === "Tab" && !e.shiftKey && !e.ctrlKey && !e.altKey && !e.metaKey;
-    if (plainTab && assist.replace) {
-      e.preventDefault();
-      acceptReplace();
-      return;
-    }
-    if (plainTab && assist.ghost && caretAtEnd()) {
+    if (e.key === "Tab" && assist.ghost && caretAtEnd() && !e.shiftKey && !e.ctrlKey && !e.altKey && !e.metaKey) {
       e.preventDefault();
       acceptGhost();
       return;
     }
-    if (e.key === "Escape" && (assist.ghost || assist.replace)) {
+    if (e.key === "Escape" && assist.ghost) {
       e.preventDefault();
       assist.dismissed = queryInput.value;
       cancelSuggest();

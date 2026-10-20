@@ -317,15 +317,14 @@ test("API実行前の確認: 目的と入力トークン数の見積もりを渡
   assert.equal(seen[0]!.purpose, "テスト");
   assert.equal(seen[0]!.kind, "chat");
   assert.equal(seen[0]!.inputTokens, raw);
-  assert.match(logs[0]!, /^→ 送信 チャット「テスト」 モデル test-model 系統 依頼の処理 試行1回目 入力\(見積もり\)約\d+トークン/);
-  assert.match(logs[1]!, /^← 完了 チャット「テスト」 .* 入力400トークン\(キャッシュ-\) 出力\d+トークン/);
+  assert.deepEqual(logs, ["test-model 入力400(キャッシュ-) 出力5"]);
   await client.chat(request);
   assert.ok(seen[1]!.inputTokens > raw, "実測(400)に近づくよう補正される");
 
   allow = false;
   await assert.rejects(client.chat(request), /取り消しました/);
   assert.equal(sent, 2, "取り消した呼び出しは送らない");
-  assert.match(logs.at(-1)!, /^× 取り消し チャット「テスト」 .*: 取り消しました/);
+  assert.equal(logs.length, 2, "取り消した呼び出しは送らないので記録も増えない");
   await assert.rejects(client.embed(["a", "b"], undefined, "埋め込みテスト"), /取り消しました/);
   assert.equal(seen[seen.length - 1]!.purpose, "埋め込みテスト");
   assert.equal(seen[seen.length - 1]!.kind, "embedding");

@@ -4,19 +4,7 @@ import { test } from "node:test";
 import { IndexManager } from "../../core/indexer";
 import { OpenAiClient } from "../../core/llm";
 import type { ChatRequest, ChatResult } from "../../core/ports";
-import {
-  CALLS_PER_MINUTE,
-  looksFinished,
-  looksSecret,
-  messagesFor,
-  preservedRatio,
-  PromptAssistant,
-  rejectCompletion,
-  rejectReplacement,
-  stripEcho,
-  type AssistContext,
-  type NameSource,
-} from "../../core/promptAssist";
+import { CALLS_PER_MINUTE, looksSecret, messagesFor, PromptAssistant, rejectCompletion, stripEcho, type AssistContext, type NameSource } from "../../core/promptAssist";
 import { startFakeOpenAi } from "./helpers/fakeOpenAi";
 import { FakeEmbedder, makeTempDir, NodeWorkspace, writeFiles } from "./helpers/nodeWorkspace";
 import { TsCompilerParser } from "./helpers/tsAst";
@@ -48,8 +36,7 @@ function assistant(
   context?: (files: string[]) => Promise<AssistContext>,
 ) {
   const f = fakeLlm(reply);
-  const log: string[] = [];
-  return { ...f, log, a: new PromptAssistant({ llm: f.llm, index: () => index, context, workspaceId: "/ws", log: (l) => log.push(l), now }) };
+  return { ...f, a: new PromptAssistant({ llm: f.llm, index: () => index, context, workspaceId: "/ws", now }) };
 }
 
 // ---------- 整形と規則 ----------
@@ -73,36 +60,9 @@ test("続きの候補は、空・「なし」などの文・返事・コード�
   assert.equal(ok("索引の更新", "x".repeat(201)), "too_long");
 });
 
-test("文が書き終わっているか: 読点・助詞・接続の語尾はまだ途中。短いものも途中", () => {
-  for (const t of ["ログイン処理を", "ログインの", "ログインを直したいが、", "保存したあとに", "テスト"]) {
-    assert.equal(looksFinished(t), false, t);
-  }
-  for (const t of ["テストの表示を直したい。", "ログインの処理を変更したい", "索引の更新はどう動く?", "Fix the login flow."]) {
-    assert.equal(looksFinished(t), true, t);
-  }
-});
+// ---------- 続きの候補(本体) ----------
 
-test("置き換え案: 利用者の言葉を残して情報を足したものだけ出す(同じ・短くなる・別の依頼・コードブロックは出さない)", () => {
-  const draft = "テストの表示を直したい。";
-  assert.equal(rejectReplacement(draft, "`onLessonTest` で、テストが失敗したときの表示を直したい。"), undefined);
-  assert.equal(rejectReplacement(draft, "テストの 表示を 直したい。"), "same");
-  assert.equal(rejectReplacement(draft, "表示を直したい。"), "not_richer");
-  assert.equal(rejectReplacement(draft, "ログイン画面にパスワードの再設定を追加して、メールも送れるようにしたい。"), "drift");
-  assert.equal(rejectReplacement(draft, "```x```"), "formatting");
-  assert.ok(preservedRatio(draft, "`onLessonTest` で、テストが失敗したときの表示を直したい。") > 0.9);
-});
-
-test("秘密らしい文字列(API キー・環境変数の形・Bearer・URL のパスワード)は送らない", () => {
-  for (const t of ["sk-abcdefghijklmnopqrstu", "OPENAI_API_KEY=abcdef123456", "DB_PASSWORD: hunter2hunter2", "Authorization: Bearer abcdefghijklmnopqrstuvwxyz", "https://user:pass@example.com"]) {
-    assert.ok(looksSecret(t), t);
-  }
-  assert.ok(!looksSecret("ログイン処理の流れを知りたい"));
-});
-
-// ---------- 続きの候補・置き換え案(本体) ----------
-
-const cont = (text: string) => ({ kind: "continue", text });
-const repl = (text: string) => ({ kind: "replace", text });
+const cont = (completion: string) => ({ completion });
 
 test("モデルへの入力: 指示 → 全体像 → 入力ごとの状況 の順。関連コードの本文・開いているファイル・直近の依頼と結果・書きかけの状態を含む", () => {
   const hit: any = { chunk: { file: "media/main.js", startLine: 10, endLine: 20, symbols: ["onLessonTest"], text: "function onLessonTest(m) {\n  show(m);\n}" }, score: 1 };
@@ -114,55 +74,38 @@ test("モデルへの入力: 指示 → 全体像 → 入力ごとの状況 の�
     coChanged: ["src/c.ts"],
     recent: [{ query: "ログインを直したい", outcome: "変更の依頼。受け入れ条件: …" }],
   };
-  const m = messagesFor("テストの表示を直したい。", "change", [hit], ctx);
+  const m = messagesFor("テストの表示を", "change", [hit], ctx);
   assert.deepEqual(m.map((x) => x.role), ["system", "user", "user"]);
-  assert.match(m[0]!.content!, /continue.*replace.*none/s);
+  assert.match(m[0]!.content!, /システムの全体像/);
   assert.equal(m[1]!.content, "【システムの全体像】\n【プロジェクト】\nコード思考");
   const last = m[2]!.content!;
-  for (const needle of ["ログインを直したい", "結果: 変更の依頼", "開いているファイル: src/a.ts", "const x = 1;", "未コミットの変更: src/b.ts", "media/main.js:10-20(onLessonTest)", "show(m);", "src/c.ts", "変更を組み立てる", "文末が完結している可能性: はい", "<<<テストの表示を直したい。>>>"]) {
+  for (const needle of ["ログインを直したい", "結果: 変更の依頼", "開いているファイル: src/a.ts", "const x = 1;", "未コミットの変更: src/b.ts", "media/main.js:10-20(onLessonTest)", "show(m);", "src/c.ts", "変更を組み立てる", "<<<テストの表示を>>>"]) {
     assert.ok(last.includes(needle), needle);
   }
   assert.ok(last.indexOf("最近の依頼") < last.indexOf("関連しそうなコード") && last.indexOf("関連しそうなコード") < last.indexOf("【書きかけ】"));
 });
 
-test("続きの候補: 文の途中なら続きを出し、推論なし・出力の上限・キャッシュキーを付け、同じ書きかけは使い回す", async () => {
-  const { a, requests, log } = assistant(() => cont("は、ファイルを保存してから `IndexManager.commit` までどう流れる?"));
-  const out = await a.complete("索引の更新", "auto");
-  assert.deepEqual(out, { kind: "continue", text: "は、ファイルを保存してから `IndexManager.commit` までどう流れる?" });
-  const req = requests[0]!;
-  assert.equal(req.channel, "assist-auto");
-  assert.equal(req.reasoningEffort, "none");
-  assert.equal(req.maxOutputTokens, 500);
-  assert.equal(req.retries, 0);
-  assert.equal(req.jsonSchema?.name, "prompt_assist");
-  assert.match(req.cacheKey ?? "", /^qbs-assist-[0-9a-f]{12}$/);
-  await a.complete("索引の更新", "auto");
-  assert.equal(requests.length, 1);
-  assert.match(log[0]!, /^続き 書きかけ 5文字 → /);
-});
-
-test("置き換え案: 書き終わっていて情報が足りない依頼に、足りない情報を補った案を出す。作業の状況は入力ごとに集めて渡す", async () => {
+test("続きの候補: 指示 → 全体像 → 入力ごとの状況 の順で送り、推論なし・出力の上限・キャッシュキーを付け、同じ書きかけは使い回す。作業の状況は入力ごとに集めて渡す", async () => {
   const seen: string[][] = [];
-  const { a, requests, log } = assistant(
-    () => repl("`onLessonTest` で、テストが失敗したときの表示を直したい。"),
+  const { a, requests } = assistant(
+    () => cont("は、ファイルを保存してから `IndexManager.commit` までどう流れる?"),
     NAMES,
     () => 0,
     async (files) => (seen.push(files), { overview: "全体像", recent: [{ query: "前の依頼", outcome: "結果" }] }),
   );
-  const out = await a.complete("テストの表示を直したい。", "auto");
-  assert.deepEqual(out, { kind: "replace", text: "`onLessonTest` で、テストが失敗したときの表示を直したい。" });
+  const out = await a.complete("索引の更新", "auto");
+  assert.deepEqual(out, { text: "は、ファイルを保存してから `IndexManager.commit` までどう流れる?" });
+  const req = requests[0]!;
+  assert.equal(req.channel, "assist-auto");
+  assert.equal(req.reasoningEffort, "none");
+  assert.equal(req.maxOutputTokens, 300);
+  assert.equal(req.retries, 0);
+  assert.equal(req.jsonSchema?.name, "prompt_completion");
+  assert.match(req.cacheKey ?? "", /^qbs-assist-[0-9a-f]{12}$/);
+  assert.match(req.messages[2]!.content!, /前の依頼/);
   assert.equal(seen.length, 1);
-  assert.match(requests[0]!.messages[2]!.content!, /前の依頼/);
-  assert.match(log[0]!, /^置き換え案 書きかけ 12文字 → /);
-});
-
-test("置き換え案は、文が途中のとき・別の依頼にしたとき・変わらないときは出さない。none は何も出さない", async () => {
-  const r = async (draft: string, reply: unknown) => (await assistant(() => reply).a.complete(draft, "auto"));
-  assert.deepEqual(await r("ログインの処理を", repl("`login` の処理を直したい。")), { kind: "none", text: "", reason: "unfinished" });
-  assert.equal((await r("テストの表示を直したい。", repl("ログイン画面にパスワードの再設定を追加して、メールも送れるようにしたい。"))).reason, "drift");
-  assert.equal((await r("テストの表示を直したい。", repl("テストの表示を直したい。"))).reason, "same");
-  assert.deepEqual(await r("`IndexManager.commit` がどこから呼ばれるか知りたい。", { kind: "none", text: "" }), { kind: "none", text: "", reason: "none" });
-  assert.equal((await r("テストの表示を直したい。", "not json")).reason, "unreadable");
+  await a.complete("索引の更新", "auto");
+  assert.equal(requests.length, 1);
 });
 
 test("入力補助: 索引がまだ無くても出す。短い・長い・秘密らしい書きかけは送らない。複数行の続きは最初の行を使う", async () => {
@@ -186,17 +129,21 @@ test("入力補助: 秘密らしい選択範囲・関連コードの抜粋は送
   assert.ok(sent.includes("src/ok.ts"));
 });
 
-test("入力補助: 出さなかった理由と候補を記録に残す", async () => {
-  const { a, log } = assistant(() => cont("承知しました"));
-  const out = await a.complete("ログインを直したい", "auto");
-  assert.deepEqual(out, { kind: "none", text: "", reason: "voice" });
-  assert.match(log[0]!, /出さない\(voice\).*候補「承知しました」/);
+test("続きの候補: 返事・空・「なし」・読めない応答・出力の上限で切れた応答は出さない", async () => {
+  const r = async (reply: unknown, finishReason?: string) => {
+    const f = { chat: async (): Promise<ChatResult> => ({ content: typeof reply === "string" ? reply : JSON.stringify(reply), toolCalls: [], finishReason }) };
+    return new PromptAssistant({ llm: f, index: () => NAMES, workspaceId: "/ws" }).complete("ログインを直したい", "auto");
+  };
+  assert.deepEqual(await r(cont("承知しました")), { text: "", reason: "voice" });
+  assert.equal((await r(cont(""))).reason, "empty");
+  assert.equal((await r("not json")).reason, "unreadable");
+  assert.equal((await r('{"completion":"はど', "length")).reason, "truncated");
 });
 
-test("入力補助: 失敗しても例外を投げず、理由を記録して休む(1分・2分・5分)。設定を変えると戻る", async () => {
+test("入力補助: 失敗しても例外を投げず休む(1分・2分)。設定を変えると戻る", async () => {
   let t = 0;
   let fail = true;
-  const { a, requests, log } = assistant(
+  const { a, requests } = assistant(
     () => {
       if (fail) {
         throw new Error("API エラー(400): Unrecognized request argument");
@@ -207,20 +154,20 @@ test("入力補助: 失敗しても例外を投げず、理由を記録して休
     () => t,
   );
   assert.equal((await a.complete("IndexManager の流れ 1", "auto")).reason, "error");
-  assert.match(log[0]!, /API エラー\(400\).*60秒休みます/);
   assert.equal((await a.complete("IndexManager の流れ 2", "auto")).reason, "paused");
   assert.equal(requests.length, 1);
   t = 61_000;
   assert.equal((await a.complete("IndexManager の流れ 3", "auto")).reason, "error");
-  assert.match(log.at(-1)!, /120秒休みます/);
+  t = 61_000 + 100_000;
+  assert.equal((await a.complete("IndexManager の流れ 4", "auto")).reason, "paused", "2回目の休みは2分");
   a.resetPause();
   fail = false;
-  assert.equal((await a.complete("IndexManager の流れ 4", "auto")).text, "はどう動く?");
+  assert.equal((await a.complete("IndexManager の流れ 5", "auto")).text, "はどう動く?");
 });
 
 test("入力補助: 1分間の上限を超えたら呼ばない。新しい書きかけが来たら前の要求を中止する", async () => {
   let t = 0;
-  const { a, requests } = assistant(() => ({ kind: "none", text: "" }), NAMES, () => t);
+  const { a, requests } = assistant(() => cont(""), NAMES, () => t);
   for (let i = 0; i < CALLS_PER_MINUTE; i++) {
     await a.complete(`索引の更新 ${i} 回目`, "auto");
   }
@@ -240,12 +187,6 @@ test("入力補助: 1分間の上限を超えたら呼ばない。新しい書�
   assert.equal(second.text, "はどう動く?");
 });
 
-test("入力補助: 出力の上限で切れた応答は出さない", async () => {
-  const f = { chat: async (): Promise<ChatResult> => ({ content: '{"kind":"continue","text":"はど', toolCalls: [], finishReason: "length" }) };
-  const a = new PromptAssistant({ llm: f, index: () => NAMES, workspaceId: "/ws" });
-  assert.equal((await a.complete("IndexManager の流れ", "auto")).reason, "truncated");
-});
-
 // ---------- API クライアント ----------
 
 test("API: 入力補助の任意の引数(推論なし・出力の上限・キャッシュキー)を拒まれたら、付けずに送り直して、以後は付けない", async () => {
@@ -254,7 +195,7 @@ test("API: 入力補助の任意の引数(推論なし・出力の上限・キ�
     if (b.reasoning_effort === "none" || b.prompt_cache_key || b.max_completion_tokens) {
       return { status: 400, json: { error: { message: "Unrecognized request argument supplied: prompt_cache_key" } } };
     }
-    return { json: { choices: [{ message: { role: "assistant", content: '{"kind":"continue","text":"はどう動く?"}' }, finish_reason: "stop" }] } };
+    return { json: { choices: [{ message: { role: "assistant", content: '{"completion":"はどう動く?"}' }, finish_reason: "stop" }] } };
   });
   try {
     const client = new OpenAiClient({ apiKey: async () => "k", baseUrl: () => server.baseUrl, model: () => "m", embeddingModel: () => "e", reasoningEffort: () => "auto", sleep: async () => {} });
