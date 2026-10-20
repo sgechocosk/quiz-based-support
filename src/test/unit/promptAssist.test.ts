@@ -2,57 +2,34 @@ import * as assert from "node:assert/strict";
 import * as path from "node:path";
 import { test } from "node:test";
 import { IndexManager } from "../../core/indexer";
-import { OpenAiClient, type ApiRequestInfo } from "../../core/llm";
-import type { ChatRequest, ChatResult, KeyValueStore } from "../../core/ports";
+import { OpenAiClient } from "../../core/llm";
+import type { ChatRequest, ChatResult } from "../../core/ports";
 import {
-  addedNameRefs,
-  AUTO_CALLS_PER_MINUTE,
+  CALLS_PER_MINUTE,
   codeNames,
-  contextNames,
-  draftIntent,
   looksSecret,
-  mentionsCodeName,
-  missingParts,
-  nameExists,
-  parseRefine,
   PromptAssistant,
   rejectCompletion,
   stripEcho,
+  unknownNames,
   type NameSource,
 } from "../../core/promptAssist";
+import { startFakeOpenAi } from "./helpers/fakeOpenAi";
 import { FakeEmbedder, makeTempDir, NodeWorkspace, writeFiles } from "./helpers/nodeWorkspace";
 import { TsCompilerParser } from "./helpers/tsAst";
 
-/** 索引の代わり: words にある単語・paths にあるパスだけが実在する */
-function fakeNames(words: string[], paths: string[] = [], repoMap?: string): NameSource {
-  const lower = new Set(words.map((w) => w.toLowerCase()));
+/** 索引の代わり: words にある識別子だけがコードに実在する */
+function fakeIndex(words: string[]): NameSource {
   return {
     hasChunks: () => true,
     lexicalSearch: () => [],
-    knowsWord: (w, exact = true) => (exact ? words.includes(w) : lower.has(w.toLowerCase())),
-    hasPath: (p) => paths.some((f) => f === p || f.endsWith(`/${p}`)),
-    completeName: (prefix) => {
-      const names = words.filter((w) => w.toLowerCase().startsWith(prefix.toLowerCase()) && w !== prefix);
-      return { names: names.slice(0, 5), total: names.length };
-    },
-    repoMap: () => repoMap ?? "src/core/indexer.ts — IndexManager, commit, prepare\nmedia/main.js — onLessonTest, handleAsk",
-    definitionOf: (n) => (words.includes(n) ? { path: "src/x.ts", line: 1 } : undefined),
+    knowsWord: (w, exact = true) => (exact ? words.includes(w) : words.some((x) => x.toLowerCase() === w.toLowerCase())),
+    repoMap: () => "src/core/indexer.ts — IndexManager, commit, prepare",
   };
 }
 
-const NAMES = fakeNames(["IndexManager", "commit", "prepare", "handleAsk", "onLessonTest"], ["src/core/indexer.ts", "media/main.js"]);
+const NAMES = fakeIndex(["IndexManager", "commit", "prepare", "handleAsk"]);
 
-function memoryStore(): KeyValueStore {
-  const data = new Map<string, unknown>();
-  return {
-    get: <T>(key: string) => data.get(key) as T | undefined,
-    update: async (key, value) => {
-      data.set(key, JSON.parse(JSON.stringify(value)));
-    },
-  };
-}
-
-/** 偽の LLM: reply が返す内容を JSON にして返す。リクエストは requests に残る */
 function fakeLlm(reply: (req: ChatRequest, n: number) => unknown | Promise<unknown>) {
   const requests: ChatRequest[] = [];
   return {
@@ -67,318 +44,198 @@ function fakeLlm(reply: (req: ChatRequest, n: number) => unknown | Promise<unkno
   };
 }
 
-function assistant(reply: (req: ChatRequest, n: number) => unknown | Promise<unknown>, names: NameSource = NAMES, now = () => 0) {
+function assistant(reply: (req: ChatRequest, n: number) => unknown | Promise<unknown>, index: NameSource | undefined = NAMES, now = () => 0) {
   const f = fakeLlm(reply);
-  const store = memoryStore();
-  return { ...f, store, a: new PromptAssistant({ llm: f.llm, index: () => names, store, workspaceId: "/ws", now }) };
+  const log: string[] = [];
+  return { ...f, log, a: new PromptAssistant({ llm: f.llm, index: () => index, workspaceId: "/ws", log: (l) => log.push(l), now }) };
 }
 
 // ---------- 整形と規則 ----------
 
-test("書きかけの繰り返し: 全体・後半の繰り返しは除き、偶然の短い重なりは残す", () => {
+test("書きかけの繰り返しを除く: 全体・末尾の繰り返しは除き、語の途中や偶然の短い重なりは残す", () => {
   assert.equal(stripEcho("索引の更新", "索引の更新は、どう流れる?"), "は、どう流れる?");
   assert.equal(stripEcho("ログイン処理を読みたい。特に失敗時", "特に失敗時の流れ"), "の流れ");
   assert.equal(stripEcho("テストのテスト", "テストを足したい"), "テストを足したい");
+  assert.equal(stripEcho("Add a dark mode toggle to the", " theme settings panel"), " theme settings panel");
   assert.equal(stripEcho("索引の更新", "  は?"), "は?");
-  assert.equal(stripEcho("add ", " a logout button"), "a logout button");
 });
 
-test("続きの候補を捨てる規則: メタ文・口調・評価・複数の文・書式・決めること", () => {
-  const r = (c: string, mode: "auto" | "read" | "change" = "auto", draft = "索引の更新") => rejectCompletion(draft, c, mode, NAMES);
-  assert.equal(r(""), "empty");
-  assert.equal(r("(なし)"), "meta");
-  assert.equal(r("提案はありません"), "meta");
-  assert.equal(r("承知しました、索引を見ます"), "assistant_voice");
-  assert.equal(r("を確認しますね"), "assistant_voice");
-  assert.equal(r("ありがとうございます"), "evaluative");
-  assert.equal(r("はどう動く?あと保存も"), "multiple_sentences");
-  assert.equal(r("は\nどう動く?"), "multiline");
-  assert.equal(r("- 一覧"), "formatting");
-  assert.equal(r("を〔決めること〕にしたい"), "placeholder");
-  assert.equal(r("x".repeat(81)), "too_long");
+test("続きの候補として自然なものは出し、メタ文・口調・複数の文・書式・長すぎるものは出さない", () => {
+  const ok = (draft: string, c: string) => rejectCompletion(draft, stripEcho(draft, c), NAMES);
+  assert.equal(ok("索引の更新", "は、ファイルを保存してから `IndexManager.commit` までどう流れる?"), undefined);
+  assert.equal(ok("ログアウト機能を", "追加したい"), undefined);
+  assert.equal(ok("テストモードのとき", "自動の候補を出さないようにしたい"), undefined);
+  assert.equal(ok("`handleAsk` がどこから", "呼ばれているか知りたい"), undefined);
+  assert.equal(ok("索引の更新", ""), "empty");
+  assert.equal(ok("索引の更新", "(なし)"), "meta");
+  assert.equal(ok("索引の更新", "承知しました、見てみます"), "voice");
+  assert.equal(ok("索引の更新", "はどう動く?あと保存も"), "sentences");
+  assert.equal(ok("索引の更新", "は\nどう動く?"), "multiline");
+  assert.equal(ok("索引の更新", "- 一覧"), "formatting");
+  assert.equal(ok("索引の更新", "を〔決めること〕にしたい"), "formatting");
+  assert.equal(ok("索引の更新", "x".repeat(81)), "too_long");
 });
 
-test("続きの候補を捨てる規則: 進め方との食い違い・索引に無い名前。読み解きの問いは出してよい", () => {
-  assert.equal(rejectCompletion("索引の更新", "は、`IndexManager.commit` までどう流れる?", "read", NAMES), undefined);
-  assert.equal(rejectCompletion("索引の更新", "は、`IndexManager.flushAll` までどう流れる?", "auto", NAMES), "unknown_name");
-  assert.equal(rejectCompletion("索引の更新", "に進み具合の表示を追加したい", "read", NAMES), "intent_flip");
-  assert.equal(rejectCompletion("索引の更新", "の流れを知りたい", "read", NAMES), undefined);
-  // 自動で判断でも、書きかけが示す種類は変えない
-  assert.equal(rejectCompletion("索引の更新はどう", "変えればよいか知りたいので `commit` を直したい", "auto", NAMES), "intent_flip");
-  assert.equal(rejectCompletion("ログアウトを追加したい", "。あわせてログインも直したい", "auto", NAMES), "multiple_sentences");
-  assert.equal(rejectCompletion("ログアウトボタンを", "追加して、あわせて設定も直したい", "auto", NAMES), "extra_request");
-  assert.equal(rejectCompletion("保存ボタンを押", "したら確認を出したい", "auto", NAMES), "new_condition");
-  assert.equal(rejectCompletion("パスワードを間違えたらロック", "を5回目から有効にしたい", "auto", NAMES), "new_number");
-  assert.equal(rejectCompletion("保存したら", "「保存しました」と表示したい", "auto", NAMES), "new_quote");
-  assert.equal(rejectCompletion("保存したら「保存しました」", "と表示したい", "auto", NAMES), undefined);
-  assert.equal(rejectCompletion("`utf8` の", "読み込みはどう動く?", "auto", fakeNames(["utf8"])), undefined);
-  assert.equal(rejectCompletion("索引の更新処理を", "直すにはどうする?", "change", NAMES), "question_in_change");
-  // 利用者が書いた名前は確かめない
-  assert.equal(rejectCompletion("fooBarBaz の", "処理はどう動く?", "auto", NAMES), undefined);
+test("コードの名前は索引にあるものだけ。書きかけにある名前・製品名・パスは確かめない", () => {
+  assert.deepEqual(codeNames("`IndexManager.commit` と handleAsk と media/main.js と OpenAI"), ["IndexManager.commit", "handleAsk", "OpenAI"]);
+  assert.deepEqual(unknownNames("`IndexManager.flushAll` と `handleLogout` を見る", NAMES), ["IndexManager.flushAll", "handleLogout"]);
+  assert.deepEqual(unknownNames("`fooBarBaz` の処理", NAMES, "fooBarBaz の"), []);
+  assert.deepEqual(unknownNames("OpenAI の呼び出し", NAMES), []);
+  assert.equal(rejectCompletion("索引の更新", "は `IndexManager.flushAll` からどう呼ばれる?", NAMES), "unknown_name");
 });
 
-test("名前は文脈(構成の地図・手がかり・書きかけ)にあるものだけ認め、LLM が書いた名前は大文字小文字まで確かめる", () => {
-  const ctx = contextNames("src/core/indexer.ts — IndexManager, commit", "- media/main.js:1-9(function onLessonTest)", "索引の更新");
-  assert.ok(ctx.has("IndexManager") && ctx.has("indexer.ts") && ctx.has("src/core/indexer.ts") && ctx.has("main.js"));
-  assert.ok(nameExists("IndexManager.commit", NAMES, "", ctx));
-  assert.ok(!nameExists("handleAsk", NAMES, "", ctx), "索引にはあるが文脈に無い");
-  assert.ok(!nameExists("indexManager", NAMES, "", ctx), "大文字小文字が違う");
-  assert.ok(nameExists("media/main.js", NAMES, "", ctx));
-  assert.equal(rejectCompletion("索引の更新", "は `handleAsk` からどう呼ばれる?", "auto", NAMES, ctx), "unknown_name");
-});
-
-test("コードの名前: バッククォート・camelCase・パスを拾い、製品名や利用者の書いた名前は確かめない", () => {
-  assert.deepEqual(codeNames("`IndexManager.commit` と handleAsk と media/main.js と OpenAI"), ["IndexManager.commit", "handleAsk", "media/main.js", "OpenAI"]);
-  assert.ok(nameExists("IndexManager.commit", NAMES));
-  assert.ok(!nameExists("IndexManager.flushAll", NAMES));
-  assert.ok(nameExists("main.js", NAMES));
-  assert.ok(!nameExists("src/none.ts", NAMES));
-  assert.ok(nameExists("OpenAI", NAMES));
-  assert.ok(nameExists("handleLogin()", NAMES, "handleLogin() を読みたい"));
-});
-
-test("伝わりやすさの要素: 利用者にしか決められないことだけ(変更はどうなってほしいか、読み解きは知りたいこと)。場所は求めない", () => {
-  assert.deepEqual(missingParts("ログインを直したい", "auto"), ["どうなってほしいか"]);
-  assert.deepEqual(missingParts("ログインで失敗した行を表示したい", "auto"), []);
-  assert.deepEqual(missingParts("索引の更新", "read"), ["知りたいこと(流れ・呼び出し元・データなど)"]);
-  assert.deepEqual(missingParts("索引の更新はどう動く?", "auto"), []);
-});
-
-test("書き直しで補った名前に、定義の場所を添える(書きかけにあった名前・製品名は除く)", () => {
-  const defs: Record<string, { path: string; line: number }> = {
-    onLessonTest: { path: "media/main.js", line: 1380 },
-    commit: { path: "src/core/indexer.ts", line: 320 },
-    "package.json": { path: "package.json", line: 1 },
-  };
-  const refs = addedNameRefs("`onLessonTest` と `IndexManager.commit` と `package.json` と `handleAsk` と OpenAI と `noSuch`", "handleAsk を", { definitionOf: (n) => defs[n] });
-  assert.deepEqual(refs, [
-    { name: "onLessonTest", path: "media/main.js", line: 1380 },
-    { name: "IndexManager.commit", path: "src/core/indexer.ts", line: 320 },
-    { name: "package.json", path: "package.json", line: 1 },
-  ]);
-});
-
-test("書き直し案の確認: 案に無い要素・〔〕の無い問い・同じ選択肢を捨て、無い名前・書きかけに無い数値・進め方の食い違いは直させる", () => {
-  const { proposal, problems } = parseRefine(
-    {
-      instruction: "`onLessonTest` で、テストの〔表示する内容〕も出すようにしたい。",
-      intent: "change",
-      parts: [
-        { kind: "location", text: "`onLessonTest` で" },
-        { kind: "behavior", text: "も出すようにしたい" },
-        { kind: "scope", text: "成功したときは変えない" },
-        { kind: "bogus", text: "x" },
-      ],
-      questions: [
-        {
-          slot: "〔表示する内容〕",
-          question: "何を表示しますか?",
-          options: [
-            { label: "終了コード", fill: "終了コード" },
-            { label: "失敗したテスト名", fill: "失敗したテスト名" },
-            { label: "同じ", fill: "失敗したテスト名" },
-            { label: "", fill: "x" },
-          ],
-        },
-        { slot: "〔無い〕", question: "?", options: [{ label: "a", fill: "a" }, { label: "b", fill: "b" }] },
-      ],
-    },
-    "テストの表示を直したい",
-    "auto",
-    NAMES,
-  );
-  assert.deepEqual(problems, []);
-  assert.deepEqual(proposal!.parts.map((p) => p.kind), ["location", "behavior"]);
-  assert.equal(proposal!.questions.length, 1);
-  assert.deepEqual(proposal!.questions[0]!.options.map((o) => o.label), ["終了コード", "失敗したテスト名"]);
-
-  const bad = parseRefine({ instruction: "`handleLogout` を足したい", intent: "change", parts: [], questions: [] }, "ログアウト", "read", NAMES);
-  assert.deepEqual(bad.proposal!.unknownNames, ["handleLogout"]);
-  assert.equal(bad.problems.length, 1);
-  assert.equal(bad.nameProblems.length, 1, "名前の指摘は別に返す(索引が無いときは作り直しの理由にしない)");
-  assert.deepEqual(parseRefine({ instruction: " " }, "x", "auto", NAMES).problems, ["instruction が空です。"]);
-  assert.match(parseRefine({ instruction: "5回失敗したらロックしたい", intent: "change" }, "ログインをロックしたい", "auto", NAMES).problems[0]!, /数値/);
+test("秘密らしい文字列(API キー・環境変数の形・Bearer・URL のパスワード)は送らない", () => {
+  for (const t of ["sk-abcdefghijklmnopqrstu", "OPENAI_API_KEY=abcdef123456", "DB_PASSWORD: hunter2hunter2", "Authorization: Bearer abcdefghijklmnopqrstuvwxyz", "https://user:pass@example.com"]) {
+    assert.ok(looksSecret(t), t);
+  }
+  assert.ok(!looksSecret("ログイン処理の流れを知りたい"));
 });
 
 // ---------- 続きの候補(本体) ----------
 
-test("続きの候補: 指示 → 構成と最近の依頼 → 書きかけ の順で送り、自動の系統・推論なし・キャッシュキーを付ける", async () => {
-  const { a, requests } = assistant(() => ({ completion: "は、`IndexManager.commit` までどう流れる?", intent: "read" }));
+test("続きの候補: 指示 → 構成 → 書きかけ の順で送り、推論なし・出力の上限・キャッシュキーを付け、同じ書きかけは使い回す", async () => {
+  const { a, requests, log } = assistant(() => ({ completion: "は、`IndexManager.commit` までどう流れる?" }));
   const out = await a.complete("索引の更新", "auto");
   assert.equal(out.completion, "は、`IndexManager.commit` までどう流れる?");
   const req = requests[0]!;
   assert.equal(req.channel, "assist-auto");
   assert.equal(req.reasoningEffort, "none");
+  assert.equal(req.maxOutputTokens, 200);
+  assert.equal(req.retries, 0);
   assert.match(req.cacheKey ?? "", /^qbs-assist-[0-9a-f]{12}$/);
-  assert.equal(req.jsonSchema?.name, "prompt_completion");
   assert.deepEqual(req.messages.map((m) => m.role), ["system", "user", "user"]);
   assert.match(req.messages[1]!.content!, /IndexManager, commit/);
   assert.match(req.messages[2]!.content!, /<<<索引の更新>>>/);
-  // 同じ書きかけは覚えている(API を呼ばない)
   await a.complete("索引の更新", "auto");
+  assert.equal(requests.length, 1);
+  assert.match(log[0]!, /^表示 書きかけ 5文字 → /);
+});
+
+test("続きの候補: 索引がまだ無くても出す(名前は確かめない)。短い・長い・秘密らしい書きかけは送らない", async () => {
+  const { a, requests } = assistant(() => ({ completion: "はどう動く?" }), undefined);
+  assert.equal((await a.complete("fooBar の流れ", "auto")).completion, "はどう動く?");
+  assert.equal((await a.complete("ログ", "auto")).reason, "short");
+  assert.equal((await a.complete("x".repeat(401), "auto")).reason, "long");
+  assert.equal((await a.complete("1行目\n2行目\n3行目\n4行目", "auto")).reason, "long");
+  assert.equal((await a.complete("キーは sk-abcdefghijklmnopqrstu です", "auto")).reason, "secret");
   assert.equal(requests.length, 1);
 });
 
-test("続きの候補: 短い・秘密らしい書きかけは送らず、捨てた候補は理由と足りない要素を返す", async () => {
-  const { a, requests } = assistant(() => ({ completion: "承知しました", intent: "none" }));
-  assert.equal((await a.complete("ログ", "auto")).reason, "short");
-  assert.equal((await a.complete("キーは sk-abcdefghijklmnopqrstu です", "auto")).reason, "secret");
-  assert.equal(requests.length, 0);
+test("続きの候補: 捨てた理由と候補を記録に残す", async () => {
+  const { a, log } = assistant(() => ({ completion: "承知しました" }));
   const out = await a.complete("ログインを直したい", "auto");
-  assert.equal(out.completion, "");
-  assert.equal(out.reason, "assistant_voice");
-  assert.deepEqual(out.missing, ["どうなってほしいか"]);
-  assert.equal(a.stats().suppressed.assistant_voice, 1);
+  assert.deepEqual(out, { completion: "", reason: "voice" });
+  assert.match(log[0]!, /出さない\(voice\).*候補「承知しました」/);
 });
 
-test("続きの候補: 失敗しても例外を投げず、1分間の上限を超えたら呼ばない", async () => {
-  const failing = assistant(() => {
-    throw new Error("400 response_format is not supported");
-  });
-  const out = await failing.a.complete("索引の更新はどう", "auto");
-  assert.equal(out.reason, "error");
-
+test("続きの候補: 失敗しても例外を投げず、理由を記録して休む(1分・2分・5分)。成功すれば戻り、設定を変えても戻る", async () => {
   let t = 0;
-  const { a, requests } = assistant(() => ({ completion: "", intent: "none" }), NAMES, () => t);
-  for (let i = 0; i < AUTO_CALLS_PER_MINUTE; i++) {
+  let fail = true;
+  const { a, requests, log } = assistant(
+    () => {
+      if (fail) {
+        throw new Error("API エラー(400): Unrecognized request argument");
+      }
+      return { completion: "はどう動く?" };
+    },
+    NAMES,
+    () => t,
+  );
+  assert.equal((await a.complete("IndexManager の流れ 1", "auto")).reason, "error");
+  assert.match(log[0]!, /API エラー\(400\).*60秒休みます/);
+  assert.equal((await a.complete("IndexManager の流れ 2", "auto")).reason, "paused");
+  assert.equal(requests.length, 1);
+  t = 61_000;
+  assert.equal((await a.complete("IndexManager の流れ 3", "auto")).reason, "error");
+  assert.match(log.at(-1)!, /120秒休みます/);
+  a.resetPause();
+  fail = false;
+  assert.equal((await a.complete("IndexManager の流れ 4", "auto")).completion, "はどう動く?");
+});
+
+test("続きの候補: 1分間の上限を超えたら呼ばない。新しい書きかけが来たら前の要求を中止する", async () => {
+  let t = 0;
+  const { a, requests } = assistant(() => ({ completion: "" }), NAMES, () => t);
+  for (let i = 0; i < CALLS_PER_MINUTE; i++) {
     await a.complete(`索引の更新 ${i} 回目`, "auto");
   }
   assert.equal((await a.complete("索引の更新 上限を超えた", "auto")).reason, "rate");
-  assert.equal(requests.length, AUTO_CALLS_PER_MINUTE);
+  assert.equal(requests.length, CALLS_PER_MINUTE);
   t = 61_000;
   await a.complete("索引の更新 1分後", "auto");
-  assert.equal(requests.length, AUTO_CALLS_PER_MINUTE + 1);
-});
+  assert.equal(requests.length, CALLS_PER_MINUTE + 1);
 
-test("続きの候補: 新しい書きかけが来たら前の要求を中止する", async () => {
-  const { a } = assistant(
-    (req, n) =>
-      n === 1
-        ? new Promise((_, reject) => req.signal!.addEventListener("abort", () => reject(new Error("中止しました。"))))
-        : { completion: "はどう動く?", intent: "read" },
+  const slow = assistant((req, n) =>
+    n === 1 ? new Promise((_, reject) => req.signal!.addEventListener("abort", () => reject(new Error("中止しました。")))) : { completion: "はどう動く?" },
   );
-  const first = a.complete("IndexManager の", "auto");
-  const second = await a.complete("IndexManager の prepare", "auto");
+  const first = slow.a.complete("IndexManager の", "auto");
+  const second = await slow.a.complete("IndexManager の prepare", "auto");
   assert.equal((await first).reason, "aborted");
   assert.equal(second.completion, "はどう動く?");
 });
 
-// ---------- 書き直し案 ----------
-
-test("書き直し案: 名前の誤りは1回だけ作り直させ、残ったら見つからない名前として返す", async () => {
-  const good = {
-    instruction: "`onLessonTest` で、テストの〔表示する内容〕も出すようにしたい。",
-    intent: "change",
-    parts: [{ kind: "location", text: "`onLessonTest` で" }],
-    questions: [],
-  };
-  const fixed = assistant((_req, n) => (n === 1 ? { ...good, instruction: "`renderTestFailure` で表示したい。" } : good));
-  const p = await fixed.a.refine("テストの表示を直したい", "auto");
-  assert.equal(p.instruction, good.instruction);
-  assert.equal(fixed.requests.length, 2);
-  assert.equal(fixed.requests[0]!.channel, "assist");
-  assert.match(fixed.requests[1]!.messages.at(-1)!.content!, /renderTestFailure/);
-
-  const stubborn = assistant(() => ({ ...good, instruction: "`renderTestFailure` で表示したい。" }));
-  const q = await stubborn.a.refine("テストの表示を直したい", "auto");
-  assert.deepEqual(q.unknownNames, ["renderTestFailure"]);
-  assert.equal(stubborn.requests.length, 2);
-
-  const broken = assistant(() => "not json");
-  await assert.rejects(broken.a.refine("テストの表示を直したい", "auto"), /整えられませんでした/);
-});
-
-// ---------- 記録と間隔 ----------
-
-test("候補が表示されたのに使わない依頼が続いたら間隔を延ばし、使えば戻す。結果は補助の有無で分けて数える", async () => {
-  const { a } = assistant(() => ({ completion: "", intent: "none" }));
-  const normal = a.delayMs();
-  for (let i = 0; i < 9; i++) {
-    a.recordSend(`依頼 ${i}`, { shown: 1, accepted: 0, refined: false });
-  }
-  a.recordSend("表示なし", { shown: 0, accepted: 0, refined: false });
-  assert.equal(a.delayMs(), normal, "表示が無かった依頼は数えない");
-  a.recordSend("依頼 9", { shown: 2, accepted: 0, refined: false });
-  assert.ok(a.delayMs() > normal);
-  a.recordSend("使った", { shown: 1, accepted: 1, refined: false });
-  assert.equal(a.delayMs(), normal);
-
-  a.recordResult("使った", { steps: 4 });
-  a.recordResult("使った", { clarified: true });
-  a.recordResult("別の依頼", { steps: 100 });
-  a.recordSend("使わない", { shown: 0, accepted: 0, refined: false });
-  a.recordResult("使わない", { steps: 9, clarified: true });
-  const s = a.stats();
-  assert.equal(s.sends, 13);
-  assert.equal(s.assistedSends, 1);
-  assert.deepEqual([s.investigatedAssisted, s.stepsAssisted, s.clarifiedAssisted], [1, 4, 1]);
-  assert.deepEqual([s.investigatedUnassisted, s.stepsUnassisted, s.clarifiedUnassisted], [1, 9, 1]);
+test("続きの候補: 出力の上限で切れた応答は出さない", async () => {
+  const f = { chat: async (): Promise<ChatResult> => ({ content: '{"completion":"はど', toolCalls: [], finishReason: "length" }) };
+  const a = new PromptAssistant({ llm: f, index: () => NAMES, workspaceId: "/ws" });
+  assert.equal((await a.complete("IndexManager の流れ", "auto")).reason, "truncated");
 });
 
 // ---------- API クライアント ----------
 
-test("API: 呼び出しごとの推論強度を送り、拒まれたら設定どおりに戻して覚える。キャッシュキーは公式エンドポイントにだけ送る", async () => {
-  const bodies: any[] = [];
-  const infos: ApiRequestInfo[] = [];
-  let base = "https://api.openai.com/v1";
-  const fetchImpl = (async (_url: any, init: any) => {
-    const body = JSON.parse(init.body);
-    bodies.push(body);
-    if (body.reasoning_effort === "none") {
-      return new Response(JSON.stringify({ error: { message: "Unsupported value: 'reasoning_effort' does not support 'none'" } }), { status: 400 });
+test("API: 入力補助の任意の引数(推論なし・出力の上限・キャッシュキー)を拒まれたら、付けずに送り直して、以後は付けない", async () => {
+  const server = await startFakeOpenAi((req) => {
+    const b = req.body;
+    if (b.reasoning_effort === "none" || b.prompt_cache_key || b.max_completion_tokens) {
+      return { status: 400, json: { error: { message: "Unrecognized request argument supplied: prompt_cache_key" } } };
     }
-    return new Response(JSON.stringify({ choices: [{ message: { role: "assistant", content: "{}" } }] }), { status: 200 });
-  }) as unknown as typeof fetch;
-  let effort = "auto";
-  const c = new OpenAiClient({
-    apiKey: async () => "k",
-    baseUrl: () => base,
-    model: () => "m",
-    embeddingModel: () => "e",
-    reasoningEffort: () => effort,
-    fetchImpl,
-    sleep: async () => {},
-    beforeRequest: async (info) => {
-      infos.push(info);
-    },
+    return { json: { choices: [{ message: { role: "assistant", content: '{"completion":"はどう動く?"}' }, finish_reason: "stop" }] } };
   });
-  const req: ChatRequest = { messages: [{ role: "user", content: "x" }], reasoningEffort: "none", cacheKey: "qbs", channel: "assist-auto" };
-  await c.chat(req);
-  assert.equal(bodies.length, 2);
-  assert.equal(bodies[0].reasoning_effort, "none");
-  assert.equal(bodies[1].reasoning_effort, "minimal", "none を拒まれたら minimal を試す");
-  assert.equal(bodies[0].prompt_cache_key, "qbs");
-  assert.equal(infos[0]!.channel, "assist-auto");
-  await c.chat(req);
-  assert.equal(bodies.length, 3, "none を拒まれたモデルには最初から minimal を送る");
-  assert.equal(bodies[2].reasoning_effort, "minimal");
+  try {
+    const client = new OpenAiClient({ apiKey: async () => "k", baseUrl: () => server.baseUrl, model: () => "m", embeddingModel: () => "e", reasoningEffort: () => "auto", sleep: async () => {} });
+    const a = new PromptAssistant({ llm: client, index: () => NAMES, workspaceId: "/ws" });
+    assert.equal((await a.complete("IndexManager の流れ", "auto")).completion, "はどう動く?");
+    assert.equal(server.requests.length, 2);
+    assert.equal(server.requests[1]!.body.reasoning_effort, undefined);
+    assert.equal(server.requests[1]!.body.max_completion_tokens, undefined);
+    await a.complete("IndexManager の流れ 2", "auto");
+    assert.equal(server.requests.length, 3, "拒まれたモデルには最初から付けない");
+    assert.equal(server.requests[2]!.body.prompt_cache_key, undefined);
+  } finally {
+    await server.close();
+  }
+});
 
-  base = "http://localhost:11434/v1";
-  effort = "default";
-  bodies.length = 0;
-  const c2 = new OpenAiClient({ apiKey: async () => "k", baseUrl: () => base, model: () => "m2", embeddingModel: () => "e", reasoningEffort: () => effort, fetchImpl, sleep: async () => {} });
-  await c2.chat({ ...req, reasoningEffort: "low" });
-  assert.equal(bodies[0].reasoning_effort, undefined, "設定が default なら送らない");
-  assert.equal(bodies[0].prompt_cache_key, undefined, "互換エンドポイントには送らない");
-  await c2.chat({ messages: [{ role: "user", content: "x" }] });
-  assert.equal(infos.at(-1)!.channel, "assist-auto");
+test("API: 公式エンドポイントにだけキャッシュキーと出力の上限を送る。設定が default なら推論強度を送らない。補助の呼び出しは見積もりの補正に使わない", async () => {
+  const bodies: any[] = [];
+  const infos: string[] = [];
+  const fetchImpl = (async (_url: any, init: any) => {
+    bodies.push(JSON.parse(init.body));
+    return new Response(JSON.stringify({ choices: [{ message: { role: "assistant", content: "{}" } }], usage: { prompt_tokens: 10 } }), { status: 200 });
+  }) as unknown as typeof fetch;
+  const make = (base: string, effort: string) =>
+    new OpenAiClient({ apiKey: async () => "k", baseUrl: () => base, model: () => "m", embeddingModel: () => "e", reasoningEffort: () => effort, fetchImpl, sleep: async () => {}, beforeRequest: async (i) => void infos.push(i.channel) });
+  const req: ChatRequest = { messages: [{ role: "user", content: "x" }], reasoningEffort: "none", cacheKey: "qbs", maxOutputTokens: 200, channel: "assist-auto" };
+  await make("https://api.openai.com/v1", "auto").chat(req);
+  assert.deepEqual([bodies[0].reasoning_effort, bodies[0].prompt_cache_key, bodies[0].max_completion_tokens], ["none", "qbs", 200]);
+  await make("http://localhost:11434/v1", "auto").chat(req);
+  assert.deepEqual([bodies[1].reasoning_effort, bodies[1].prompt_cache_key, bodies[1].max_completion_tokens], ["none", undefined, undefined]);
+  await make("https://api.openai.com/v1", "default").chat(req);
+  assert.deepEqual([bodies[2].reasoning_effort, bodies[2].prompt_cache_key], [undefined, undefined]);
+  assert.deepEqual(infos, ["assist-auto", "assist-auto", "assist-auto"]);
 });
 
 // ---------- 索引 ----------
 
-test("索引: 名前の前方一致(大文字小文字の一致・出てくる数の順)、単語とパスの実在、埋め込みを使わない検索", async () => {
+test("索引: 埋め込みを呼ばない検索、コードの識別子の実在確認(文書にだけ出る語は認めない)", async () => {
   const root = await makeTempDir();
   await writeFiles(root, {
-    "src/auth.ts": `export function loginUser(name: string): boolean {\n  return name !== "";\n}\n\nexport function logoutUser(): void {\n  loginUser("x");\n  loginUser("y");\n}\n`,
-    "src/log.ts": `export function LoginBanner(): string {\n  return "hi";\n}\n`,
-    "package.json": `{"name": "x"}\n`,
-    "docs/README.md": "# README\nloginUser の説明\n",
+    "src/auth.ts": `export function loginUser(name: string): boolean {\n  return name !== "";\n}\n\nexport function logoutUser(): void {\n  loginUser("x");\n}\n`,
+    "docs/README.md": "# README\nloginUser の説明と onlyInDocs\n",
   });
-  const ws = new NodeWorkspace(root);
   const embedder = new FakeEmbedder();
   const mgr = new IndexManager({
     dir: path.join(root, ".idx"),
-    workspace: ws,
+    workspace: new NodeWorkspace(root),
     parser: new TsCompilerParser(),
     embedder: () => embedder,
     embeddingModel: () => "fake",
@@ -386,173 +243,11 @@ test("索引: 名前の前方一致(大文字小文字の一致・出てくる�
   await mgr.load();
   await mgr.commit(await mgr.prepare(), { embed: true });
   const calls = embedder.calls;
-
-  const r = mgr.completeName("log");
-  assert.deepEqual(r.names.slice(0, 3), ["loginUser", "logoutUser", "log.ts"]);
-  assert.ok(r.names.includes("LoginBanner"));
-  assert.deepEqual(mgr.completeName("src/a").names, ["src/auth.ts"]);
-  assert.equal(mgr.completeName("loginUser").names.includes("loginUser"), false);
+  assert.equal(mgr.lexicalSearch("logout", 2)[0]!.chunk.file, "src/auth.ts");
+  assert.equal(embedder.calls, calls, "埋め込みを呼ばない");
   assert.ok(mgr.knowsWord("loginUser"));
   assert.ok(!mgr.knowsWord("LOGINUSER"), "既定は大文字小文字まで一致");
   assert.ok(mgr.knowsWord("LOGINUSER", false));
-  assert.ok(!mgr.knowsWord("signupUser", false));
-  assert.ok(!mgr.knowsWord("README"), "文書にしか出てこない語は認めない");
-  assert.ok(mgr.hasPath("src/auth.ts") && mgr.hasPath("auth.ts") && mgr.hasPath("./src/log.ts"));
-  assert.ok(mgr.hasPath("package.json"), "索引に入れない .json もパスとして認める");
-  assert.ok(!mgr.hasPath("src/none.ts"));
-  assert.equal(mgr.lexicalSearch("logout", 2)[0]!.chunk.file, "src/auth.ts");
-  assert.equal(embedder.calls, calls, "埋め込みを呼ばない");
-});
-
-test("続きの候補の歯止め: 設定の誤りで止め、混み合いは時間を置き、遅ければ止める。長い・秘密らしい書きかけと索引が無いときは呼ばない", async () => {
-  let t = 0;
-  let status: number | undefined = 401;
-  let delay = 0;
-  const { a, requests } = assistant(
-    async () => {
-      t += delay;
-      if (status !== undefined) {
-        throw Object.assign(new Error("API エラー"), { status });
-      }
-      return { completion: "はどう動く?", intent: "read" };
-    },
-    NAMES,
-    () => t,
-  );
-  assert.equal((await a.complete("IndexManager の流れ", "auto")).reason, "error");
-  assert.equal(a.autoBlock(), "config");
-  assert.equal((await a.complete("IndexManager の流れ 2", "auto")).reason, "config");
-  assert.equal(requests.length, 1, "設定の誤りでは呼び続けない");
-  a.resetPause();
-  status = 429;
-  await a.complete("IndexManager の流れ 3", "auto");
-  assert.equal(a.autoBlock(), undefined);
-  assert.equal((await a.complete("IndexManager の流れ 4", "auto")).reason, "paused");
-  t += 61_000;
-  status = undefined;
-  delay = 3000;
-  for (let i = 0; i < 3; i++) {
-    await a.complete(`IndexManager の流れ 遅い ${i}`, "auto");
-  }
-  assert.equal(a.autoBlock(), "slow");
-  a.resetPause();
-  const n = requests.length;
-  assert.equal((await a.complete("x".repeat(401), "auto")).reason, "long");
-  assert.equal((await a.complete("1行目\n2行目\n3行目\n4行目", "auto")).reason, "long");
-  assert.equal((await a.complete("Authorization: Bearer abcdefghijklmnopqrstuvwxyz", "auto")).reason, "secret");
-  assert.equal((await a.complete("接続先 https://user:pass@example.com を", "auto")).reason, "secret");
-  assert.equal(requests.length, n);
-
-  const noIndex = new PromptAssistant({ llm: fakeLlm(() => ({})).llm, index: () => undefined, store: memoryStore(), workspaceId: "/ws" });
-  assert.equal((await noIndex.complete("IndexManager の流れ", "auto")).reason, "no_index");
-});
-
-test("使われない状態が続いても止めずに(利用者が決めること)、オフにできると知らせる。秘密らしい依頼は最近の依頼に残さない", async () => {
-  const { a, store } = assistant(() => ({ completion: "", intent: "none" }));
-  for (let i = 0; i < 30; i++) {
-    a.recordSend(`依頼 ${i}`, { shown: 1, accepted: 0, refined: false });
-  }
-  assert.equal(a.autoBlock(), undefined);
-  assert.ok(a.rarelyUsed());
-  a.resetPause(true);
-  assert.ok(!a.rarelyUsed(), "スイッチを入れ直すと数え直す");
-  a.recordSend("トークンは token=abcdef123456 です", { shown: 0, accepted: 0, refined: false });
-  assert.ok(!JSON.stringify(store.get("promptAssist.v1")).includes("abcdef123456"));
-});
-
-// ---------- レビューで見つかった問題の再発防止 ----------
-
-test("依頼の種類: 「教えてください」は読み解き、「並べ替えたい」「止めたい」は変更。どちらの言い方でも候補を捨てない", () => {
-  assert.equal(draftIntent("`IndexManager.commit` の流れを教えてください", "auto"), "read");
-  assert.equal(draftIntent("一覧を名前順に並べ替えたい", "auto"), "change");
-  assert.deepEqual(missingParts("索引の更新の仕組みを説明してください", "auto"), []);
-  assert.equal(rejectCompletion("`IndexManager.commit` がどこから呼ばれるか", "教えてください", "read", NAMES), undefined);
-  assert.equal(rejectCompletion("`handleAsk` が何をしているか", "説明してください", "auto", NAMES), undefined);
-  assert.equal(rejectCompletion("一覧を", "名前順に並べ替えたい", "change", NAMES), undefined);
-  assert.equal(rejectCompletion("`prepare` のログを", "止めたい", "change", NAMES), undefined);
-  assert.deepEqual(missingParts("認証のフローを理解したい", "auto"), []);
-});
-
-test("書きかけの繰り返しの除去は、語の途中で切らない(the → theme)", () => {
-  assert.equal(stripEcho("Add a dark mode toggle to the", " theme settings panel"), " theme settings panel");
-  assert.equal(stripEcho("How is the index", " indexed after saving?"), " indexed after saving?");
-});
-
-test("名前: フォルダは実在として認め、拡張子もフォルダとしての一致も無い a/b(true/false)は名前として確かめない", () => {
-  const names = fakeNames(["IndexManager"], ["src/core/indexer.ts"]);
-  const withDirs: NameSource = { ...names, hasPath: (p) => p === "src/core" || names.hasPath(p) };
-  const ctx = contextNames("src/core/indexer.ts — IndexManager");
-  assert.ok(ctx.has("src/core"));
-  assert.ok(nameExists("src/core", withDirs, "", ctx));
-  assert.ok(nameExists("true/false", withDirs, "", ctx));
-  assert.ok(!mentionsCodeName("TypeScript の型エラーを直したい", NAMES), "製品名は名前として数えない");
-  assert.ok(mentionsCodeName("indexmanager の流れ", NAMES), "大文字小文字の違いは許す");
-});
-
-test("秘密らしい文字列: 環境変数の形も送らない", () => {
-  for (const t of ["OPENAI_API_KEY=abcdef123456", "DB_PASSWORD: hunter2hunter2", "AWS_SECRET_ACCESS_KEY=abcd/efgh+ijkl"]) {
-    assert.ok(looksSecret(t), t);
-  }
-  assert.ok(!looksSecret("ログイン処理の流れを知りたい"));
-});
-
-test("続きの候補: 出力の上限で切れたら truncated として覚え、読めない応答が続いたら止める", async () => {
-  let reply: ChatResult = { content: '{"completion":"はど', toolCalls: [], finishReason: "length" };
-  const requests: ChatRequest[] = [];
-  const a = new PromptAssistant({
-    llm: { chat: async (r) => (requests.push(r), reply) },
-    index: () => NAMES,
-    store: memoryStore(),
-    workspaceId: "/ws",
-  });
-  assert.equal((await a.complete("IndexManager の流れ", "auto")).reason, "truncated");
-  await a.complete("IndexManager の流れ", "auto");
-  assert.equal(requests.length, 1, "切れた結果も覚える");
-  reply = { content: "not json", toolCalls: [] };
-  for (let i = 0; i < 3; i++) {
-    await a.complete(`IndexManager の流れ ${i}`, "auto");
-  }
-  assert.equal(a.autoBlock(), "config");
-});
-
-test("書き直し案: 意図を守る規則(条件・別の依頼・文言・種類の反転)と、読み解きの〔 〕の置き場所も直させる。索引が無くても名前以外は作り直す", async () => {
-  const p = (instruction: string, intent: string, questions: any[] = []) => parseRefine({ instruction, intent, parts: [], questions }, "テストの表示を直したい", "auto", NAMES).problems;
-  assert.ok(p("テストが失敗したときの表示を直したい", "change").some((x) => x.includes("条件")));
-  assert.ok(p("テストの表示を直し、あわせてログも直したい", "change").some((x) => x.includes("別の依頼")));
-  assert.ok(p("テストの表示を「失敗」にしたい", "change").some((x) => x.includes("文言")));
-  assert.ok(p("テストの表示はどう動く?", "read").some((x) => x.includes("変更の依頼のまま")));
-  const read = parseRefine(
-    { instruction: "〔対象〕はどう動く?", intent: "read", parts: [], questions: [{ slot: "〔対象〕", question: "?", options: [{ label: "a", fill: "a" }, { label: "b", fill: "b" }] }] },
-    "流れ",
-    "read",
-    NAMES,
-  );
-  assert.ok(read.problems.some((x) => x.includes("括弧の補足")));
-
-  const { llm, requests } = fakeLlm((_r, n) =>
-    n === 1 ? { instruction: "`zzz` が失敗したときに表示したい", intent: "change", parts: [], questions: [] } : { instruction: "`zzz` の表示を直したい", intent: "change", parts: [], questions: [] },
-  );
-  const noIndex = new PromptAssistant({ llm, index: () => undefined, store: memoryStore(), workspaceId: "/ws" });
-  const out = await noIndex.refine("テストの表示を直したい", "auto");
-  assert.equal(requests.length, 2, "索引が無くても、名前以外の指摘では作り直す");
-  assert.deepEqual(out.unknownNames, ["zzz"]);
-});
-
-test("API: none を拒むモデルには minimal を試し、強度ごとに覚える(依頼を整えるの low は送り続ける)", async () => {
-  const bodies: any[] = [];
-  const fetchImpl = (async (_url: any, init: any) => {
-    const body = JSON.parse(init.body);
-    bodies.push(body);
-    if (body.reasoning_effort === "none") {
-      return new Response(JSON.stringify({ error: { message: "reasoning_effort 'none' is not supported" } }), { status: 400 });
-    }
-    return new Response(JSON.stringify({ choices: [{ message: { role: "assistant", content: "{}" } }] }), { status: 200 });
-  }) as unknown as typeof fetch;
-  const c = new OpenAiClient({ apiKey: async () => "k", baseUrl: () => "https://api.openai.com/v1", model: () => "m", embeddingModel: () => "e", reasoningEffort: () => "auto", fetchImpl, sleep: async () => {} });
-  await c.chat({ messages: [{ role: "user", content: "x" }], reasoningEffort: "none" });
-  assert.deepEqual(bodies.map((b) => b.reasoning_effort), ["none", "minimal"]);
-  await c.chat({ messages: [{ role: "user", content: "x" }], reasoningEffort: "none" });
-  assert.equal(bodies[2].reasoning_effort, "minimal", "以後は最初から minimal");
-  await c.chat({ messages: [{ role: "user", content: "x" }], reasoningEffort: "low" });
-  assert.equal(bodies[3].reasoning_effort, "low");
+  assert.ok(!mgr.knowsWord("onlyInDocs"), "文書にしか出てこない語は認めない");
+  assert.equal(mgr.repoMap(1800), mgr.repoMap(1800));
 });

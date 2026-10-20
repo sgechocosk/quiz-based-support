@@ -112,8 +112,8 @@ function acceptsCacheKey(baseUrl: string): boolean {
 export class OpenAiClient implements ChatLlm, Embedder, DecisionLlm {
   /** ツール利用時に reasoning_effort=none が必要と判明したモデル */
   private readonly needsNoneWithTools = new Set<string>();
-  /** 呼び出しごとに優先した推論強度(ChatRequest.reasoningEffort)を拒んだモデルと強度の組("model:effort") */
-  private readonly rejectsPreferredEffort = new Set<string>();
+  /** 入力補助の任意の引数(推論強度・出力の上限・キャッシュキー)を拒んだモデル */
+  private readonly rejectsOptional = new Set<string>();
   /** 見積もりを実測値に合わせる補正係数(実測 ÷ 見積もり の移動平均) */
   private readonly ratio = { chat: 1, embedding: 1, decision: 1 };
 
@@ -222,26 +222,33 @@ export class OpenAiClient implements ChatLlm, Embedder, DecisionLlm {
         : mode === "auto" && hasTools && this.needsNoneWithTools.has(model)
           ? "none"
           : undefined;
-    // 呼び出しごとの優先(入力補助の速さのため)。設定が "default"(常に送らない)なら従わない
-    // none を拒むモデル(minimal までのもの)には minimal を試す
-    const wanted =
-      request.reasoningEffort === "none" && this.rejectsPreferredEffort.has(`${model}:none`) ? "minimal" : request.reasoningEffort;
-    const preferred = wanted && mode !== "default" && !this.rejectsPreferredEffort.has(`${model}:${wanted}`) ? wanted : undefined;
-    const effort = preferred ?? configured();
-    if (effort !== undefined) {
-      body.reasoning_effort = effort;
-    }
-    if (request.cacheKey && acceptsCacheKey(this.o.baseUrl())) {
-      body.prompt_cache_key = request.cacheKey;
-    }
-    const limitOutput = () => {
-      if (request.maxOutputTokens && body.reasoning_effort === "none" && acceptsCacheKey(this.o.baseUrl())) {
-        body.max_completion_tokens = request.maxOutputTokens;
+    // 入力補助のための任意の引数(推論なし・出力の上限・キャッシュキー)。モデルや互換エンドポイントが拒んだら、
+    // 付けずに送り直し、そのモデルには以後付けない(引数を拒まれただけで入力補助が止まらないように)
+    const optional =
+      !this.rejectsOptional.has(model) && (request.reasoningEffort || request.cacheKey || request.maxOutputTokens) && mode !== "default";
+    const official = acceptsCacheKey(this.o.baseUrl());
+    const plain = (): void => {
+      delete body.prompt_cache_key;
+      delete body.max_completion_tokens;
+      const e = configured();
+      if (e === undefined) {
+        delete body.reasoning_effort;
       } else {
-        delete body.max_completion_tokens;
+        body.reasoning_effort = e;
       }
     };
-    limitOutput();
+    plain();
+    if (optional) {
+      if (request.reasoningEffort) {
+        body.reasoning_effort = request.reasoningEffort;
+      }
+      if (request.cacheKey && official) {
+        body.prompt_cache_key = request.cacheKey;
+      }
+      if (request.maxOutputTokens && request.reasoningEffort === "none" && official) {
+        body.max_completion_tokens = request.maxOutputTokens;
+      }
+    }
     const raw = estimateChatTokens(request);
     const info: ApiRequestInfo = {
       kind: "chat",
@@ -256,34 +263,13 @@ export class OpenAiClient implements ChatLlm, Embedder, DecisionLlm {
     try {
       json = await this.post("/chat/completions", body, request.signal, request.retries);
     } catch (error) {
-      const effortRejected = error instanceof LlmError && error.status === 400 && /reasoning_effort/i.test(error.message);
-      if (effortRejected && preferred !== undefined) {
-        // 優先した推論強度を受け付けないモデル: その強度は以後送らない。none なら minimal を1回試し、だめなら設定どおりにする
-        this.rejectsPreferredEffort.add(`${model}:${preferred}`);
-        if (preferred === "none" && !this.rejectsPreferredEffort.has(`${model}:minimal`) && mode !== "default") {
-          body.reasoning_effort = "minimal";
-          limitOutput();
-          try {
-            json = await this.post("/chat/completions", body, request.signal, request.retries);
-          } catch (retryError) {
-            if (!(retryError instanceof LlmError && retryError.status === 400 && /reasoning_effort/i.test(retryError.message))) {
-              throw retryError;
-            }
-            this.rejectsPreferredEffort.add(`${model}:minimal`);
-          }
-        }
-      }
-      if (json === undefined && effortRejected && preferred !== undefined) {
-        const fallback = configured();
-        if (fallback === undefined) {
-          delete body.reasoning_effort;
-        } else {
-          body.reasoning_effort = fallback;
-        }
-        limitOutput();
+      const rejected = error instanceof LlmError && error.status === 400;
+      if (rejected && optional) {
+        this.rejectsOptional.add(model);
+        plain();
         json = await this.post("/chat/completions", body, request.signal, request.retries);
-      } else if (json === undefined) {
-        const retriable = mode === "auto" && hasTools && body.reasoning_effort === undefined && effortRejected && /tool/i.test((error as LlmError).message);
+      } else {
+        const retriable = mode === "auto" && hasTools && body.reasoning_effort === undefined && rejected && /reasoning_effort/i.test(error.message) && /tool/i.test(error.message);
         if (!retriable) {
           throw error;
         }

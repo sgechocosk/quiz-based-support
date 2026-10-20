@@ -81,13 +81,9 @@ export class IndexManager {
   private manifest: Manifest;
   private vectors = new Map<string, Float32Array>();
   private hybrid: HybridIndex | undefined;
-  /** 補完に使う名前(宣言された名前・ファイル名)。索引を作り直したら捨てる */
-  private names: string[] | undefined;
   /** コード(文書を除くチャンク)に出てくる識別子。exact は大文字小文字まで、lower は小文字にしたもの */
   private words: { exact: Set<string>; lower: Set<string> } | undefined;
   private repoMapCache: { budget: number; text: string } | undefined;
-  /** 最後に全体を走査したときのファイル(索引に入れない .json なども含む。パスの実在確認に使う) */
-  private knownFiles = new Set<string>();
   private chain: Promise<unknown> = Promise.resolve();
   private readonly chunkOptions: ChunkOptions;
 
@@ -140,7 +136,6 @@ export class IndexManager {
   private rebuild(): void {
     const chunks = Object.values(this.manifest.files).flatMap((f) => f.chunks);
     this.hybrid = new HybridIndex(chunks, this.vectors);
-    this.names = undefined;
     this.words = undefined;
     this.repoMapCache = undefined;
   }
@@ -166,7 +161,7 @@ export class IndexManager {
     return this.manifest.semantic;
   }
 
-  /** 差分計算(索引は変えない。パスの実在確認に使うファイルの一覧だけ覚える)。paths を渡すとそのファイルだけを対象にする。 */
+  /** 差分計算(副作用なし)。paths を渡すとそのファイルだけを対象にする。 */
   async prepare(paths?: string[], progress?: Progress): Promise<SyncPlan> {
     const maxFiles = this.opts.maxFiles ?? 3000;
     const maxBytes = this.opts.maxFileBytes ?? 300_000;
@@ -179,11 +174,6 @@ export class IndexManager {
       targets = [];
       for (const p of paths) {
         const info = await this.opts.workspace.stat(p);
-        if (info) {
-          this.knownFiles.add(p);
-        } else {
-          this.knownFiles.delete(p);
-        }
         if (info && isIndexable(p) && info.size <= maxBytes) {
           targets.push(info);
         } else if (this.manifest.files[p]) {
@@ -191,9 +181,7 @@ export class IndexManager {
         }
       }
     } else {
-      const listed = await this.opts.workspace.listFiles();
-      this.knownFiles = new Set(listed.map((f) => f.path));
-      const all = listed
+      const all = (await this.opts.workspace.listFiles())
         .filter((f) => isIndexable(f.path) && f.size <= maxBytes)
         .sort((a, b) => a.path.localeCompare(b.path));
       truncated = all.length > maxFiles;
@@ -432,69 +420,6 @@ export class IndexManager {
       this.words = { exact: exactSet, lower: new Set([...exactSet].map((w) => w.toLowerCase())) };
     }
     return exact ? this.words.exact.has(word) : this.words.lower.has(word.toLowerCase());
-  }
-
-  /** 名前が宣言されている場所(文書を除くチャンクの symbols。パス・ファイル名なら先頭行)。見つからなければ undefined */
-  definitionOf(name: string): { path: string; line: number } | undefined {
-    if (name.includes("/") || /\.[A-Za-z0-9]{1,5}$/.test(name)) {
-      const q = name.replace(/^\.\//, "");
-      const file = [...Object.keys(this.manifest.files), ...this.knownFiles].find((f) => f === q || f.endsWith(`/${q}`));
-      return file ? { path: file, line: 1 } : undefined;
-    }
-    for (const c of this.hybrid?.chunks ?? []) {
-      if (c.language !== "markdown" && c.symbols.includes(name)) {
-        return { path: c.file, line: c.startLine };
-      }
-    }
-    return undefined;
-  }
-
-  /** ワークスペースのファイルのパス(相対)か、そのファイル名か(索引に入れない .json なども含む) */
-  hasPath(p: string): boolean {
-    const q = p.replace(/^\.\//, "");
-    if (this.manifest.files[q] || this.knownFiles.has(q)) {
-      return true;
-    }
-    const tail = `/${q}`;
-    return Object.keys(this.manifest.files).some((f) => f.endsWith(tail)) || [...this.knownFiles].some((f) => f.endsWith(tail));
-  }
-
-  /**
-   * 前方一致する名前(宣言された名前・ファイル名。prefix に / があればパス)。
-   * 大文字小文字まで一致するもの → 多くの場所に出てくるもの → 短いもの の順。prefix と同じ名前は除く。
-   */
-  completeName(prefix: string, limit = 5): { names: string[]; total: number } {
-    if (prefix.length === 0 || !this.hybrid) {
-      return { names: [], total: 0 };
-    }
-    const pool = prefix.includes("/") ? Object.keys(this.manifest.files) : this.nameList();
-    const lower = prefix.toLowerCase();
-    const hits = pool.filter((n) => n !== prefix && n.toLowerCase().startsWith(lower));
-    const hybrid = this.hybrid;
-    const rank = (n: string) => ({
-      exact: n.startsWith(prefix) ? 0 : 1,
-      df: hybrid.documentFrequency(n.toLowerCase()),
-    });
-    const ranked = hits
-      .map((n) => ({ n, ...rank(n) }))
-      .sort((a, b) => a.exact - b.exact || b.df - a.df || a.n.length - b.n.length || a.n.localeCompare(b.n));
-    return { names: ranked.slice(0, limit).map((r) => r.n), total: ranked.length };
-  }
-
-  private nameList(): string[] {
-    if (!this.names) {
-      const set = new Set<string>();
-      for (const [file, f] of Object.entries(this.manifest.files)) {
-        set.add(file.slice(file.lastIndexOf("/") + 1));
-        for (const c of f.chunks) {
-          for (const s of c.symbols) {
-            set.add(s);
-          }
-        }
-      }
-      this.names = [...set];
-    }
-    return this.names;
   }
 
   fileChunks(filePath: string): ChunkRecord[] {

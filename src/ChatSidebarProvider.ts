@@ -49,7 +49,7 @@ import {
   type ProjectRule,
 } from "./core/patterns";
 import { ChangePlanner, PlanError } from "./core/planner";
-import { PromptAssistant, type SendAssist } from "./core/promptAssist";
+import { PromptAssistant } from "./core/promptAssist";
 import type { RequirementSpec, StagePlan } from "./core/planTypes";
 import type { KeyValueStore, TypeChecker } from "./core/ports";
 import { buildStructureQuestions } from "./core/questions";
@@ -168,13 +168,6 @@ function readConfig() {
   };
 }
 
-/** 送った依頼で入力補助をどう使ったか(webview から届いた値を整える) */
-function sendAssistFrom(raw: unknown): SendAssist {
-  const a = (typeof raw === "object" && raw !== null ? raw : {}) as Record<string, unknown>;
-  const count = (v: unknown) => (Number.isFinite(Number(v)) ? Math.max(0, Math.floor(Number(v))) : 0);
-  return { shown: count(a.shown), accepted: count(a.accepted), refined: a.refined === true };
-}
-
 function reviewChoices(card: ReviewCard): Choice[] {
   return buildChoices({
     answer: card.answer,
@@ -213,13 +206,10 @@ export class ChatSidebarProvider
   private readonly parser: TreeSitterProvider;
   private readonly client: OpenAiClient;
   private readonly log: LearnerLog;
-  private readonly store: KeyValueStore;
   /** 入力補助(サービスを作ったときに作る) */
   private assistant?: PromptAssistant;
-  /** 「依頼を整える」の要求(新しい要求が来たら前のものを中止する) */
-  private refineAbort?: AbortController;
-  /** 入力補助の API 使用量(依頼の処理の集計とは分ける。テストモードで表示) */
-  private assistUsage = { calls: 0, estimated: 0, actual: 0, cached: 0, output: 0 };
+  /** 入力補助の記録(候補が出ない理由を調べられるように、出力パネルに残す) */
+  private assistLog?: vscode.OutputChannel;
   private readonly sessions = new Map<string, QuizSession>();
   private readonly lessons = new Map<string, LessonSession>();
   private readonly campaigns = new Map<string, Campaign>();
@@ -262,7 +252,6 @@ export class ChatSidebarProvider
         await context.workspaceState.update(key, value);
       },
     };
-    this.store = store;
     this.log = new LearnerLog(store);
 
     this.disposables.push(
@@ -284,8 +273,8 @@ export class ChatSidebarProvider
 
   dispose(): void {
     this.abort?.abort();
-    this.refineAbort?.abort();
     this.assistant?.cancel();
+    this.assistLog?.dispose();
     if (this.syncTimer) {
       clearTimeout(this.syncTimer);
     }
@@ -315,7 +304,6 @@ export class ChatSidebarProvider
       vscode.Uri.joinPath(mediaRoot, "main.css"),
     );
     const js = webview.asWebviewUri(vscode.Uri.joinPath(mediaRoot, "main.js"));
-    const assistJs = webview.asWebviewUri(vscode.Uri.joinPath(mediaRoot, "assist.js"));
     const csp = [
       "default-src 'none'",
       `style-src ${webview.cspSource}`,
@@ -351,13 +339,12 @@ export class ChatSidebarProvider
     </div>
     <label class="setting setting-toggle">
       <input type="checkbox" id="input-assist">
-      <div class="setting-text"><div class="setting-name">入力中の候補</div><div class="muted">入力が止まったときに、書きかけの続きや関数名の候補を薄い文字で出します(Tab で入れる)。続きの候補を作るため、送信前の書きかけ・最近の依頼・コードの構成(ファイルと主な名前)・関連する場所を OpenAI API に送ります。オフにしても「依頼を整える」は使えます。</div><div id="input-assist-test" class="muted hidden">テストモードの間は出しません。</div><div id="input-assist-note" class="warn hidden"></div></div>
+      <div class="setting-text"><div class="setting-name">入力中の候補</div><div class="muted">入力が止まったときに、書きかけの続きを薄い文字で出します(Tab で入れる)。続きを作るため、送信前の書きかけとコードの構成を OpenAI API に送ります。テストモードの間は出しません。</div></div>
     </label>
     <label class="setting setting-toggle" title="開発・検証向けの表示です">
       <input type="checkbox" id="test-mode">
       <div class="setting-text"><div class="setting-name">テストモード</div><div class="muted">API を呼ぶ前に目的と入力トークン数を確認し、処理ごとの使用量や生成の内部情報を表示します(開発・検証向け)。</div></div>
     </label>
-    <div id="assist-stats" class="assist-stats muted hidden"></div>
   </section>
   <section id="setup-box" class="panel notice-panel hidden"></section>
   <section id="level-box" class="panel hidden"></section>
@@ -369,12 +356,10 @@ export class ChatSidebarProvider
   </div>
   <div id="live" class="hidden" role="status"></div>
   <footer id="input-area">
-    <div id="assist-box" class="hidden"></div>
     <div class="query-wrap">
       <div id="query-mirror" aria-hidden="true"></div>
       <textarea id="query" rows="1" placeholder="準備中..." disabled aria-label="質問・要望(Enter で送信、Shift+Enter で改行)"></textarea>
     </div>
-    <div id="assist-line" class="assist-line hidden"></div>
     <div id="assist-sr" class="sr-only" aria-live="polite"></div>
     <div id="send-row">
       <select id="mode" title="進め方" aria-label="進め方">
@@ -383,13 +368,11 @@ export class ChatSidebarProvider
         <option value="change">変更を組み立てる</option>
       </select>
       <span class="spacer"></span>
-      <button id="btn-refine" class="secondary" disabled title="書きかけの依頼を、調査と計画に伝わりやすい形に整えます(Ctrl+Enter)">依頼を整える</button>
       <button id="btn-cancel" class="secondary hidden">中止</button>
       <button id="btn-send" disabled>送信</button>
     </div>
   </footer>
 </div>
-<script nonce="${nonce}" src="${assistJs}"></script>
 <script nonce="${nonce}" src="${js}"></script>
 </body>
 </html>`;
@@ -482,11 +465,13 @@ export class ChatSidebarProvider
     watcher.onDidDelete((u) => mark(u, true));
 
     this.services = { ws, lsp: new VscodeLsp(ws), index, watcher };
+    this.assistLog ??= vscode.window.createOutputChannel("コード思考: 入力補助");
+    const log = this.assistLog;
     this.assistant = new PromptAssistant({
       llm: this.client,
       index: () => (index.hasChunks() ? index : undefined),
-      store: this.store,
       workspaceId: ws.id,
+      log: (line) => log.appendLine(`${new Date().toLocaleTimeString()} ${line}`),
     });
     return this.services;
   }
@@ -570,32 +555,10 @@ export class ChatSidebarProvider
     });
   }
 
-  /**
-   * 入力補助の状態。入力中の候補(続きの候補・名前の補完)は設定でオフにでき、テストモードの間は出さない
-   * (テストモードでは裏で API を呼ばない)。「依頼を整える」は利用者の操作で呼ぶので、どちらでも使える。
-   */
+  /** 入力中の候補は設定でオフにでき、テストモードの間は出さない(テストモードでは裏で API を呼ばない) */
   private assistState(): Record<string, unknown> {
     const cfg = readConfig();
-    const live = cfg.inputAssist && !cfg.testMode;
-    const u = this.assistUsage;
-    const block = this.assistant?.autoBlock();
-    const notes: Record<string, string> = {
-      config: "API の設定(モデル名・ベースURL・APIキー)では続きの候補を作れなかったため、止めています。設定を見直すと再開します。",
-      slow: "応答に時間がかかるため、続きの候補を止めています(推論を止められないモデルの可能性があります)。設定を見直すと再開します。",
-    };
-    // 使われない状態が続いても止めない(既定オン・オフは利用者が決める)。オフにできることだけを知らせる
-    const rarely = live && !block && this.assistant?.rarelyUsed() ? "続きの候補があまり使われていません。不要なら、このスイッチでオフにできます。" : "";
-    return {
-      inputAssist: cfg.inputAssist,
-      assist: {
-        names: live,
-        auto: live && !!this.apiKey && !block,
-        delayMs: this.assistant?.delayMs() ?? 800,
-      },
-      assistNote: live && block ? notes[block] : rarely,
-      // 使われ方と API 使用量は、利用者が意識しなくてよいのでテストモードでだけ渡す
-      assistStats: cfg.testMode && this.assistant ? { ...this.assistant.stats(), usage: { ...u } } : undefined,
-    };
+    return { inputAssist: cfg.inputAssist, assistAuto: cfg.inputAssist && !cfg.testMode && !!this.apiKey };
   }
 
   /** 利用者が経験レベルを一度でも選んだか(未選択なら初回に選んでもらう) */
@@ -626,9 +589,7 @@ export class ChatSidebarProvider
           await vscode.commands.executeCommand("quiz-based-support.setApiKey");
           break;
         case "ask":
-          // 送ったら、整えている途中の依頼は要らない
-          this.refineAbort?.abort();
-          this.assistant?.recordSend(String(m.query ?? "").trim(), sendAssistFrom(m.assist));
+          this.assistant?.cancel();
           await this.handleAsk(String(m.query ?? ""), this.coerceMode(m.mode));
           break;
         case "suggest":
@@ -637,20 +598,8 @@ export class ChatSidebarProvider
         case "suggestCancel":
           this.assistant?.cancel();
           break;
-        case "completeName":
-          this.handleCompleteName(m);
-          break;
-        case "nameAccepted":
-          this.assistant?.recordNameAccepted();
-          break;
-        case "refine":
-          await this.handleRefine(m);
-          break;
-        case "refineCancel":
-          this.refineAbort?.abort();
-          break;
         case "setInputAssist": {
-          this.assistant?.resetPause(true);
+          this.assistant?.resetPause();
           // ワークスペースの設定で決めていれば、そちらを書き換える(ユーザー設定だけ変えても効かないため)
           const c = vscode.workspace.getConfiguration("quizSupport");
           const i = c.inspect<boolean>("inputAssist");
@@ -700,7 +649,6 @@ export class ChatSidebarProvider
           break;
         case "cancel":
           this.abort?.abort();
-          this.refineAbort?.abort();
           break;
         case "grade":
           await this.handleGrade(m);
@@ -739,8 +687,6 @@ export class ChatSidebarProvider
           break;
         case "resetLog":
           await this.log.reset();
-          // 入力補助の最近の依頼と記録も消す
-          this.assistant?.reset();
           await this.pushState();
           break;
       }
@@ -760,86 +706,20 @@ export class ChatSidebarProvider
   private async handleSuggest(m: Record<string, any>): Promise<void> {
     const id = Number(m.id) || 0;
     const draft = String(m.draft ?? "");
-    const reply = (completion: string, missing: string[]) =>
-      this.post({ type: "suggestion", id, draft, completion, missing });
+    const reply = (completion: string) => this.post({ type: "suggestion", id, draft, completion });
     const cfg = readConfig();
     const assistant = this.assistant;
-    if (!cfg.inputAssist || cfg.testMode || this.busy || !this.apiKey || !assistant || !this.view?.visible) {
-      reply("", []);
+    if (!cfg.inputAssist || cfg.testMode || this.busy || !this.apiKey || !assistant) {
+      reply("");
       return;
     }
-    const before = assistant.autoBlock();
     try {
       const out = await assistant.complete(draft, this.coerceMode(m.mode));
       if (out.reason !== "aborted") {
-        reply(out.completion, out.missing);
+        reply(out.completion);
       }
     } catch {
       // 候補は出せなくても入力は続けられる
-    }
-    if (assistant.autoBlock() !== before) {
-      // 失敗・遅さで止めたことを画面に伝える(以後は求めてこない)
-      await this.pushState();
-    }
-  }
-
-  /** 名前の補完(API を使わない) */
-  private handleCompleteName(m: Record<string, any>): void {
-    const cfg = readConfig();
-    const prefix = String(m.prefix ?? "");
-    const result = cfg.inputAssist && !cfg.testMode && this.assistant ? this.assistant.completeName(prefix) : { names: [], total: 0 };
-    // 候補を選ぶときに、どこで宣言されている名前かを見られるようにする
-    const defs: Record<string, { path: string; line: number }> = {};
-    for (const name of result.names) {
-      const def = this.services?.index.definitionOf(name);
-      if (def) {
-        defs[name] = def;
-      }
-    }
-    this.post({ type: "nameCompletion", id: Number(m.id) || 0, prefix, ...result, defs });
-  }
-
-  /** 「依頼を整える」(利用者の操作)。テストモードでは API の確認を出す */
-  private async handleRefine(m: Record<string, any>): Promise<void> {
-    const id = Number(m.id) || 0;
-    const draft = String(m.draft ?? "").trim();
-    const fail = (text: string) => this.post({ type: "refined", id, draft, error: text });
-    if (!draft) {
-      return;
-    }
-    if (draft.length > 2000) {
-      fail("書きかけが長すぎます(2000文字まで)。ログやコードは要点だけにしてから整えてください。");
-      return;
-    }
-    if (!this.apiKey) {
-      fail("OpenAI APIキーが未設定です。上の案内またはサイドバーの「設定」から設定してください。");
-      return;
-    }
-    const services = await this.ensureServices();
-    const assistant = this.assistant;
-    if (!services || !assistant) {
-      fail("フォルダを開いてから使ってください。");
-      return;
-    }
-    this.refineAbort?.abort();
-    const controller = new AbortController();
-    this.refineAbort = controller;
-    try {
-      const proposal = await assistant.refine(draft, this.coerceMode(m.mode), controller.signal);
-      if (!controller.signal.aborted) {
-        this.post({ type: "refined", id, draft, proposal });
-      }
-    } catch (error) {
-      if (!controller.signal.aborted) {
-        fail(errorMessage(error, "依頼を整えられませんでした。"));
-      }
-    } finally {
-      if (this.refineAbort === controller) {
-        this.refineAbort = undefined;
-      }
-      if (readConfig().testMode) {
-        await this.pushState();
-      }
     }
   }
 
@@ -861,16 +741,7 @@ export class ChatSidebarProvider
     // 新しい質問をしたら、答えていない要件の確認は無効にする
     this.pendingClarify = undefined;
     await this.withAgent(services, async (agent, hooks) => {
-      let inv: Investigation;
-      try {
-        inv = await agent.investigate(text, mode, hooks);
-      } catch (error) {
-        if (!hooks.signal?.aborted && error instanceof Error && error.message.startsWith("関連するコードが見つかりませんでした")) {
-          this.assistant?.recordResult(text, { notFound: true });
-        }
-        throw error;
-      }
-      this.assistant?.recordResult(text, { steps: inv.steps });
+      const inv = await agent.investigate(text, mode, hooks);
       if (!investigationRequiresChange(inv)) {
         // 仕組みの質問: 読解のクイズ
         await this.presentQuiz(
@@ -882,7 +753,6 @@ export class ChatSidebarProvider
       }
       // 実装・修正の依頼: 要件を整理し、大きい・案が複数あるなら先に質問する(調査結果は回答後の計画に使う)
       const { spec, clarification } = await agent.organize(inv, hooks);
-      this.assistant?.recordResult(text, { clarified: !!clarification });
       if (clarification) {
         const id = crypto.randomUUID();
         this.pendingClarify = { id, query: text, inv, clarification, spec };
@@ -1605,20 +1475,17 @@ export class ChatSidebarProvider
   // ---------- テストモード: OpenAI API の実行前確認・使用量 ----------
 
   private async confirmApi(info: ApiRequestInfo): Promise<void> {
-    const testMode = readConfig().testMode;
     if (info.channel === "assist-auto") {
       // 自動の候補は確認ダイアログを出さない(テストモードの間は呼ばない)
-      if (testMode) {
+      if (readConfig().testMode) {
         throw new LlmError("テストモードのため、自動の候補は出しません。");
       }
       return;
     }
-    if (!testMode || (info.channel === "main" && this.approveRest)) {
+    if (!readConfig().testMode || this.approveRest) {
       return;
     }
     const kind = info.kind === "chat" ? "チャット" : info.kind === "decision" ? "判定" : "埋め込み";
-    // 「以降確認しない」は依頼の処理のためのもの(入力補助は1回ずつ確認する)
-    const buttons = info.channel === "main" ? ["実行する", "この処理では以降確認しない"] : ["実行する"];
     const choice = await vscode.window.showWarningMessage(
       `OpenAI API を呼び出します: ${info.purpose}`,
       {
@@ -1630,7 +1497,8 @@ export class ChatSidebarProvider
           "この確認はテストモードでだけ行います。サイドバーの設定の「テストモード」または設定 quizSupport.testMode でオフにできます。",
         ].join("\n"),
       },
-      ...buttons,
+      "実行する",
+      "この処理では以降確認しない",
     );
     if (!choice) {
       throw new LlmError("OpenAI API の呼び出しを取り消しました。");
@@ -1643,13 +1511,12 @@ export class ChatSidebarProvider
   private countUsage(info: ApiUsageInfo): void {
     // 入力補助は依頼の処理の集計に混ぜない
     if (info.channel !== "main") {
-      this.assistUsage.cached += info.cachedInputTokens ?? 0;
+      return;
     }
-    const u = info.channel === "main" ? this.usage : this.assistUsage;
-    u.calls++;
-    u.estimated += info.inputTokens;
-    u.actual += info.actualInputTokens ?? 0;
-    u.output += info.outputTokens ?? 0;
+    this.usage.calls++;
+    this.usage.estimated += info.inputTokens;
+    this.usage.actual += info.actualInputTokens ?? 0;
+    this.usage.output += info.outputTokens ?? 0;
   }
 
   /** 処理の始めに、確認の省略と使用量の集計を戻す */
