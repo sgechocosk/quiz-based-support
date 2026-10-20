@@ -75,3 +75,55 @@ test("Decisions API: predicate を /decisions に送り、確率を返す。refu
   reply = { answers: [] };
   await assert.rejects(c.predicate({ input: "x", name: "q", instructions: "?" }), /答えがありません/);
 });
+
+test("API の記録: 完了はモデルと入力・出力トークン数(キャッシュ)の1行、失敗はモデルとエラーの1行。再試行・引数なしでの送り直しも1回ずつ。送った内容は含めない", async () => {
+  const logs: string[] = [];
+  let n = 0;
+  const fetchImpl = (async (_url: any, init: any) => {
+    const body = JSON.parse(init.body);
+    n++;
+    if (n === 1) {
+      return new Response(JSON.stringify({ error: { message: "rate limited" } }), { status: 429 });
+    }
+    if (body.reasoning_effort === "none") {
+      return new Response(JSON.stringify({ error: { message: "Unrecognized request argument: reasoning_effort" } }), { status: 400 });
+    }
+    return new Response(
+      JSON.stringify({
+        choices: [{ message: { role: "assistant", content: "ok" }, finish_reason: "stop" }],
+        usage: { prompt_tokens: 3310, completion_tokens: 48, prompt_tokens_details: { cached_tokens: 2816 } },
+      }),
+      { status: 200 },
+    );
+  }) as unknown as typeof fetch;
+  const c = new OpenAiClient({
+    apiKey: async () => "k",
+    baseUrl: () => "https://api.openai.com/v1",
+    model: () => "gpt-6-luna",
+    embeddingModel: () => "e",
+    fetchImpl,
+    sleep: async () => {},
+    log: (l) => logs.push(l),
+  });
+  await c.chat({ messages: [{ role: "user", content: "秘密の本文 SECRET-BODY" }], reasoningEffort: "none", cacheKey: "k", maxOutputTokens: 100 });
+  assert.deepEqual(logs, [
+    "gpt-6-luna エラー HTTP 429: rate limited",
+    "gpt-6-luna エラー HTTP 400: Unrecognized request argument: reasoning_effort",
+    "gpt-6-luna 入力3,310(キャッシュ2,816) 出力48",
+  ]);
+  assert.ok(!logs.join("\n").includes("SECRET-BODY"));
+});
+
+test("API の記録: 埋め込みと判定の完了にも入力トークン数が出る。キャッシュ・使用量が返されなければ「-」", async () => {
+  const logs: string[] = [];
+  const fetchImpl = (async (url: any) => {
+    if (String(url).endsWith("/embeddings")) {
+      return new Response(JSON.stringify({ data: [{ index: 0, embedding: [1] }], usage: { prompt_tokens: 7 } }), { status: 200 });
+    }
+    return new Response(JSON.stringify({ answers: [{ type: "predicate", name: "q", probability: 0.9 }] }), { status: 200 });
+  }) as unknown as typeof fetch;
+  const c = new OpenAiClient({ apiKey: async () => "k", baseUrl: () => "http://x/v1", model: () => "m", embeddingModel: () => "e-model", fetchImpl, sleep: async () => {}, log: (l) => logs.push(l) });
+  await c.embed(["a"], undefined, "埋め込みテスト");
+  await c.predicate({ input: "x", name: "q", instructions: "?", purpose: "判定テスト" });
+  assert.deepEqual(logs, ["e-model 入力7(キャッシュ-) 出力-", "gpt-6-luna 入力-(キャッシュ-) 出力-"]);
+});

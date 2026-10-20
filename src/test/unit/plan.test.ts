@@ -9,7 +9,7 @@ import { applyTextEdits, diffHunks, lineMapper, textEdits } from "../../core/dif
 import { changedSubjects } from "../../core/impact";
 import { IndexManager } from "../../core/indexer";
 import { buildLesson, gradeItem, gradeQuestion, nextCheckQuestion, revealPayload, stepPayload, whyText } from "../../core/lesson";
-import { OpenAiClient, estimateChatTokens, type ApiRequestInfo, type ApiUsageInfo } from "../../core/llm";
+import { OpenAiClient, estimateChatTokens, type ApiRequestInfo } from "../../core/llm";
 import { locateBlock } from "../../core/editMatch";
 import { applyEdits, applyRawEdit, VirtualWorkspace } from "../../core/overlay";
 import { matchingRules, parseProjectRules } from "../../core/patterns";
@@ -295,7 +295,7 @@ test("API実行前の確認: 目的と入力トークン数の見積もりを渡
   });
   t.after(() => server.close());
   const seen: ApiRequestInfo[] = [];
-  const usage: ApiUsageInfo[] = [];
+  const logs: string[] = [];
   let allow = true;
   const client = new OpenAiClient({
     apiKey: async () => "sk-test",
@@ -309,7 +309,7 @@ test("API実行前の確認: 目的と入力トークン数の見積もりを渡
         throw new Error("取り消しました");
       }
     },
-    afterResponse: (info) => usage.push(info),
+    log: (line) => logs.push(line),
   });
   const request = { messages: [{ role: "user" as const, content: "x".repeat(700) }], purpose: "テスト" };
   const raw = estimateChatTokens(request);
@@ -317,13 +317,14 @@ test("API実行前の確認: 目的と入力トークン数の見積もりを渡
   assert.equal(seen[0]!.purpose, "テスト");
   assert.equal(seen[0]!.kind, "chat");
   assert.equal(seen[0]!.inputTokens, raw);
-  assert.equal(usage[0]!.actualInputTokens, 400);
+  assert.deepEqual(logs, ["test-model 入力400(キャッシュ-) 出力5"]);
   await client.chat(request);
   assert.ok(seen[1]!.inputTokens > raw, "実測(400)に近づくよう補正される");
 
   allow = false;
   await assert.rejects(client.chat(request), /取り消しました/);
   assert.equal(sent, 2, "取り消した呼び出しは送らない");
+  assert.equal(logs.length, 2, "取り消した呼び出しは送らないので記録も増えない");
   await assert.rejects(client.embed(["a", "b"], undefined, "埋め込みテスト"), /取り消しました/);
   assert.equal(seen[seen.length - 1]!.purpose, "埋め込みテスト");
   assert.equal(seen[seen.length - 1]!.kind, "embedding");

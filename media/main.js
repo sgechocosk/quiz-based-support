@@ -30,7 +30,9 @@
   const messages = $("messages");
   const live = $("live");
   const jumpBtn = $("jump-latest");
-  const queryInput = /** @type {HTMLInputElement} */ ($("query"));
+  const queryInput = /** @type {HTMLTextAreaElement} */ ($("query"));
+  const queryMirror = $("query-mirror");
+  const assistSr = $("assist-sr");
   const sendBtn = /** @type {HTMLButtonElement} */ ($("btn-send"));
   const cancelBtn = $("btn-cancel");
   const modeSelect = /** @type {HTMLSelectElement} */ ($("mode"));
@@ -214,6 +216,8 @@
 
   const testMode = /** @type {HTMLInputElement} */ ($("test-mode"));
   testMode.addEventListener("change", () => vscode.postMessage({ type: "setTestMode", value: testMode.checked }));
+  const inputAssistToggle = /** @type {HTMLInputElement} */ ($("input-assist"));
+  inputAssistToggle.addEventListener("change", () => vscode.postMessage({ type: "setInputAssist", value: inputAssistToggle.checked }));
 
   function renderState() {
     const s = state;
@@ -223,6 +227,12 @@
     queryInput.disabled = !ready;
     sendBtn.disabled = !ready;
     modeSelect.disabled = !ready;
+    inputAssistToggle.checked = s.inputAssist !== false;
+    if (!ready || !s.assistAuto) {
+      // 処理中・設定でオフ・テストモード・APIキー未設定のときは、出している候補を消す
+      cancelSuggest();
+      clearGhost();
+    }
     cancelBtn.classList.toggle("hidden", !s.busy);
     sendBtn.classList.toggle("hidden", !!s.busy);
     queryInput.placeholder = !s.hasWorkspace
@@ -358,13 +368,12 @@
             (m.truncated ? "\n※ファイル数が上限を超えたため一部のみ対象です(設定 quizSupport.maxFiles)。" : ""),
       }),
     );
-    // トークン数はテストモードでだけ出す
     box.append(
       el("div", {
         class: "muted",
         text:
           "キーワード検索の索引は API を使わずに作れます。意味検索を有効にすると、OpenAI API でコードの埋め込みを作り、言い回しが違っても関連するコードを見つけやすくなります。" +
-          (state.testMode ? `\n未計算: ${m.pendingEmbeds} チャンク(約 ${m.tokens.toLocaleString()} トークン)` : ""),
+          (state.testMode ? `\n未計算: ${m.pendingEmbeds} チャンク` : ""),
       }),
     );
     const lexical = el("button", { class: "secondary", text: "キーワードのみ更新" });
@@ -1394,13 +1403,189 @@
       const line = (m.output || "").split("\n").find((l) => /error|fail|✘|not ok|expected/i.test(l)) || "";
       const fix = el("button", { class: "secondary", text: "失敗の内容で修正を依頼する(入力欄に下書き)" });
       fix.onclick = () => {
-        queryInput.value = `テスト(${m.command})が失敗したので直したい: ${line.trim().slice(0, 200)}`;
+        insertAtEnd(`${queryInput.value.trim() ? "\n" : ""}テスト(${m.command})が失敗したので直したい: ${line.trim().slice(0, 200)}`);
         queryInput.focus();
       };
       f.testBox.append(el("div", { class: "row" }, fix));
     }
     ensureVisible(f.testBox);
   }
+
+  // ---------- 入力補助(続きの候補) ----------
+  //
+  // - 候補は入力欄に重ねた要素(#query-mirror)に薄い文字で描くだけで、入力の値には入れない(Enter は打った文だけを送る)
+  // - Tab で入れる(execCommand で入れるので Ctrl+Z で戻せる)。Esc で消す。打った文字が候補の先頭と同じなら、候補を縮める
+  // - IME の変換中・処理中・カーソルが末尾でないときは出さず、求めもしない
+
+  const DELAY_MS = 800;
+  const assist = {
+    /** 候補を出したときの入力と、その続き(薄い文字) */
+    base: "",
+    ghost: "",
+    /** @type {ReturnType<typeof setTimeout> | undefined} */
+    timer: undefined,
+    reqId: 0,
+    /** 続きの候補を求めて、まだ届いていない */
+    waiting: false,
+    composing: false,
+    /** Esc で消した書きかけ(同じ書きかけでは出し直さない) */
+    dismissed: "",
+    /** 入力欄を書き換えている間(input イベントを入力の変化として扱わない) */
+    inserting: false,
+  };
+
+  function caretAtEnd() {
+    const len = queryInput.value.length;
+    return queryInput.selectionStart === len && queryInput.selectionEnd === len;
+  }
+
+  /** 入力と候補を重ねた要素に写す(入力欄の高さもこの要素で決まる) */
+  function renderMirror() {
+    const parts = [document.createTextNode(queryInput.value)];
+    if (assist.ghost && !assist.composing && !queryInput.disabled && document.activeElement === queryInput && caretAtEnd()) {
+      parts.push(el("span", { class: "ghost", text: assist.ghost }), el("span", { class: "ghost-key", text: "Tab" }));
+    }
+    // 末尾が改行のときも、その行の高さを取る
+    parts.push(document.createTextNode("\u200b"));
+    queryMirror.replaceChildren(...parts);
+    queryMirror.scrollTop = queryInput.scrollTop;
+  }
+
+  function clearGhost() {
+    assist.ghost = "";
+    renderMirror();
+  }
+
+  /** 求めている続きの候補を取り消す(遅れて届いても使わない) */
+  function cancelSuggest() {
+    clearTimeout(assist.timer);
+    assist.timer = undefined;
+    if (assist.waiting) {
+      assist.waiting = false;
+      assist.reqId++;
+      vscode.postMessage({ type: "suggestCancel" });
+    }
+  }
+
+  /** 打った文字が候補の先頭と同じなら、残りの候補(違えば null) */
+  function consume(base, ghost, value) {
+    if (!value.startsWith(base)) {
+      return null;
+    }
+    const typed = value.slice(base.length);
+    return ghost.startsWith(typed) ? ghost.slice(typed.length) : null;
+  }
+
+  function assistReady() {
+    return !!state.assistAuto && state.hasKey && state.hasWorkspace && !state.busy && !queryInput.disabled;
+  }
+
+  /** 入力が変わったとき: 打った文字が候補と同じなら候補を縮め、違えば消して、止まったら求める */
+  function onDraftChanged() {
+    if (assist.inserting) {
+      return;
+    }
+    const value = queryInput.value;
+    if (assist.ghost) {
+      const rest = consume(assist.base, assist.ghost, value);
+      if (rest && caretAtEnd()) {
+        assist.base = value;
+        assist.ghost = rest;
+        renderMirror();
+        return;
+      }
+      assist.ghost = "";
+    }
+    cancelSuggest();
+    renderMirror();
+    if (assistReady() && !assist.composing && caretAtEnd() && value !== assist.dismissed) {
+      scheduleSuggest(value);
+    }
+  }
+
+  function scheduleSuggest(value) {
+    clearTimeout(assist.timer);
+    assist.timer = setTimeout(() => {
+      assist.timer = undefined;
+      if (!assistReady() || assist.composing || document.activeElement !== queryInput || !caretAtEnd() || queryInput.value !== value) {
+        return;
+      }
+      assist.waiting = true;
+      vscode.postMessage({ type: "suggest", id: ++assist.reqId, draft: value, mode: modeSelect.value });
+    }, DELAY_MS);
+  }
+
+  function onSuggestion(m) {
+    if (m.id !== assist.reqId) {
+      return;
+    }
+    assist.waiting = false;
+    const value = queryInput.value;
+    if (!assistReady() || assist.composing || !caretAtEnd() || document.activeElement !== queryInput || !m.text) {
+      return;
+    }
+    // 届くまでに打った文字が候補の先頭と同じなら、その分を縮めて出す
+    const ghost = value === m.draft ? m.text : consume(m.draft, m.text, value) || "";
+    if (ghost) {
+      assist.base = value;
+      assist.ghost = ghost;
+      renderMirror();
+      assistSr.textContent = `続きの候補: ${ghost}(Tab で入れられます)`;
+    }
+  }
+
+  /** 入力欄の末尾に text を足す。execCommand で入れるので、Ctrl+Z で戻せる */
+  function insertAtEnd(text) {
+    const end = queryInput.value.length;
+    queryInput.focus();
+    queryInput.setSelectionRange(end, end);
+    assist.inserting = true;
+    let done = false;
+    try {
+      done = document.execCommand("insertText", false, text);
+    } catch {
+      done = false;
+    }
+    if (!done) {
+      queryInput.setRangeText(text, end, end, "end");
+    }
+    assist.inserting = false;
+    renderMirror();
+  }
+
+  function acceptGhost() {
+    const text = assist.ghost;
+    assist.ghost = "";
+    insertAtEnd(text);
+    cancelSuggest();
+  }
+
+  queryInput.addEventListener("compositionstart", () => {
+    assist.composing = true;
+    cancelSuggest();
+    renderMirror();
+  });
+  queryInput.addEventListener("compositionend", () => {
+    assist.composing = false;
+    onDraftChanged();
+  });
+  queryInput.addEventListener("input", (e) => {
+    if (assist.composing || /** @type {InputEvent} */ (e).isComposing) {
+      renderMirror();
+      return;
+    }
+    onDraftChanged();
+  });
+  for (const type of ["keyup", "click", "focus", "blur", "select"]) {
+    queryInput.addEventListener(type, () => renderMirror());
+  }
+  queryInput.addEventListener("scroll", () => {
+    queryMirror.scrollTop = queryInput.scrollTop;
+  });
+  modeSelect.addEventListener("change", () => {
+    cancelSuggest();
+    clearGhost();
+  });
 
   // ---------- 入出力 ----------
 
@@ -1411,13 +1596,31 @@
     }
     closeClarify("(新しい質問をしたため無効になりました)");
     addMessage("user", text);
+    cancelSuggest();
+    assist.dismissed = "";
     queryInput.value = "";
+    clearGhost();
     vscode.postMessage({ type: "ask", query: text, mode: modeSelect.value });
   }
 
   sendBtn.addEventListener("click", send);
   queryInput.addEventListener("keydown", (e) => {
-    if (e.key === "Enter" && !e.isComposing) {
+    if (e.isComposing || e.keyCode === 229) {
+      return;
+    }
+    if (e.key === "Tab" && assist.ghost && caretAtEnd() && !e.shiftKey && !e.ctrlKey && !e.altKey && !e.metaKey) {
+      e.preventDefault();
+      acceptGhost();
+      return;
+    }
+    if (e.key === "Escape" && assist.ghost) {
+      e.preventDefault();
+      assist.dismissed = queryInput.value;
+      cancelSuggest();
+      clearGhost();
+      return;
+    }
+    if (e.key === "Enter" && !e.shiftKey && !e.altKey) {
       e.preventDefault();
       send();
     }
@@ -1495,9 +1698,13 @@
         setLive("");
         renderCampaignDone(m);
         break;
+      case "suggestion":
+        onSuggestion(m);
+        break;
     }
   });
 
   renderEmptyHint();
+  renderMirror();
   vscode.postMessage({ type: "ready" });
 })();

@@ -79,7 +79,23 @@ export interface ChatRequest {
   signal?: AbortSignal;
   /** 何のための呼び出しか(API 実行前の確認画面に表示する) */
   purpose?: string;
+  /**
+   * 呼び出し元の系統(既定は main)。入力補助は依頼の処理と使用量を分けて数え、
+   * 自動で呼ぶもの(assist-auto)はテストモードの確認ダイアログを出さずに取り消す。
+   */
+  channel?: ApiChannel;
+  /** この呼び出しで優先する推論強度(速さが要る入力補助用)。設定が "default" のときは送らない */
+  reasoningEffort?: string;
+  /** プロンプトキャッシュの振り分けキー(OpenAI の公式エンドポイントにだけ送る) */
+  cacheKey?: string;
+  /** 出力トークンの上限(推論なし reasoning_effort=none で送れたときだけ使う。推論が上限を食って出力が空になるのを避ける) */
+  maxOutputTokens?: number;
+  /** 失敗したときに送り直す回数(既定はクライアントの設定。入力中の候補は古くなるので送り直さない) */
+  retries?: number;
 }
+
+/** API 呼び出しの系統 */
+export type ApiChannel = "main" | "assist" | "assist-auto";
 
 export interface ChatResult {
   content: string | null;

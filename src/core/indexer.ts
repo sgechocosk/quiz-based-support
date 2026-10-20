@@ -81,6 +81,7 @@ export class IndexManager {
   private manifest: Manifest;
   private vectors = new Map<string, Float32Array>();
   private hybrid: HybridIndex | undefined;
+  private repoMapCache: { budget: number; text: string } | undefined;
   private chain: Promise<unknown> = Promise.resolve();
   private readonly chunkOptions: ChunkOptions;
 
@@ -133,6 +134,7 @@ export class IndexManager {
   private rebuild(): void {
     const chunks = Object.values(this.manifest.files).flatMap((f) => f.chunks);
     this.hybrid = new HybridIndex(chunks, this.vectors);
+    this.repoMapCache = undefined;
   }
 
   stats(): IndexStats {
@@ -385,6 +387,15 @@ export class IndexManager {
     return { hits: hybrid.search(query, queryVector, options), semantic: queryVector !== undefined, note };
   }
 
+  /** キーワード検索(BM25)だけで探す。埋め込み API を呼ばないので、入力中に何度呼んでもよい */
+  lexicalSearch(query: string, k: number): SearchHit[] {
+    const hybrid = this.hybrid;
+    if (!hybrid || hybrid.chunks.length === 0) {
+      return [];
+    }
+    return hybrid.search(query, undefined, { k, minSimilarity: 1 });
+  }
+
   fileChunks(filePath: string): ChunkRecord[] {
     return this.manifest.files[filePath]?.chunks ?? [];
   }
@@ -406,6 +417,13 @@ export class IndexManager {
   }
 
   repoMap(budgetChars: number): string {
-    return this.hybrid ? buildRepoMap(this.hybrid, budgetChars) : "";
+    if (!this.hybrid) {
+      return "";
+    }
+    // 入力補助は入力のたびに使うので、索引を作り直すまで覚えておく
+    if (this.repoMapCache?.budget !== budgetChars) {
+      this.repoMapCache = { budget: budgetChars, text: buildRepoMap(this.hybrid, budgetChars) };
+    }
+    return this.repoMapCache.text;
   }
 }

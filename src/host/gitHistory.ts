@@ -34,6 +34,28 @@ export class GitHistory implements HistoryPort {
     });
   }
 
+  private changedCache?: { at: number; files: string[] };
+
+  /** 未コミットの変更があるファイル(ワークスペース相対。10秒は覚えておく)。取得できなければ空配列 */
+  async changedFiles(): Promise<string[]> {
+    if (this.changedCache && Date.now() - this.changedCache.at < 10_000) {
+      return this.changedCache.files;
+    }
+    let files: string[] = [];
+    try {
+      const out = await this.run(["-c", "core.quotepath=off", "status", "--porcelain", "--untracked-files=normal", "--", "."]);
+      files = out
+        .split(/\r?\n/)
+        .map((l) => l.slice(3).replace(/^.* -> /, "").trim())
+        .filter(Boolean)
+        .slice(0, 30);
+    } catch {
+      files = [];
+    }
+    this.changedCache = { at: Date.now(), files };
+    return files;
+  }
+
   async commits(): Promise<string[][]> {
     try {
       const head = (await this.run(["rev-parse", "HEAD"])).trim();
