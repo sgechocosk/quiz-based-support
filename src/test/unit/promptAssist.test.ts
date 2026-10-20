@@ -4,31 +4,16 @@ import { test } from "node:test";
 import { IndexManager } from "../../core/indexer";
 import { OpenAiClient } from "../../core/llm";
 import type { ChatRequest, ChatResult } from "../../core/ports";
-import {
-  CALLS_PER_MINUTE,
-  codeNames,
-  looksSecret,
-  PromptAssistant,
-  rejectCompletion,
-  stripEcho,
-  unknownNames,
-  type NameSource,
-} from "../../core/promptAssist";
+import { CALLS_PER_MINUTE, looksSecret, PromptAssistant, rejectCompletion, stripEcho, type NameSource } from "../../core/promptAssist";
 import { startFakeOpenAi } from "./helpers/fakeOpenAi";
 import { FakeEmbedder, makeTempDir, NodeWorkspace, writeFiles } from "./helpers/nodeWorkspace";
 import { TsCompilerParser } from "./helpers/tsAst";
 
-/** 索引の代わり: words にある識別子だけがコードに実在する */
-function fakeIndex(words: string[]): NameSource {
-  return {
-    hasChunks: () => true,
-    lexicalSearch: () => [],
-    knowsWord: (w, exact = true) => (exact ? words.includes(w) : words.some((x) => x.toLowerCase() === w.toLowerCase())),
-    repoMap: () => "src/core/indexer.ts — IndexManager, commit, prepare",
-  };
-}
-
-const NAMES = fakeIndex(["IndexManager", "commit", "prepare", "handleAsk"]);
+const NAMES: NameSource = {
+  hasChunks: () => true,
+  lexicalSearch: () => [],
+  repoMap: () => "src/core/indexer.ts — IndexManager, commit, prepare",
+};
 
 function fakeLlm(reply: (req: ChatRequest, n: number) => unknown | Promise<unknown>) {
   const requests: ChatRequest[] = [];
@@ -60,28 +45,16 @@ test("書きかけの繰り返しを除く: 全体・末尾の繰り返しは除
   assert.equal(stripEcho("索引の更新", "  は?"), "は?");
 });
 
-test("続きの候補として自然なものは出し、メタ文・口調・複数の文・書式・長すぎるものは出さない", () => {
-  const ok = (draft: string, c: string) => rejectCompletion(draft, stripEcho(draft, c), NAMES);
+test("続きの候補は、空・「なし」などの文・書式の崩れ・長すぎるものだけを出さない。それ以外は出す", () => {
+  const ok = (draft: string, c: string) => rejectCompletion(stripEcho(draft, c));
   assert.equal(ok("索引の更新", "は、ファイルを保存してから `IndexManager.commit` までどう流れる?"), undefined);
-  assert.equal(ok("ログアウト機能を", "追加したい"), undefined);
-  assert.equal(ok("テストモードのとき", "自動の候補を出さないようにしたい"), undefined);
-  assert.equal(ok("`handleAsk` がどこから", "呼ばれているか知りたい"), undefined);
+  assert.equal(ok("ログアウト機能を", "追加したい。ログアウトしたらログイン画面に戻るようにしたい"), undefined);
+  assert.equal(ok("`fooBar` がどこから", "呼ばれているか知りたい。あと `bazQux` との関係も"), undefined, "名前や複数の文でも捨てない");
   assert.equal(ok("索引の更新", ""), "empty");
   assert.equal(ok("索引の更新", "(なし)"), "meta");
   assert.equal(ok("索引の更新", "承知しました、見てみます"), "voice");
-  assert.equal(ok("索引の更新", "はどう動く?あと保存も"), "sentences");
-  assert.equal(ok("索引の更新", "は\nどう動く?"), "multiline");
-  assert.equal(ok("索引の更新", "- 一覧"), "formatting");
-  assert.equal(ok("索引の更新", "を〔決めること〕にしたい"), "formatting");
-  assert.equal(ok("索引の更新", "x".repeat(81)), "too_long");
-});
-
-test("コードの名前は索引にあるものだけ。書きかけにある名前・製品名・パスは確かめない", () => {
-  assert.deepEqual(codeNames("`IndexManager.commit` と handleAsk と media/main.js と OpenAI"), ["IndexManager.commit", "handleAsk", "OpenAI"]);
-  assert.deepEqual(unknownNames("`IndexManager.flushAll` と `handleLogout` を見る", NAMES), ["IndexManager.flushAll", "handleLogout"]);
-  assert.deepEqual(unknownNames("`fooBarBaz` の処理", NAMES, "fooBarBaz の"), []);
-  assert.deepEqual(unknownNames("OpenAI の呼び出し", NAMES), []);
-  assert.equal(rejectCompletion("索引の更新", "は `IndexManager.flushAll` からどう呼ばれる?", NAMES), "unknown_name");
+  assert.equal(ok("索引の更新", "```ts\nx\n```"), "formatting");
+  assert.equal(ok("索引の更新", "x".repeat(201)), "too_long");
 });
 
 test("秘密らしい文字列(API キー・環境変数の形・Bearer・URL のパスワード)は送らない", () => {
@@ -100,7 +73,7 @@ test("続きの候補: 指示 → 構成 → 書きかけ の順で送り、推�
   const req = requests[0]!;
   assert.equal(req.channel, "assist-auto");
   assert.equal(req.reasoningEffort, "none");
-  assert.equal(req.maxOutputTokens, 200);
+  assert.equal(req.maxOutputTokens, 300);
   assert.equal(req.retries, 0);
   assert.match(req.cacheKey ?? "", /^qbs-assist-[0-9a-f]{12}$/);
   assert.deepEqual(req.messages.map((m) => m.role), ["system", "user", "user"]);
@@ -111,12 +84,12 @@ test("続きの候補: 指示 → 構成 → 書きかけ の順で送り、推�
   assert.match(log[0]!, /^表示 書きかけ 5文字 → /);
 });
 
-test("続きの候補: 索引がまだ無くても出す(名前は確かめない)。短い・長い・秘密らしい書きかけは送らない", async () => {
-  const { a, requests } = assistant(() => ({ completion: "はどう動く?" }), undefined);
+test("続きの候補: 索引がまだ無くても出す。短い・長い・秘密らしい書きかけは送らない。複数行の候補は最初の行を使う", async () => {
+  const { a, requests } = assistant(() => ({ completion: "はどう動く?\n補足" }), undefined);
   assert.equal((await a.complete("fooBar の流れ", "auto")).completion, "はどう動く?");
   assert.equal((await a.complete("ログ", "auto")).reason, "short");
-  assert.equal((await a.complete("x".repeat(401), "auto")).reason, "long");
-  assert.equal((await a.complete("1行目\n2行目\n3行目\n4行目", "auto")).reason, "long");
+  assert.equal((await a.complete("x".repeat(1001), "auto")).reason, "long");
+  assert.equal((await a.complete("1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n11", "auto")).reason, "long");
   assert.equal((await a.complete("キーは sk-abcdefghijklmnopqrstu です", "auto")).reason, "secret");
   assert.equal(requests.length, 1);
 });
@@ -226,7 +199,7 @@ test("API: 公式エンドポイントにだけキャッシュキーと出力の
 
 // ---------- 索引 ----------
 
-test("索引: 埋め込みを呼ばない検索、コードの識別子の実在確認(文書にだけ出る語は認めない)", async () => {
+test("索引: 埋め込みを呼ばない検索と、覚えておく構成の地図", async () => {
   const root = await makeTempDir();
   await writeFiles(root, {
     "src/auth.ts": `export function loginUser(name: string): boolean {\n  return name !== "";\n}\n\nexport function logoutUser(): void {\n  loginUser("x");\n}\n`,
@@ -245,9 +218,5 @@ test("索引: 埋め込みを呼ばない検索、コードの識別子の実在
   const calls = embedder.calls;
   assert.equal(mgr.lexicalSearch("logout", 2)[0]!.chunk.file, "src/auth.ts");
   assert.equal(embedder.calls, calls, "埋め込みを呼ばない");
-  assert.ok(mgr.knowsWord("loginUser"));
-  assert.ok(!mgr.knowsWord("LOGINUSER"), "既定は大文字小文字まで一致");
-  assert.ok(mgr.knowsWord("LOGINUSER", false));
-  assert.ok(!mgr.knowsWord("onlyInDocs"), "文書にしか出てこない語は認めない");
   assert.equal(mgr.repoMap(1800), mgr.repoMap(1800));
 });

@@ -6,27 +6,25 @@ import type { SearchHit } from "./types";
 /**
  * 入力補助: 書きかけの依頼の続きを、入力欄に薄い文字で示す。
  * Claude Code の「次のプロンプトの予測」にならい、勧めたい依頼ではなく、利用者が書こうとしている続きを予測させる。
- * 書きかけは変えず、外れそうなら出さない。LLM の出力は規則で確かめる(コードの名前は索引にあるものだけ)。
+ * 書きかけは変えない。捨てるのは、候補になっていないもの(空・「なし」などの文・書式の崩れ)だけにする。
  */
 
 /** 続きの候補を求める索引の機能(IndexManager が満たす) */
 export interface NameSource {
   hasChunks(): boolean;
   lexicalSearch(query: string, k: number): SearchHit[];
-  /** コード(文書を除く)に出てくる識別子か。exact=false は大文字小文字を区別しない */
-  knowsWord(word: string, exact?: boolean): boolean;
   repoMap(budgetChars: number): string;
 }
 
 /** 入力が止まってから求めるまで(ミリ秒) */
 export const DELAY_MS = 800;
 /** 続きの候補を求める書きかけの長さ(空白を除く最短・全体の最長) */
-export const MIN_DRAFT_CHARS = 5;
-export const MAX_DRAFT_CHARS = 400;
+export const MIN_DRAFT_CHARS = 3;
+export const MAX_DRAFT_CHARS = 1000;
 /** 続きの候補の最長(文字数) */
-export const MAX_COMPLETION_CHARS = 80;
+export const MAX_COMPLETION_CHARS = 200;
 /** 1分間に API を呼ぶ上限 */
-export const CALLS_PER_MINUTE = 10;
+export const CALLS_PER_MINUTE = 20;
 const REPO_MAP_CHARS = 1800;
 const LEADS = 5;
 const CACHE_SIZE = 40;
@@ -66,55 +64,22 @@ export function looksSecret(text: string): boolean {
   return SECRET_PATTERNS.some((re) => re.test(text));
 }
 
-// ---------- コードの名前の確認 ----------
-
-/** 名前の形をしていても、製品名などとしてよく書かれる語 */
-const COMMON_NAMES = new Set(["openai", "typescript", "javascript", "github", "gitlab", "vscode", "postgresql", "mongodb", "graphql", "nodejs", "chatgpt"]);
-
-/** 文の中のコードの名前(バッククォートの中身と、camelCase・snake_case・a.b の語)。パス・ファイル名は確かめない */
-export function codeNames(text: string): string[] {
-  const out = new Set<string>();
-  for (const m of text.matchAll(/`([^`\n]+)`/g)) {
-    out.add(m[1]!.trim());
-  }
-  for (const m of text.replace(/`[^`\n]*`/g, " ").matchAll(/[A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)*(?:\(\))?/g)) {
-    if (/[a-z0-9][A-Z]/.test(m[0]) || /[A-Za-z]_[A-Za-z0-9]|^_|\$/.test(m[0]) || /[A-Za-z]\.[A-Za-z]/.test(m[0])) {
-      out.add(m[0]);
-    }
-  }
-  return [...out].filter((n) => n && !n.includes("/") && !/\.[A-Za-z0-9]{1,5}$/.test(n) && !/\s/.test(n));
-}
-
-/** 文の中の、コードに無い名前(書きかけにある名前と製品名は確かめない) */
-export function unknownNames(text: string, names: Pick<NameSource, "knowsWord">, draft = ""): string[] {
-  const d = draft.toLowerCase();
-  return codeNames(text).filter((name) => {
-    const bare = name.replace(/\(\)$/, "");
-    if (!bare || d.includes(bare.toLowerCase()) || COMMON_NAMES.has(bare.toLowerCase())) {
-      return false;
-    }
-    const parts = bare.split(/[^A-Za-z0-9_$]+/).filter((p) => p.length >= 2);
-    return !parts.every((p) => draft.includes(p) || names.knowsWord(p));
-  });
-}
-
 // ---------- 続きの候補 ----------
 
 const SYSTEM = [
-  "あなたは VS Code 拡張「コード思考」の入力欄で、利用者が書きかけている依頼の続きを予測する担当です。",
-  "利用者はこの入力欄に、コードの仕組みを読み解く質問か、コードの変更の依頼を書きます。",
+  "あなたは VS Code 拡張「コード思考」の入力欄で、利用者が書きかけている指示の続きを予測する担当です。",
+  "利用者はこの入力欄に、コードの仕組みを知りたい質問や、コードを変更してほしい依頼を、自然な日本語(英語のこともある)で書きます。",
   "",
-  "【いちばん大事なこと】",
-  "- あなたが勧めたい依頼ではなく、利用者がまさに書こうとしている続きを予測する。基準は「利用者が『ちょうどそう書こうとしていた』と思うか」。",
+  "【やること】",
+  "- 書きかけの文章が、何を指示しよう・質問しようとしているのかを推測し、その続きを書く。基準は「利用者が『まさにそう書こうとしていた』と思うか」。",
   "- 書きかけの部分は変えない。completion には、書きかけの末尾にそのままつなげる文字列だけを入れる(書きかけを繰り返さない)。",
-  "- 続きが1つに絞れないとき・意図が読めないときは、completion を空文字にする。外れた候補を出すより、出さないほうがよい。",
-  "",
-  "【書き方】",
-  "- 1文の続きを60文字以内で。文体(です・ます/である/体言止め)は書きかけに合わせる。改行・箇条書き・説明・呼びかけ・お礼や評価は書かない。",
-  "- 読み解きの質問は問いの形(「〜はどう動く?」)で、変更の依頼は「〜ようにしたい」「〜を追加したい」の形で終える。進め方が決まっていれば、それに合わせる。",
-  "- 場所や名前を足すときは、【構成】【候補】にある実在の名前だけを、バッククォートで囲んで使う。無い名前は書かない。",
-  "- 書かれていない要件・条件・数値・画面の文言・別の依頼は足さない(利用者が決めること)。",
+  "- 文の途中なら、その文を完成させる。文が書き終わっていれば、利用者が次に付け足しそうな内容を書いてよい。",
+  "- 文体(です・ます/である/体言止め)と言葉づかいは書きかけに合わせる。利用者自身の声で書き、説明・呼びかけ・お礼・評価はしない。",
+  "- 具体的にする。【構成】【候補】にある実在のファイル名・関数名が使えるときは、バッククォートで囲んで使う。無い名前は作らない。",
+  "- 質問なら問いの形(「〜はどう動く?」)、変更の依頼なら「〜ようにしたい」「〜を追加したい」の形で自然に終える。",
+  "- 続きがまったく読み取れないときだけ、completion を空文字にする。",
   "- 例: 書きかけ「索引の更新」→ completion「は、ファイルを保存してから `IndexManager.commit` までどう流れる?」",
+  "- 例: 書きかけ「ログアウト機能を」→ completion「追加したい。ログアウトしたらログイン画面に戻るようにしたい」",
   "出力は指定の JSON スキーマに厳密に従う。",
 ].join("\n");
 
@@ -172,21 +137,15 @@ export function stripEcho(draft: string, completion: string): string {
   return c.replace(/\s+$/, "");
 }
 
-/** 続きの候補を出さない理由(出してよければ undefined) */
-export function rejectCompletion(draft: string, completion: string, names: Pick<NameSource, "knowsWord">): string | undefined {
+/** 候補を整える(改行は最初の行だけにする)。出さない理由があればそれを返す */
+export function rejectCompletion(completion: string): string | undefined {
   const c = completion;
   const checks: Array<[string, () => boolean]> = [
     ["empty", () => meaningfulLength(c) === 0],
-    ["multiline", () => /\n/.test(c)],
     ["too_long", () => c.length > MAX_COMPLETION_CHARS],
-    ["formatting", () => /```|\*\*|^\s*([-*•#>]|\d+\.)\s/.test(c) || /[〔〕]/.test(c)],
+    ["formatting", () => /```/.test(c)],
     ["meta", () => /^[\s(（「『]*(なし|特になし|提案なし|候補なし|ありません|n\/a|none|null|no suggestion)[\s)）」』。.]*$/i.test(c)],
-    [
-      "voice",
-      () => /^\s*(承知|かしこまり|了解しました|以下|こちらは|では、|let me|i'll|here is|here's|sure[,!])/i.test(c) || /しますね[。!！]?$/.test(c) || /ありがとう|いいですね|thanks|looks good/i.test(c),
-    ],
-    ["sentences", () => /[。！？!?]\s*[^\s。！？!?)）」』]/.test(c)],
-    ["unknown_name", () => unknownNames(c, names, draft).length > 0],
+    ["voice", () => /^\s*(承知しました|かしこまりました|了解しました|let me |i'll |here is|here's|sure[,!])/i.test(c)],
   ];
   return checks.find(([, test]) => test())?.[0];
 }
@@ -248,7 +207,7 @@ export class PromptAssistant {
     if (meaningfulLength(draft) < MIN_DRAFT_CHARS) {
       return { completion: "", reason: "short" };
     }
-    if (draft.length > MAX_DRAFT_CHARS || draft.split("\n").length > 3) {
+    if (draft.length > MAX_DRAFT_CHARS || draft.split("\n").length > 10) {
       return this.done(draft, "", "long");
     }
     if (looksSecret(draft)) {
@@ -285,7 +244,7 @@ export class PromptAssistant {
         channel: "assist-auto",
         reasoningEffort: "none",
         cacheKey: `qbs-assist-${sha1(this.deps.workspaceId).slice(0, 12)}`,
-        maxOutputTokens: 200,
+        maxOutputTokens: 300,
         retries: 0,
       });
       this.failures = 0;
@@ -294,8 +253,9 @@ export class PromptAssistant {
         result = this.done(draft, "", "truncated");
       } else {
         const raw = parseJson<{ completion?: unknown }>(res.content);
-        const completion = stripEcho(draft, typeof raw.completion === "string" ? raw.completion : "");
-        const reason = rejectCompletion(draft, completion, index ?? { knowsWord: () => true });
+        // 複数行で返ってきたら最初の行を使う(入力欄に1行の続きとして足すため)
+        const completion = stripEcho(draft, typeof raw.completion === "string" ? raw.completion : "").split("\n")[0]!.trimEnd();
+        const reason = rejectCompletion(completion);
         result = reason ? this.done(draft, "", reason, `候補「${completion}」`) : this.done(draft, completion, undefined);
       }
       this.cache.set(key, result);

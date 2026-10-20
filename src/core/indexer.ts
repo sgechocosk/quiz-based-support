@@ -81,8 +81,6 @@ export class IndexManager {
   private manifest: Manifest;
   private vectors = new Map<string, Float32Array>();
   private hybrid: HybridIndex | undefined;
-  /** コード(文書を除くチャンク)に出てくる識別子。exact は大文字小文字まで、lower は小文字にしたもの */
-  private words: { exact: Set<string>; lower: Set<string> } | undefined;
   private repoMapCache: { budget: number; text: string } | undefined;
   private chain: Promise<unknown> = Promise.resolve();
   private readonly chunkOptions: ChunkOptions;
@@ -136,7 +134,6 @@ export class IndexManager {
   private rebuild(): void {
     const chunks = Object.values(this.manifest.files).flatMap((f) => f.chunks);
     this.hybrid = new HybridIndex(chunks, this.vectors);
-    this.words = undefined;
     this.repoMapCache = undefined;
   }
 
@@ -397,29 +394,6 @@ export class IndexManager {
       return [];
     }
     return hybrid.search(query, undefined, { k, minSimilarity: 1 });
-  }
-
-  /**
-   * その識別子が索引したコード(文書を除く)のどこかに出てくるか。
-   * exact=true(既定)は大文字小文字まで一致するものだけ(LLM が書いた名前の確認)、false は区別しない(利用者が書いた名前)
-   */
-  knowsWord(word: string, exact = true): boolean {
-    if (!this.words) {
-      const exactSet = new Set<string>();
-      for (const c of this.hybrid?.chunks ?? []) {
-        if (c.language === "markdown") {
-          continue;
-        }
-        for (const s of c.symbols) {
-          exactSet.add(s);
-        }
-        for (const m of c.text.matchAll(/[A-Za-z_$][\w$]*/g)) {
-          exactSet.add(m[0]);
-        }
-      }
-      this.words = { exact: exactSet, lower: new Set([...exactSet].map((w) => w.toLowerCase())) };
-    }
-    return exact ? this.words.exact.has(word) : this.words.lower.has(word.toLowerCase());
   }
 
   fileChunks(filePath: string): ChunkRecord[] {
